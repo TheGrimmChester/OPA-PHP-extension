@@ -1,0 +1,131 @@
+name: Build PHP Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+    inputs:
+      php_version:
+        description: 'PHP version (8.4 or 8.5)'
+        required: true
+        default: '8.4'
+        type: choice
+        options:
+          - '8.4'
+          - '8.5'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php_version: ['8.4', '8.5']
+        include:
+          - php_version: '8.4'
+            php_package: 'php8.4-dev'
+          - php_version: '8.5'
+            php_package: 'php8.5-dev'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Check for code changes
+        id: code_changes
+        run: |
+          # For workflow_dispatch (manual trigger), always build
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger detected. Proceeding with build."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # For tag pushes, always build
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "Tag push detected. Proceeding with build."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # For pull requests, check if .c or .h files changed
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            CHANGED_FILES=$(git diff --name-only ${BASE_SHA}..${HEAD_SHA} -- "*.c" "*.h" | wc -l)
+          else
+            # For push events, check changes in the commit
+            if [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+              CHANGED_FILES=$(git diff --name-only ${{ github.event.before }}..${{ github.event.after }} -- "*.c" "*.h" | wc -l)
+            else
+              # If no before SHA, check current commit
+              CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD -- "*.c" "*.h" | wc -l)
+            fi
+          fi
+          
+          if [ "$CHANGED_FILES" -gt 0 ]; then
+            echo "Code files (.c or .h) have changed. Proceeding with build."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "No .c or .h files changed. Skipping build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Set up PHP
+        if: steps.code_changes.outputs.should_build == 'true'
+        run: |
+          sudo add-apt-repository ppa:ondrej/php -y
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.php_package }} liblz4-dev build-essential autoconf libtool pkg-config
+      
+      - name: Build extension
+        if: steps.code_changes.outputs.should_build == 'true'
+        run: |
+          phpize
+          ./configure --enable-opa
+          make
+      
+      - name: Create release directory
+        if: steps.code_changes.outputs.should_build == 'true'
+        run: |
+          mkdir -p dist/php${{ matrix.php_version }}
+          cp modules/opa.so dist/php${{ matrix.php_version }}/opa.so
+      
+      - name: Upload artifact
+        if: steps.code_changes.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: opa-php${{ matrix.php_version }}
+          path: dist/php${{ matrix.php_version }}/opa.so
+          retention-days: 30
+  
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/**/*.so
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
