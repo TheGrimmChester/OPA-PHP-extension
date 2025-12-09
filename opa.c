@@ -1608,9 +1608,71 @@ PHP_FUNCTION(opaphp_mysqli_query) {
     
     double elapsed = (get_microtime() - start) * 1000.0; // Convert to milliseconds
     
-    // Get rows affected (simplified - just log 0 for now to avoid segfaults)
-    // TODO: Safely retrieve num_rows or affected_rows
-    long rows_affected = 0;
+    // Get rows affected/returned
+    long rows_affected = -1;
+    
+    // Try to get row count from return_value
+    if (return_value && Z_TYPE_P(return_value) != IS_NULL) {
+        // Check if return_value is a mysqli_result object (SELECT queries)
+        if (Z_TYPE_P(return_value) == IS_OBJECT) {
+            zend_class_entry *ce = Z_OBJCE_P(return_value);
+            const char *class_name = ZSTR_VAL(ce->name);
+            
+            // If it's a mysqli_result, get num_rows
+            if (strcmp(class_name, "mysqli_result") == 0) {
+                zval num_rows_zv;
+                zval method_name;
+                zval return_zv;
+                ZVAL_OBJ(&return_zv, Z_OBJ_P(return_value));
+                ZVAL_STRING(&method_name, "num_rows");
+                // Try to read property directly
+                zval *num_rows_prop = zend_read_property(ce, Z_OBJ_P(return_value), "num_rows", sizeof("num_rows") - 1, 1, &num_rows_zv);
+                if (num_rows_prop && Z_TYPE_P(num_rows_prop) == IS_LONG) {
+                    rows_affected = Z_LVAL_P(num_rows_prop);
+                } else if (call_user_function(EG(function_table), &return_zv, &method_name, &num_rows_zv, 0, NULL) == SUCCESS) {
+                    if (Z_TYPE(num_rows_zv) == IS_LONG) {
+                        rows_affected = Z_LVAL(num_rows_zv);
+                    }
+                    zval_ptr_dtor(&num_rows_zv);
+                }
+                zval_ptr_dtor(&method_name);
+            } else if (strcmp(class_name, "mysqli") == 0) {
+                // For non-SELECT queries, get affected_rows from the link
+                zval affected_rows_zv;
+                zval method_name;
+                zval link_zv;
+                ZVAL_OBJ(&link_zv, Z_OBJ_P(link));
+                ZVAL_STRING(&method_name, "affected_rows");
+                zval *affected_rows_prop = zend_read_property(Z_OBJCE_P(link), Z_OBJ_P(link), "affected_rows", sizeof("affected_rows") - 1, 1, &affected_rows_zv);
+                if (affected_rows_prop && Z_TYPE_P(affected_rows_prop) == IS_LONG) {
+                    rows_affected = Z_LVAL_P(affected_rows_prop);
+                } else if (call_user_function(EG(function_table), &link_zv, &method_name, &affected_rows_zv, 0, NULL) == SUCCESS) {
+                    if (Z_TYPE(affected_rows_zv) == IS_LONG) {
+                        rows_affected = Z_LVAL(affected_rows_zv);
+                    }
+                    zval_ptr_dtor(&affected_rows_zv);
+                }
+                zval_ptr_dtor(&method_name);
+            }
+        } else if (Z_TYPE_P(return_value) == IS_TRUE) {
+            // For INSERT/UPDATE/DELETE, get affected_rows from link
+            zval affected_rows_zv;
+            zval method_name;
+            zval link_zv;
+            ZVAL_OBJ(&link_zv, Z_OBJ_P(link));
+            ZVAL_STRING(&method_name, "affected_rows");
+            zval *affected_rows_prop = zend_read_property(Z_OBJCE_P(link), Z_OBJ_P(link), "affected_rows", sizeof("affected_rows") - 1, 1, &affected_rows_zv);
+            if (affected_rows_prop && Z_TYPE_P(affected_rows_prop) == IS_LONG) {
+                rows_affected = Z_LVAL_P(affected_rows_prop);
+            } else if (call_user_function(EG(function_table), &link_zv, &method_name, &affected_rows_zv, 0, NULL) == SUCCESS) {
+                if (Z_TYPE(affected_rows_zv) == IS_LONG) {
+                    rows_affected = Z_LVAL(affected_rows_zv);
+                }
+                zval_ptr_dtor(&affected_rows_zv);
+            }
+            zval_ptr_dtor(&method_name);
+        }
+    }
     
     // Log SQL query with timing
     if (query) {
@@ -1645,8 +1707,13 @@ PHP_METHOD(PDO, query) {
     double elapsed = (get_microtime() - start) * 1000.0;
     
     // Get row count if available
-    long row_count = 0;
+    long row_count = -1;
     if (return_value && Z_TYPE_P(return_value) == IS_OBJECT) {
+        zend_class_entry *ce = Z_OBJCE_P(return_value);
+        const char *class_name = ZSTR_VAL(ce->name);
+        
+        // For PDOStatement, get rowCount() (works for INSERT/UPDATE/DELETE)
+        // For SELECT queries, rowCount() returns 0, so we try to fetch and count
         zval row_count_zv;
         zval method_name;
         zval return_zv;
@@ -1655,6 +1722,21 @@ PHP_METHOD(PDO, query) {
         if (call_user_function(EG(function_table), &return_zv, &method_name, &row_count_zv, 0, NULL) == SUCCESS) {
             if (Z_TYPE(row_count_zv) == IS_LONG) {
                 row_count = Z_LVAL(row_count_zv);
+                
+                // If rowCount is 0, it might be a SELECT query
+                // Try to fetch all rows and count them
+                if (row_count == 0 && sql && (strncasecmp(ZSTR_VAL(sql), "SELECT", 6) == 0)) {
+                    zval fetch_all_zv;
+                    zval fetch_all_method;
+                    ZVAL_STRING(&fetch_all_method, "fetchAll");
+                    if (call_user_function(EG(function_table), &return_zv, &fetch_all_method, &fetch_all_zv, 0, NULL) == SUCCESS) {
+                        if (Z_TYPE(fetch_all_zv) == IS_ARRAY) {
+                            row_count = zend_hash_num_elements(Z_ARRVAL(fetch_all_zv));
+                        }
+                        zval_ptr_dtor(&fetch_all_zv);
+                    }
+                    zval_ptr_dtor(&fetch_all_method);
+                }
             }
             zval_ptr_dtor(&row_count_zv);
         }
@@ -1698,7 +1780,7 @@ PHP_METHOD(PDOStatement, execute) {
     double elapsed = (get_microtime() - start) * 1000.0;
     
     // Get row count
-    long row_count = 0;
+    long row_count = -1;
     zval row_count_zv;
     zval method_name;
     zval this_zv;
@@ -1707,6 +1789,21 @@ PHP_METHOD(PDOStatement, execute) {
     if (call_user_function(EG(function_table), &this_zv, &method_name, &row_count_zv, 0, NULL) == SUCCESS) {
         if (Z_TYPE(row_count_zv) == IS_LONG) {
             row_count = Z_LVAL(row_count_zv);
+            
+            // If rowCount is 0, it might be a SELECT query
+            // Try to fetch all rows and count them
+            if (row_count == 0 && sql && (strncasecmp(sql, "SELECT", 6) == 0)) {
+                zval fetch_all_zv;
+                zval fetch_all_method;
+                ZVAL_STRING(&fetch_all_method, "fetchAll");
+                if (call_user_function(EG(function_table), &this_zv, &fetch_all_method, &fetch_all_zv, 0, NULL) == SUCCESS) {
+                    if (Z_TYPE(fetch_all_zv) == IS_ARRAY) {
+                        row_count = zend_hash_num_elements(Z_ARRVAL(fetch_all_zv));
+                    }
+                    zval_ptr_dtor(&fetch_all_zv);
+                }
+                zval_ptr_dtor(&fetch_all_method);
+            }
         }
         zval_ptr_dtor(&row_count_zv);
     }

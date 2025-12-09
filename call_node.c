@@ -15,6 +15,15 @@ void record_sql_query(const char *sql, double duration, zval *params, const char
     call_node_t *current_call = NULL;
     if (global_collector->call_stack_top) {
         current_call = global_collector->call_stack_top;
+    } else {
+        // No active call stack - SQL queries executed at top level
+        // Create a root call node to attach SQL queries to
+        debug_log("[record_sql_query] No call stack, creating root call node for SQL query");
+        char *root_call_id = opa_enter_function("__root__", NULL, __FILE__, __LINE__, 0);
+        if (root_call_id) {
+            efree(root_call_id);
+            current_call = global_collector->call_stack_top;
+        }
     }
     
     // Lazily allocate sql_queries array when first SQL query is recorded
@@ -49,9 +58,13 @@ void record_sql_query(const char *sql, double duration, zval *params, const char
         //     add_assoc_zval(&query_data, "params", &params_copy);
         // }
         
-        if (rows_affected >= 0) {
-            add_assoc_long(&query_data, "rows_affected", rows_affected);
-        }
+               // Always include rows_affected (can be -1 if unknown, 0 for SELECT with no results, or positive for actual count)
+               add_assoc_long(&query_data, "rows_affected", rows_affected);
+               
+               // Also add rows_returned for SELECT queries (same as rows_affected for SELECT)
+               if (sql && strncasecmp(sql, "SELECT", 6) == 0 && rows_affected >= 0) {
+                   add_assoc_long(&query_data, "rows_returned", rows_affected);
+               }
         
         // Determine query type (SELECT, INSERT, etc.)
         if (sql) {

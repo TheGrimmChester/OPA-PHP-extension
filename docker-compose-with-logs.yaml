@@ -1,0 +1,28 @@
+# Extended compose file that includes agent and dashboard for log viewing
+# Usage: docker-compose -f docker-compose.yaml -f docker-compose-with-logs.yaml up --abort-on-container-exit
+version: '3.8'
+
+services:
+  # These services reference existing containers and won't be started
+  # They're only here so docker-compose logs can show their output
+  agent:
+    container_name: opa-agent
+    image: alpine:latest
+    command: ["tail", "-f", "/dev/null"]  # Dummy command, won't run if container exists
+    networks:
+      - opa_network
+    profiles:
+      - logs-only  # Only used for logging, not starting
+
+  dashboard-dev:
+    container_name: opa-dashboard-dev
+    image: alpine:latest
+    command: ["tail", "-f", "/dev/null"]  # Dummy command, won't run if container exists
+    networks:
+      - opa_network
+    profiles:
+      - logs-only  # Only used for logging, not starting
+
+networks:
+  opa_network:
+    external: true
