@@ -126,12 +126,33 @@ void send_message_direct(char *msg, int compress) {
                 
                 // Parse host address
                 if (inet_aton(host, &addr.sin_addr) == 0) {
-                    // If inet_aton fails, try to resolve hostname
-                    struct hostent *he = gethostbyname(host);
-                    if (he != NULL && he->h_addr_list[0] != NULL) {
-                        memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
+                    // If inet_aton fails, try to resolve hostname using getaddrinfo (modern, works with Docker DNS)
+                    struct addrinfo hints, *result, *rp;
+                    memset(&hints, 0, sizeof(struct addrinfo));
+                    hints.ai_family = AF_INET;
+                    hints.ai_socktype = SOCK_STREAM;
+                    
+                    char port_str_buf[16];
+                    snprintf(port_str_buf, sizeof(port_str_buf), "%d", port);
+                    
+                    int gai_result = getaddrinfo(host, port_str_buf, &hints, &result);
+                    if (gai_result == 0) {
+                        // Use first result
+                        for (rp = result; rp != NULL; rp = rp->ai_next) {
+                            if (rp->ai_family == AF_INET) {
+                                struct sockaddr_in *sin = (struct sockaddr_in *)rp->ai_addr;
+                                memcpy(&addr.sin_addr, &sin->sin_addr, sizeof(addr.sin_addr));
+                                break;
+                            }
+                        }
+                        freeaddrinfo(result);
+                        if (rp == NULL) {
+                            debug_log("[SEND] getaddrinfo returned no IPv4 address for host: %s", host);
+                            close(sock);
+                            sock = -1;
+                        }
                     } else {
-                        debug_log("[SEND] Failed to resolve host: %s", host);
+                        debug_log("[SEND] Failed to resolve host: %s (getaddrinfo error: %s)", host, gai_strerror(gai_result));
                         close(sock);
                         sock = -1;
                     }
