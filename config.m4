@@ -10,6 +10,11 @@ if test "$PHP_OPA" != "no"; then
     ])
   ])
   
+  # Check for MySQLi and PDO extensions (for SQL profiling hooks)
+  # These are usually built-in, but we check to ensure they're available
+  PHP_CHECK_LIBRARY(mysqlclient, mysql_init,
+    [AC_DEFINE(HAVE_MYSQLI, 1, [MySQLi support available])], [], [])
+  
   PHP_NEW_EXTENSION(opa, opa.c span.c call_node.c transport.c serialize.c opa_api.c error_tracking.c, $ext_shared, , -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DCOMPILE_DL_OPA=1)
   PHP_SUBST(OPA_SHARED_LIBADD)
 fi

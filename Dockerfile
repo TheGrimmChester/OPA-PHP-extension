@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y \
     liblz4-dev \
     libpthread-stubs0-dev \
     gdb \
+    default-mysql-client \
+    libmariadb-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Composer BEFORE installing opa extension to avoid segfaults
@@ -19,6 +21,9 @@ RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local
 
 # Install sockets extension for PHP BEFORE opa
 RUN docker-php-ext-install sockets
+
+# Install MySQLi and PDO MySQL extensions
+RUN docker-php-ext-install mysqli pdo pdo_mysql
 
 # Install APCu extension
 RUN pecl install apcu && \

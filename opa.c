@@ -1570,6 +1570,256 @@ void opa_execute_ex(zend_execute_data *execute_data) {
     }
 }
 
+/* SQL Profiling Hooks */
+
+// Store original function handlers
+static zend_function *orig_mysqli_query_func = NULL;
+static zif_handler orig_mysqli_query_handler = NULL;
+static zend_function *orig_pdo_query_func = NULL;
+static zif_handler orig_pdo_query_handler = NULL;
+static zend_function *orig_pdo_stmt_execute_func = NULL;
+static zif_handler orig_pdo_stmt_execute_handler = NULL;
+
+// Helper: Get current time in microseconds
+static double get_microtime(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+// MySQLi query hook
+PHP_FUNCTION(opaphp_mysqli_query) {
+    zval *link;
+    zend_string *query;
+    double start = get_microtime();
+    
+    // Parse parameters
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT(link)
+        Z_PARAM_STR(query)
+    ZEND_PARSE_PARAMETERS_END();
+    
+    // Call original mysqli_query
+    if (orig_mysqli_query_handler) {
+        orig_mysqli_query_handler(execute_data, return_value);
+    } else if (orig_mysqli_query_func && orig_mysqli_query_func->internal_function.handler) {
+        orig_mysqli_query_func->internal_function.handler(execute_data, return_value);
+    }
+    
+    double elapsed = (get_microtime() - start) * 1000.0; // Convert to milliseconds
+    
+    // Get rows affected/returned
+    long rows_affected = -1;
+    
+    // Try to get row count from return_value
+    if (return_value && Z_TYPE_P(return_value) != IS_NULL) {
+        // Check if return_value is a mysqli_result object (SELECT queries)
+        if (Z_TYPE_P(return_value) == IS_OBJECT) {
+            zend_class_entry *ce = Z_OBJCE_P(return_value);
+            const char *class_name = ZSTR_VAL(ce->name);
+            
+            // If it's a mysqli_result, get num_rows
+            if (strcmp(class_name, "mysqli_result") == 0) {
+                zval num_rows_zv;
+                zval method_name;
+                zval return_zv;
+                ZVAL_OBJ(&return_zv, Z_OBJ_P(return_value));
+                ZVAL_STRING(&method_name, "num_rows");
+                // Try to read property directly
+                zval *num_rows_prop = zend_read_property(ce, Z_OBJ_P(return_value), "num_rows", sizeof("num_rows") - 1, 1, &num_rows_zv);
+                if (num_rows_prop && Z_TYPE_P(num_rows_prop) == IS_LONG) {
+                    rows_affected = Z_LVAL_P(num_rows_prop);
+                } else if (call_user_function(EG(function_table), &return_zv, &method_name, &num_rows_zv, 0, NULL) == SUCCESS) {
+                    if (Z_TYPE(num_rows_zv) == IS_LONG) {
+                        rows_affected = Z_LVAL(num_rows_zv);
+                    }
+                    zval_ptr_dtor(&num_rows_zv);
+                }
+                zval_ptr_dtor(&method_name);
+            } else if (strcmp(class_name, "mysqli") == 0) {
+                // For non-SELECT queries, get affected_rows from the link
+                zval affected_rows_zv;
+                zval method_name;
+                zval link_zv;
+                ZVAL_OBJ(&link_zv, Z_OBJ_P(link));
+                ZVAL_STRING(&method_name, "affected_rows");
+                zval *affected_rows_prop = zend_read_property(Z_OBJCE_P(link), Z_OBJ_P(link), "affected_rows", sizeof("affected_rows") - 1, 1, &affected_rows_zv);
+                if (affected_rows_prop && Z_TYPE_P(affected_rows_prop) == IS_LONG) {
+                    rows_affected = Z_LVAL_P(affected_rows_prop);
+                } else if (call_user_function(EG(function_table), &link_zv, &method_name, &affected_rows_zv, 0, NULL) == SUCCESS) {
+                    if (Z_TYPE(affected_rows_zv) == IS_LONG) {
+                        rows_affected = Z_LVAL(affected_rows_zv);
+                    }
+                    zval_ptr_dtor(&affected_rows_zv);
+                }
+                zval_ptr_dtor(&method_name);
+            }
+        } else if (Z_TYPE_P(return_value) == IS_TRUE) {
+            // For INSERT/UPDATE/DELETE, get affected_rows from link
+            zval affected_rows_zv;
+            zval method_name;
+            zval link_zv;
+            ZVAL_OBJ(&link_zv, Z_OBJ_P(link));
+            ZVAL_STRING(&method_name, "affected_rows");
+            zval *affected_rows_prop = zend_read_property(Z_OBJCE_P(link), Z_OBJ_P(link), "affected_rows", sizeof("affected_rows") - 1, 1, &affected_rows_zv);
+            if (affected_rows_prop && Z_TYPE_P(affected_rows_prop) == IS_LONG) {
+                rows_affected = Z_LVAL_P(affected_rows_prop);
+            } else if (call_user_function(EG(function_table), &link_zv, &method_name, &affected_rows_zv, 0, NULL) == SUCCESS) {
+                if (Z_TYPE(affected_rows_zv) == IS_LONG) {
+                    rows_affected = Z_LVAL(affected_rows_zv);
+                }
+                zval_ptr_dtor(&affected_rows_zv);
+            }
+            zval_ptr_dtor(&method_name);
+        }
+    }
+    
+    // Log SQL query with timing
+    if (query) {
+        php_printf("[OPA SQL Profiling] MySQLi Query: %s | Time: %.3fms | Rows: %ld\n", 
+                   ZSTR_VAL(query), elapsed, rows_affected);
+        
+        // Send SQL query data to agent via record_sql_query
+        // Duration is in milliseconds, convert to seconds for record_sql_query
+        double duration_seconds = elapsed / 1000.0;
+        record_sql_query(ZSTR_VAL(query), duration_seconds, NULL, "mysqli_query", rows_affected);
+    }
+}
+
+// PDO::query hook
+PHP_METHOD(PDO, query) {
+    zend_string *sql;
+    double start = get_microtime();
+    
+    // Parse parameters (query takes at least 1 parameter: SQL string)
+    // Additional parameters are optional and handled by original function
+    ZEND_PARSE_PARAMETERS_START(1, -1)
+        Z_PARAM_STR(sql)
+    ZEND_PARSE_PARAMETERS_END();
+    
+    // Call original PDO::query
+    if (orig_pdo_query_handler) {
+        orig_pdo_query_handler(execute_data, return_value);
+    } else if (orig_pdo_query_func && orig_pdo_query_func->internal_function.handler) {
+        orig_pdo_query_func->internal_function.handler(execute_data, return_value);
+    }
+    
+    double elapsed = (get_microtime() - start) * 1000.0;
+    
+    // Get row count if available
+    long row_count = -1;
+    if (return_value && Z_TYPE_P(return_value) == IS_OBJECT) {
+        zend_class_entry *ce = Z_OBJCE_P(return_value);
+        const char *class_name = ZSTR_VAL(ce->name);
+        
+        // For PDOStatement, get rowCount() (works for INSERT/UPDATE/DELETE)
+        // For SELECT queries, rowCount() returns 0, so we try to fetch and count
+        zval row_count_zv;
+        zval method_name;
+        zval return_zv;
+        ZVAL_OBJ(&return_zv, Z_OBJ_P(return_value));
+        ZVAL_STRING(&method_name, "rowCount");
+        if (call_user_function(EG(function_table), &return_zv, &method_name, &row_count_zv, 0, NULL) == SUCCESS) {
+            if (Z_TYPE(row_count_zv) == IS_LONG) {
+                row_count = Z_LVAL(row_count_zv);
+                
+                // If rowCount is 0, it might be a SELECT query
+                // Try to fetch all rows and count them
+                if (row_count == 0 && sql && (strncasecmp(ZSTR_VAL(sql), "SELECT", 6) == 0)) {
+                    zval fetch_all_zv;
+                    zval fetch_all_method;
+                    ZVAL_STRING(&fetch_all_method, "fetchAll");
+                    if (call_user_function(EG(function_table), &return_zv, &fetch_all_method, &fetch_all_zv, 0, NULL) == SUCCESS) {
+                        if (Z_TYPE(fetch_all_zv) == IS_ARRAY) {
+                            row_count = zend_hash_num_elements(Z_ARRVAL(fetch_all_zv));
+                        }
+                        zval_ptr_dtor(&fetch_all_zv);
+                    }
+                    zval_ptr_dtor(&fetch_all_method);
+                }
+            }
+            zval_ptr_dtor(&row_count_zv);
+        }
+        zval_ptr_dtor(&method_name);
+    }
+    
+    // Log SQL query
+    if (sql) {
+        php_printf("[OPA SQL Profiling] PDO Query: %s | Time: %.3fms | Rows: %ld\n", 
+                   ZSTR_VAL(sql), elapsed, row_count);
+        
+        // Send SQL query data to agent via record_sql_query
+        double duration_seconds = elapsed / 1000.0;
+        record_sql_query(ZSTR_VAL(sql), duration_seconds, NULL, "PDO::query", row_count);
+    }
+}
+
+// PDOStatement::execute hook
+PHP_METHOD(PDOStatement, execute) {
+    double start = get_microtime();
+    
+    // Parse parameters (execute can take 0 or more parameters)
+    // We don't need to parse them, just pass through
+    ZEND_PARSE_PARAMETERS_START(0, -1)
+    ZEND_PARSE_PARAMETERS_END();
+    
+    // Get SQL query string from PDOStatement
+    zval *query_string = zend_read_property(Z_OBJCE_P(getThis()), Z_OBJ_P(getThis()), "queryString", sizeof("queryString")-1, 1, NULL);
+    const char *sql = NULL;
+    if (query_string && Z_TYPE_P(query_string) == IS_STRING) {
+        sql = Z_STRVAL_P(query_string);
+    }
+    
+    // Call original PDOStatement::execute
+    if (orig_pdo_stmt_execute_handler) {
+        orig_pdo_stmt_execute_handler(execute_data, return_value);
+    } else if (orig_pdo_stmt_execute_func && orig_pdo_stmt_execute_func->internal_function.handler) {
+        orig_pdo_stmt_execute_func->internal_function.handler(execute_data, return_value);
+    }
+    
+    double elapsed = (get_microtime() - start) * 1000.0;
+    
+    // Get row count
+    long row_count = -1;
+    zval row_count_zv;
+    zval method_name;
+    zval this_zv;
+    ZVAL_OBJ(&this_zv, Z_OBJ_P(getThis()));
+    ZVAL_STRING(&method_name, "rowCount");
+    if (call_user_function(EG(function_table), &this_zv, &method_name, &row_count_zv, 0, NULL) == SUCCESS) {
+        if (Z_TYPE(row_count_zv) == IS_LONG) {
+            row_count = Z_LVAL(row_count_zv);
+            
+            // If rowCount is 0, it might be a SELECT query
+            // Try to fetch all rows and count them
+            if (row_count == 0 && sql && (strncasecmp(sql, "SELECT", 6) == 0)) {
+                zval fetch_all_zv;
+                zval fetch_all_method;
+                ZVAL_STRING(&fetch_all_method, "fetchAll");
+                if (call_user_function(EG(function_table), &this_zv, &fetch_all_method, &fetch_all_zv, 0, NULL) == SUCCESS) {
+                    if (Z_TYPE(fetch_all_zv) == IS_ARRAY) {
+                        row_count = zend_hash_num_elements(Z_ARRVAL(fetch_all_zv));
+                    }
+                    zval_ptr_dtor(&fetch_all_zv);
+                }
+                zval_ptr_dtor(&fetch_all_method);
+            }
+        }
+        zval_ptr_dtor(&row_count_zv);
+    }
+    zval_ptr_dtor(&method_name);
+    
+    // Log SQL query
+    if (sql) {
+        php_printf("[OPA SQL Profiling] PDOStatement Execute: %s | Time: %.3fms | Rows: %ld\n", 
+                   sql, elapsed, row_count);
+        
+        // Send SQL query data to agent via record_sql_query
+        double duration_seconds = elapsed / 1000.0;
+        record_sql_query(sql, duration_seconds, NULL, "PDOStatement::execute", row_count);
+    }
+}
+
 // Module initialization - registers INI settings and hooks zend_execute_ex for function call interception
 PHP_MINIT_FUNCTION(opa) {
     REGISTER_INI_ENTRIES();
@@ -1598,6 +1848,49 @@ PHP_MINIT_FUNCTION(opa) {
         if (zend_execute_ex && !original_zend_execute_ex) {
             original_zend_execute_ex = zend_execute_ex;
             zend_execute_ex = opa_execute_ex;
+    }
+    
+    // Register SQL profiling hooks (lazy registration - try in RINIT as well)
+    // MySQLi hook
+    orig_mysqli_query_func = zend_hash_str_find_ptr(CG(function_table), "mysqli_query", sizeof("mysqli_query")-1);
+    if (orig_mysqli_query_func && orig_mysqli_query_func->type == ZEND_INTERNAL_FUNCTION) {
+        // Store original handler
+        orig_mysqli_query_handler = orig_mysqli_query_func->internal_function.handler;
+        // Replace with our handler
+        orig_mysqli_query_func->internal_function.handler = zif_opaphp_mysqli_query;
+        php_printf("[OPA] MySQLi query hook registered\n");
+    } else {
+        php_printf("[OPA] MySQLi query function not found at MINIT\n");
+    }
+    
+    // PDO::query hook
+    zend_class_entry *pdo_ce = zend_hash_str_find_ptr(CG(class_table), "PDO", sizeof("PDO")-1);
+    if (pdo_ce) {
+        orig_pdo_query_func = zend_hash_str_find_ptr(&pdo_ce->function_table, "query", sizeof("query")-1);
+        if (orig_pdo_query_func && orig_pdo_query_func->type == ZEND_INTERNAL_FUNCTION) {
+            orig_pdo_query_handler = orig_pdo_query_func->internal_function.handler;
+            orig_pdo_query_func->internal_function.handler = zim_PDO_query;
+            php_printf("[OPA] PDO::query hook registered\n");
+        } else {
+            php_printf("[OPA] PDO::query method not found at MINIT\n");
+        }
+    } else {
+        php_printf("[OPA] PDO class not found at MINIT\n");
+    }
+    
+    // PDOStatement::execute hook
+    zend_class_entry *pdo_stmt_ce = zend_hash_str_find_ptr(CG(class_table), "PDOStatement", sizeof("PDOStatement")-1);
+    if (pdo_stmt_ce) {
+        orig_pdo_stmt_execute_func = zend_hash_str_find_ptr(&pdo_stmt_ce->function_table, "execute", sizeof("execute")-1);
+        if (orig_pdo_stmt_execute_func && orig_pdo_stmt_execute_func->type == ZEND_INTERNAL_FUNCTION) {
+            orig_pdo_stmt_execute_handler = orig_pdo_stmt_execute_func->internal_function.handler;
+            orig_pdo_stmt_execute_func->internal_function.handler = zim_PDOStatement_execute;
+            php_printf("[OPA] PDOStatement::execute hook registered\n");
+        } else {
+            php_printf("[OPA] PDOStatement::execute method not found at MINIT\n");
+        }
+    } else {
+        php_printf("[OPA] PDOStatement class not found at MINIT\n");
     }
     
     return SUCCESS;
@@ -1633,6 +1926,25 @@ PHP_MSHUTDOWN_FUNCTION(opa) {
         original_zend_execute_ex = NULL;
     }
     
+    // Restore original SQL profiling handlers
+    if (orig_mysqli_query_func && orig_mysqli_query_handler) {
+        orig_mysqli_query_func->internal_function.handler = orig_mysqli_query_handler;
+        orig_mysqli_query_func = NULL;
+        orig_mysqli_query_handler = NULL;
+    }
+    
+    if (orig_pdo_query_func && orig_pdo_query_handler) {
+        orig_pdo_query_func->internal_function.handler = orig_pdo_query_handler;
+        orig_pdo_query_func = NULL;
+        orig_pdo_query_handler = NULL;
+    }
+    
+    if (orig_pdo_stmt_execute_func && orig_pdo_stmt_execute_handler) {
+        orig_pdo_stmt_execute_func->internal_function.handler = orig_pdo_stmt_execute_handler;
+        orig_pdo_stmt_execute_func = NULL;
+        orig_pdo_stmt_execute_handler = NULL;
+    }
+    
     // During MSHUTDOWN, the Zend heap is being destroyed
     // PHP will try to destroy the hash table automatically via zend_hash_graceful_reverse_destroy
     // The hash table should have been destroyed in RSHUTDOWN, but if it wasn't,
@@ -1663,6 +1975,37 @@ PHP_MSHUTDOWN_FUNCTION(opa) {
 PHP_RINIT_FUNCTION(opa) {
     // RINIT: Only reset per-request state, do NOT install hooks or access globals
     // Following best practices: RINIT should only reset counters and lightweight state
+    
+    // Try to register SQL hooks lazily if they weren't found at MINIT
+    if (!orig_mysqli_query_func) {
+        orig_mysqli_query_func = zend_hash_str_find_ptr(CG(function_table), "mysqli_query", sizeof("mysqli_query")-1);
+        if (orig_mysqli_query_func && orig_mysqli_query_func->type == ZEND_INTERNAL_FUNCTION) {
+            orig_mysqli_query_handler = orig_mysqli_query_func->internal_function.handler;
+            orig_mysqli_query_func->internal_function.handler = zif_opaphp_mysqli_query;
+        }
+    }
+    
+    if (!orig_pdo_query_func) {
+        zend_class_entry *pdo_ce = zend_hash_str_find_ptr(CG(class_table), "PDO", sizeof("PDO")-1);
+        if (pdo_ce) {
+            orig_pdo_query_func = zend_hash_str_find_ptr(&pdo_ce->function_table, "query", sizeof("query")-1);
+            if (orig_pdo_query_func && orig_pdo_query_func->type == ZEND_INTERNAL_FUNCTION) {
+                orig_pdo_query_handler = orig_pdo_query_func->internal_function.handler;
+                orig_pdo_query_func->internal_function.handler = zim_PDO_query;
+            }
+        }
+    }
+    
+    if (!orig_pdo_stmt_execute_func) {
+        zend_class_entry *pdo_stmt_ce = zend_hash_str_find_ptr(CG(class_table), "PDOStatement", sizeof("PDOStatement")-1);
+        if (pdo_stmt_ce) {
+            orig_pdo_stmt_execute_func = zend_hash_str_find_ptr(&pdo_stmt_ce->function_table, "execute", sizeof("execute")-1);
+            if (orig_pdo_stmt_execute_func && orig_pdo_stmt_execute_func->type == ZEND_INTERNAL_FUNCTION) {
+                orig_pdo_stmt_execute_handler = orig_pdo_stmt_execute_func->internal_function.handler;
+                orig_pdo_stmt_execute_func->internal_function.handler = zim_PDOStatement_execute;
+            }
+        }
+    }
     
     // SIMPLE TEST - Write to file to verify code path is executing
     FILE *test_file = fopen("/tmp/opa_rinit_test.log", "a");
