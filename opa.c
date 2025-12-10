@@ -1427,27 +1427,64 @@ void opa_execute_ex(zend_execute_data *execute_data) {
     size_t curl_bytes_received_before = 0;
     
     // Try to detect curl by checking arguments BEFORE execution (when they're still available)
+    // For internal functions, ZEND_CALL_NUM_ARGS might not work, so try direct access
     if (execute_data && execute_data->func) {
+        // Try ZEND_CALL_NUM_ARGS first
         uint32_t num_args_before = ZEND_CALL_NUM_ARGS(execute_data);
-        debug_log("[execute_ex] BEFORE: num_args=%u, function_name=%s", num_args_before, function_name ? function_name : "NULL");
+        debug_log("[execute_ex] BEFORE: num_args=%u, function_name=%s, func_type=%d", 
+            num_args_before, function_name ? function_name : "NULL", execute_data->func->type);
+        
+        // For internal functions, try accessing arguments directly
+        zval *arg1_before = NULL;
         if (num_args_before > 0) {
-            zval *arg1_before = ZEND_CALL_ARG(execute_data, 1);
-            if (arg1_before && Z_TYPE_P(arg1_before) == IS_OBJECT) {
-                zend_class_entry *ce = Z_OBJCE_P(arg1_before);
+            arg1_before = ZEND_CALL_ARG(execute_data, 1);
+        } else if (execute_data->func->type == ZEND_INTERNAL_FUNCTION) {
+            // For internal functions, try accessing through ZEND_CALL_VAR_NUM
+            // This might work even if ZEND_CALL_NUM_ARGS returns 0
+            debug_log("[execute_ex] BEFORE: Internal function with num_args=0, trying direct access");
+            // Try to access first argument directly (might be at execute_data + offset)
+            // This is a workaround for PHP 8.4 internal function argument access
+            if (execute_data->This && Z_TYPE(execute_data->This) == IS_OBJECT) {
+                // For methods, This is the object
+                zend_class_entry *ce = Z_OBJCE(execute_data->This);
                 if (ce && ce->name) {
                     const char *class_name = ZSTR_VAL(ce->name);
                     size_t class_name_len = ZSTR_LEN(ce->name);
-                    debug_log("[execute_ex] BEFORE: arg1 is object, class=%.*s", (int)class_name_len, class_name);
+                    debug_log("[execute_ex] BEFORE: This is object, class=%.*s", (int)class_name_len, class_name);
                     if ((class_name_len == sizeof("CurlHandle")-1 && memcmp(class_name, "CurlHandle", sizeof("CurlHandle")-1) == 0) ||
                         (class_name_len == sizeof("CurlMultiHandle")-1 && memcmp(class_name, "CurlMultiHandle", sizeof("CurlMultiHandle")-1) == 0) ||
                         (class_name_len == sizeof("CurlShareHandle")-1 && memcmp(class_name, "CurlShareHandle", sizeof("CurlShareHandle")-1) == 0)) {
                         curl_func_before = 1;
-                        curl_handle_before = arg1_before;
+                        curl_handle_before = &execute_data->This;
                         curl_start_time = get_time_seconds();
                         curl_bytes_sent_before = get_bytes_sent();
                         curl_bytes_received_before = get_bytes_received();
-                        debug_log("[execute_ex] BEFORE: Detected curl call, storing handle");
+                        debug_log("[execute_ex] BEFORE: Detected curl call via This, storing handle");
                     }
+                }
+            }
+            // Also try ZEND_CALL_VAR_NUM for first argument (might work for internal functions)
+            arg1_before = ZEND_CALL_VAR_NUM(execute_data, 0);
+            if (arg1_before) {
+                debug_log("[execute_ex] BEFORE: Got arg1 via ZEND_CALL_VAR_NUM(0), type=%d", Z_TYPE_P(arg1_before));
+            }
+        }
+        
+        if (arg1_before && Z_TYPE_P(arg1_before) == IS_OBJECT) {
+            zend_class_entry *ce = Z_OBJCE_P(arg1_before);
+            if (ce && ce->name) {
+                const char *class_name = ZSTR_VAL(ce->name);
+                size_t class_name_len = ZSTR_LEN(ce->name);
+                debug_log("[execute_ex] BEFORE: arg1 is object, class=%.*s", (int)class_name_len, class_name);
+                if ((class_name_len == sizeof("CurlHandle")-1 && memcmp(class_name, "CurlHandle", sizeof("CurlHandle")-1) == 0) ||
+                    (class_name_len == sizeof("CurlMultiHandle")-1 && memcmp(class_name, "CurlMultiHandle", sizeof("CurlMultiHandle")-1) == 0) ||
+                    (class_name_len == sizeof("CurlShareHandle")-1 && memcmp(class_name, "CurlShareHandle", sizeof("CurlShareHandle")-1) == 0)) {
+                    curl_func_before = 1;
+                    curl_handle_before = arg1_before;
+                    curl_start_time = get_time_seconds();
+                    curl_bytes_sent_before = get_bytes_sent();
+                    curl_bytes_received_before = get_bytes_received();
+                    debug_log("[execute_ex] BEFORE: Detected curl call, storing handle");
                 }
             }
         }
