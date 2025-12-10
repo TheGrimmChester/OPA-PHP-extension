@@ -814,22 +814,213 @@ int is_pdo_method(zend_execute_data *execute_data) {
     return 0;
 }
 
+// PHP 8.4: Store curl class entry pointers for reliable detection (stable across PHP 8.x)
+static zend_class_entry *curl_ce = NULL;
+static zend_class_entry *curl_multi_ce = NULL;
+static zend_class_entry *curl_share_ce = NULL;
+
+// Helper to detect curl calls by checking if first argument is a CurlHandle object
+// This is stable across PHP 8.x regardless of function name/type/handler issues
+static int is_curl_call(zend_execute_data *execute_data, zval **curl_handle_out) {
+    // Defensive checks - be very careful here to avoid segfaults
+    if (!execute_data) {
+        return 0;
+    }
+    
+    // Check if execute_data is in a valid memory range (basic sanity check)
+    // We can't do much more without risking segfault, so just check pointer is not NULL
+    
+    zend_function *func = execute_data->func;
+    if (!func) {
+        return 0;
+    }
+    
+    /* Must have at least 1 argument - use safe access */
+    uint32_t num_args = 0;
+    // Try to get num_args safely - if this crashes, we'll know the issue
+    num_args = ZEND_CALL_NUM_ARGS(execute_data);
+    if (num_args < 1) {
+        return 0;
+    }
+    
+    /* First arg is potential handle - use safe access */
+    zval *arg1 = NULL;
+    // Use ZEND_CALL_ARG macro - if this crashes, execute_data is invalid
+    arg1 = ZEND_CALL_ARG(execute_data, 1);
+    if (!arg1) {
+        return 0;
+    }
+    
+    // Validate arg1 is readable (not undefined) - check type before accessing
+    if (Z_TYPE_P(arg1) == IS_UNDEF || Z_TYPE_P(arg1) == IS_NULL) {
+        return 0;
+    }
+    
+    /* PHP 8+: CurlHandle, CurlMultiHandle, CurlShareHandle objects */
+    if (Z_TYPE_P(arg1) == IS_OBJECT) {
+        // Use Z_OBJCE_P macro which is safer than manual access
+        zend_class_entry *ce = Z_OBJCE_P(arg1);
+        if (!ce) {
+            return 0;
+        }
+        
+        // Check by class entry pointer first (most reliable)
+        if ((curl_ce && ce == curl_ce) ||
+            (curl_multi_ce && ce == curl_multi_ce) ||
+            (curl_share_ce && ce == curl_share_ce)) {
+            if (curl_handle_out) {
+                *curl_handle_out = arg1;
+            }
+            return 1;
+        }
+        
+        // Fallback: check by class name (works even if class entry pointers aren't set)
+        if (ce->name) {
+            const char *class_name = ZSTR_VAL(ce->name);
+            size_t class_name_len = ZSTR_LEN(ce->name);
+            
+            if ((class_name_len == sizeof("CurlHandle")-1 && memcmp(class_name, "CurlHandle", sizeof("CurlHandle")-1) == 0) ||
+                (class_name_len == sizeof("CurlMultiHandle")-1 && memcmp(class_name, "CurlMultiHandle", sizeof("CurlMultiHandle")-1) == 0) ||
+                (class_name_len == sizeof("CurlShareHandle")-1 && memcmp(class_name, "CurlShareHandle", sizeof("CurlShareHandle")-1) == 0)) {
+                if (curl_handle_out) {
+                    *curl_handle_out = arg1;
+                }
+                return 1;
+            }
+        }
+    }
+    
+    /* Optional: legacy resource support if you care about <8.0 */
+    if (Z_TYPE_P(arg1) == IS_RESOURCE) {
+        // For PHP < 8.0, curl handles were resources
+        // We can check resource type if needed, but for PHP 8.4 we focus on objects
+        if (curl_handle_out) {
+            *curl_handle_out = arg1;
+        }
+        return 1; // Assume it's a curl resource
+    }
+    
+    return 0;
+}
+
 // Check if function is a cURL function
 int is_curl_function(zend_execute_data *execute_data) {
     if (!execute_data || !execute_data->func) {
         return 0;
     }
     
-    // Check if it's an internal function (cURL functions are internal)
-    if (execute_data->func->type == ZEND_INTERNAL_FUNCTION) {
-        if (execute_data->func->common.function_name) {
-            const char *function_name = ZSTR_VAL(execute_data->func->common.function_name);
-            // Check for curl_exec (main function we want to monitor)
-            if (strcmp(function_name, "curl_exec") == 0) {
+    // PHP 8.4: Don't rely on func->common.function_name (can be NULL)
+    // Instead, use function pointer comparison and CurlHandle class detection
+    // In PHP 8.4, internal functions can have type 1 (ZEND_INTERNAL_FUNCTION) or type 4
+    debug_log("[is_curl_function] Called: func=%p, func->type=%d, ZEND_INTERNAL_FUNCTION=%d", 
+        execute_data->func, execute_data->func->type, ZEND_INTERNAL_FUNCTION);
+    
+    if (execute_data->func->type != ZEND_INTERNAL_FUNCTION && execute_data->func->type != 4) {
+        debug_log("[is_curl_function] Not internal function (type=%d), returning 0", execute_data->func->type);
+        return 0;
+    }
+    
+    // Method 1: Check if this is a CurlHandle method by class name
+    // In PHP 8.4, curl functions might be called as methods on CurlHandle objects
+    debug_log("[is_curl_function] Checking This: Z_TYPE=%d, IS_OBJECT=%d", 
+        Z_TYPE(execute_data->This), IS_OBJECT);
+    if (Z_TYPE(execute_data->This) == IS_OBJECT) {
+        zend_class_entry *ce = Z_OBJCE(execute_data->This);
+        if (ce && ce->name) {
+            debug_log("[is_curl_function] This is object, class name: %s", ZSTR_VAL(ce->name));
+            if (ZSTR_LEN(ce->name) == sizeof("CurlHandle")-1 &&
+                memcmp(ZSTR_VAL(ce->name), "CurlHandle", sizeof("CurlHandle")-1) == 0) {
+                // This is a CurlHandle method (exec, setopt, etc.)
+                debug_log("[is_curl_function] Matched CurlHandle method");
                 return 1;
             }
         }
     }
+    
+    // Method 2: Look up curl functions in function table at runtime and compare function pointers
+    // This works even if function structures are copied in PHP 8.4
+    HashTable *func_table = EG(function_table);
+    if (func_table) {
+        const char *curl_funcs[] = {"curl_exec", "curl_setopt", "curl_init", "curl_close", NULL};
+        for (int i = 0; curl_funcs[i] != NULL; i++) {
+            zend_function *found_func = zend_hash_str_find_ptr(func_table, curl_funcs[i], strlen(curl_funcs[i]));
+            if (found_func && found_func == execute_data->func) {
+                debug_log("[is_curl_function] Matched %s via runtime function table lookup", curl_funcs[i]);
+                return 1;
+            }
+        }
+    }
+    
+    // Use argument-based detection (stable across PHP 8.x)
+    zval *curl_handle = NULL;
+    if (is_curl_call(execute_data, &curl_handle)) {
+        return 1;
+    }
+    
+    // Method 3: Fallback - check function_name if available (for older PHP versions)
+    if (execute_data->func->common.function_name) {
+        const char *function_name = ZSTR_VAL(execute_data->func->common.function_name);
+        if (strncmp(function_name, "curl_", 5) == 0) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+// Get curl function type: 1=curl_exec, 2=curl_setopt, 3=curl_multi_exec, 4=curl_init, 5=curl_close, 0=other
+// Now uses heuristics based on argument count and return type since we can't reliably identify by function name
+int get_curl_function_type(zend_execute_data *execute_data) {
+    if (!execute_data || !execute_data->func) {
+        return 0;
+    }
+    
+    // Try to get function name if available (fallback for older PHP versions)
+    // Add defensive check for common structure
+    if (execute_data->func->common.function_name) {
+        zend_string *func_name_str = execute_data->func->common.function_name;
+        if (func_name_str && ZSTR_VAL(func_name_str)) {
+            const char *function_name = ZSTR_VAL(func_name_str);
+            if (strcmp(function_name, "curl_exec") == 0) {
+                return 1;
+            } else if (strcmp(function_name, "curl_setopt") == 0 || strcmp(function_name, "curl_setopt_array") == 0) {
+                return 2;
+            } else if (strcmp(function_name, "curl_multi_exec") == 0) {
+                return 3;
+            } else if (strcmp(function_name, "curl_init") == 0) {
+                return 4;
+            } else if (strcmp(function_name, "curl_close") == 0) {
+                return 5;
+            }
+        }
+    }
+    
+    // TEMPORARILY DISABLED: is_curl_call causes segfault
+    // Heuristic: If it's a curl call, use argument count to determine type
+    // curl_exec($ch) takes 1 argument and returns string/false
+    // curl_setopt($ch, $option, $value) takes 3 arguments
+    // curl_init($url) takes 0-1 arguments
+    // curl_close($ch) takes 1 argument
+    // For now, rely only on function name detection above
+    /*
+    zval *curl_handle = NULL;
+    if (is_curl_call(execute_data, &curl_handle)) {
+        int num_args = ZEND_CALL_NUM_ARGS(execute_data);
+        // curl_exec typically has 1 arg (the handle)
+        // curl_setopt has 3 args
+        // curl_close has 1 arg
+        // curl_init has 0-1 args
+        if (num_args == 1) {
+            // Could be curl_exec or curl_close - assume curl_exec for now
+            // We can refine this by checking if it's called after curl_setopt
+            return 1; // Assume curl_exec
+        } else if (num_args == 3) {
+            return 2; // curl_setopt
+        } else if (num_args == 0 || num_args == 1) {
+            return 4; // curl_init
+        }
+    }
+    */
     
     return 0;
 }
@@ -1235,65 +1426,17 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         }
     }
     
-    // Check if this is a cURL function call and capture info BEFORE execution
-    int curl_func = is_curl_function(execute_data);
-    char *curl_url = NULL;
-    char *curl_method = NULL;
+    // Check for curl_exec in BEFORE section (capture timing before execution)
+    int curl_func_before = 0;
     double curl_start_time = 0.0;
     size_t curl_bytes_sent_before = 0;
     size_t curl_bytes_received_before = 0;
     
-    if (curl_func && execute_data && function_name && strcmp(function_name, "curl_exec") == 0) {
+    if (function_name && strcmp(function_name, "curl_exec") == 0) {
+        curl_func_before = 1;
         curl_start_time = get_time_seconds();
         curl_bytes_sent_before = get_bytes_sent();
         curl_bytes_received_before = get_bytes_received();
-        
-        // Get curl handle from first argument
-        if (ZEND_CALL_NUM_ARGS(execute_data) > 0) {
-            zval *curl_handle = ZEND_CALL_ARG(execute_data, 1);
-            if (curl_handle && (Z_TYPE_P(curl_handle) == IS_RESOURCE || Z_TYPE_P(curl_handle) == IS_OBJECT)) {
-                // Try to get URL and method from curl handle using curl_getinfo
-                // We'll use PHP function call to get curl info
-                zval curl_getinfo_func, curl_getinfo_args[1], curl_getinfo_ret;
-                ZVAL_UNDEF(&curl_getinfo_func);
-                ZVAL_UNDEF(&curl_getinfo_args[0]);
-                ZVAL_UNDEF(&curl_getinfo_ret);
-                
-                ZVAL_STRING(&curl_getinfo_func, "curl_getinfo");
-                ZVAL_COPY(&curl_getinfo_args[0], curl_handle);
-                
-                zend_fcall_info fci;
-                zend_fcall_info_cache fcc;
-                if (zend_fcall_info_init(&curl_getinfo_func, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
-                    fci.size = sizeof(fci);
-                    ZVAL_UNDEF(&fci.function_name);
-                    fci.object = NULL;
-                    fci.param_count = 1;
-                    fci.params = curl_getinfo_args;
-                    fci.retval = &curl_getinfo_ret;
-                    
-                    if (zend_call_function(&fci, &fcc) == SUCCESS) {
-                        if (Z_TYPE(curl_getinfo_ret) == IS_ARRAY) {
-                            zval *url_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "url", sizeof("url") - 1);
-                            if (url_val && Z_TYPE_P(url_val) == IS_STRING) {
-                                curl_url = estrdup(Z_STRVAL_P(url_val));
-                            }
-                            
-                            // Try to get HTTP method from CURLOPT_CUSTOMREQUEST or default to GET
-                            zval *method_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "request_method", sizeof("request_method") - 1);
-                            if (method_val && Z_TYPE_P(method_val) == IS_STRING) {
-                                curl_method = estrdup(Z_STRVAL_P(method_val));
-                            } else {
-                                curl_method = estrdup("GET");
-                            }
-                        }
-                        zval_dtor(&curl_getinfo_ret);
-                    }
-                }
-                zval_dtor(&curl_getinfo_func);
-                zval_dtor(&curl_getinfo_args[0]);
-            }
-        }
     }
     
     // Check if this is an APCu function call and capture info BEFORE execution
@@ -1341,17 +1484,66 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         efree(sql);
     }
     
-    // Capture HTTP request info AFTER execution if it's a cURL function
-    if (curl_func && call_id && function_name && strcmp(function_name, "curl_exec") == 0) {
+    // Re-check curl function after execution using argument-based detection
+    // Only check if function has at least 1 argument
+    zval *curl_handle_after = NULL;
+    int curl_func_after = 0;
+    int curl_func_type_after = 0;
+    
+    // Detect curl_exec calls using function name (stable in PHP 8.4)
+    // After segfault fix, we can now safely detect curl functions
+    if (function_name && strcmp(function_name, "curl_exec") == 0) {
+        curl_func_after = 1;
+        curl_func_type_after = 1; // curl_exec
+        
+        // Try to get curl handle from first argument (AFTER execution, but function name check is safe)
+        if (ZEND_CALL_NUM_ARGS(execute_data) > 0) {
+            curl_handle_after = ZEND_CALL_ARG(execute_data, 1);
+            // Validate handle is valid
+            if (curl_handle_after && (Z_TYPE_P(curl_handle_after) == IS_UNDEF || Z_TYPE_P(curl_handle_after) == IS_NULL)) {
+                curl_handle_after = NULL;
+            }
+        }
+    }
+    
+    // TODO: Re-enable is_curl_call once segfault is fixed
+    /*
+    if (execute_data && execute_data->func) {
+        uint32_t num_args = ZEND_CALL_NUM_ARGS(execute_data);
+        if (num_args > 0) {
+            curl_func_after = is_curl_call(execute_data, &curl_handle_after);
+            if (curl_func_after) {
+                curl_func_type_after = get_curl_function_type(execute_data);
+            }
+        }
+    }
+    */
+    
+    debug_log("[execute_ex] AFTER curl check: curl_func_after=%d, curl_func_type_after=%d, call_id=%s", 
+        curl_func_after, curl_func_type_after, call_id ? call_id : "NULL");
+    
+    // Capture HTTP request info AFTER execution if it's curl_exec
+    // Declare variables outside the if block so they're accessible
+    double curl_duration = 0.0;
+    size_t curl_bytes_sent = 0;
+    size_t curl_bytes_received = 0;
+    int status_code = 0;
+    const char *error = NULL;
+    char *curl_url = NULL;
+    char *curl_method = NULL;
+    
+    // Process curl_exec calls and capture HTTP request details
+    if (curl_func_after && curl_func_type_after == 1) {
+        debug_log("[execute_ex] Processing curl_exec - curl_func_after=%d, curl_func_type_after=%d, call_id=%s", 
+            curl_func_after, curl_func_type_after, call_id ? call_id : "NULL");
+        
+        // Calculate duration and bytes from BEFORE section
         double curl_end_time = get_time_seconds();
-        double curl_duration = curl_end_time - curl_start_time;
+        curl_duration = curl_end_time - curl_start_time;
         size_t curl_bytes_sent_after = get_bytes_sent();
         size_t curl_bytes_received_after = get_bytes_received();
-        size_t curl_bytes_sent = curl_bytes_sent_after - curl_bytes_sent_before;
-        size_t curl_bytes_received = curl_bytes_received_after - curl_bytes_received_before;
-        
-        int status_code = 0;
-        const char *error = NULL;
+        curl_bytes_sent = curl_bytes_sent_after - curl_bytes_sent_before;
+        curl_bytes_received = curl_bytes_received_after - curl_bytes_received_before;
         
         // Try to get status code, headers, and other details from curl handle
         char *request_headers_str = NULL;
@@ -1363,9 +1555,9 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         double total_time = 0.0;
         size_t response_size = curl_bytes_received;
         
-        if (ZEND_CALL_NUM_ARGS(execute_data) > 0) {
-            zval *curl_handle = ZEND_CALL_ARG(execute_data, 1);
-            if (curl_handle && (Z_TYPE_P(curl_handle) == IS_RESOURCE || Z_TYPE_P(curl_handle) == IS_OBJECT)) {
+        // Use curl_handle_after obtained from function name detection
+        if (curl_handle_after && (Z_TYPE_P(curl_handle_after) == IS_RESOURCE || Z_TYPE_P(curl_handle_after) == IS_OBJECT)) {
+            zval *curl_handle = curl_handle_after;
                 // Get full curl_getinfo array with all details
                 zval curl_getinfo_func, curl_getinfo_args[1], curl_getinfo_ret;
                 ZVAL_UNDEF(&curl_getinfo_func);
@@ -1387,6 +1579,20 @@ void opa_execute_ex(zend_execute_data *execute_data) {
                     
                     if (zend_call_function(&fci, &fcc) == SUCCESS) {
                         if (Z_TYPE(curl_getinfo_ret) == IS_ARRAY) {
+                            // Get URL
+                            zval *url_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "url", sizeof("url") - 1);
+                            if (url_val && Z_TYPE_P(url_val) == IS_STRING) {
+                                curl_url = estrdup(Z_STRVAL_P(url_val));
+                            }
+                            
+                            // Get HTTP method from request_method or default to GET
+                            zval *method_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "request_method", sizeof("request_method") - 1);
+                            if (method_val && Z_TYPE_P(method_val) == IS_STRING) {
+                                curl_method = estrdup(Z_STRVAL_P(method_val));
+                            } else {
+                                curl_method = estrdup("GET");
+                            }
+                            
                             // Get status code
                             zval *status_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "http_code", sizeof("http_code") - 1);
                             if (status_val && Z_TYPE_P(status_val) == IS_LONG) {
@@ -1451,33 +1657,32 @@ void opa_execute_ex(zend_execute_data *execute_data) {
                 zval_dtor(&curl_getinfo_func);
                 zval_dtor(&curl_getinfo_args[0]);
                 
-                // Get error if any
-                zval curl_error_func, curl_error_args[1], curl_error_ret;
-                ZVAL_UNDEF(&curl_error_func);
-                ZVAL_UNDEF(&curl_error_args[0]);
-                ZVAL_UNDEF(&curl_error_ret);
+            // Get error if any
+            zval curl_error_func, curl_error_args[1], curl_error_ret;
+            ZVAL_UNDEF(&curl_error_func);
+            ZVAL_UNDEF(&curl_error_args[0]);
+            ZVAL_UNDEF(&curl_error_ret);
+            
+            ZVAL_STRING(&curl_error_func, "curl_error");
+            ZVAL_COPY(&curl_error_args[0], curl_handle);
+            
+            if (zend_fcall_info_init(&curl_error_func, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
+                fci.size = sizeof(fci);
+                ZVAL_UNDEF(&fci.function_name);
+                fci.object = NULL;
+                fci.param_count = 1;
+                fci.params = curl_error_args;
+                fci.retval = &curl_error_ret;
                 
-                ZVAL_STRING(&curl_error_func, "curl_error");
-                ZVAL_COPY(&curl_error_args[0], curl_handle);
-                
-                if (zend_fcall_info_init(&curl_error_func, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
-                    fci.size = sizeof(fci);
-                    ZVAL_UNDEF(&fci.function_name);
-                    fci.object = NULL;
-                    fci.param_count = 1;
-                    fci.params = curl_error_args;
-                    fci.retval = &curl_error_ret;
-                    
-                    if (zend_call_function(&fci, &fcc) == SUCCESS) {
-                        if (Z_TYPE(curl_error_ret) == IS_STRING && Z_STRLEN(curl_error_ret) > 0) {
-                            error = estrdup(Z_STRVAL(curl_error_ret));
-                        }
-                        zval_dtor(&curl_error_ret);
+                if (zend_call_function(&fci, &fcc) == SUCCESS) {
+                    if (Z_TYPE(curl_error_ret) == IS_STRING && Z_STRLEN(curl_error_ret) > 0) {
+                        error = estrdup(Z_STRVAL(curl_error_ret));
                     }
+                    zval_dtor(&curl_error_ret);
                 }
-                zval_dtor(&curl_error_func);
-                zval_dtor(&curl_error_args[0]);
             }
+            zval_dtor(&curl_error_func);
+            zval_dtor(&curl_error_args[0]);
         }
         
         // Log HTTP response code for cURL requests
@@ -1893,6 +2098,14 @@ PHP_MINIT_FUNCTION(opa) {
         php_printf("[OPA] PDOStatement class not found at MINIT\n");
     }
     
+    // PHP 8.4: Get CurlHandle class entry pointers for reliable detection
+    // NOTE: EG(class_table) is NULL at MINIT time in PHP 8.4, so we defer lookup to RINIT
+    // Initialize pointers to NULL - will be set in RINIT when class_table is available
+    curl_ce = NULL;
+    curl_multi_ce = NULL;
+    curl_share_ce = NULL;
+    php_printf("[OPA] CurlHandle class lookup deferred to RINIT (class_table not available at MINIT)\n");
+    
     return SUCCESS;
 }
 
@@ -2004,6 +2217,28 @@ PHP_RINIT_FUNCTION(opa) {
                 orig_pdo_stmt_execute_handler = orig_pdo_stmt_execute_func->internal_function.handler;
                 orig_pdo_stmt_execute_func->internal_function.handler = zim_PDOStatement_execute;
             }
+        }
+    }
+    
+    // Look up curl class entries at RINIT time when class_table is available
+    if (!curl_ce && EG(class_table)) {
+        curl_ce = zend_hash_str_find_ptr(EG(class_table), "CurlHandle", sizeof("CurlHandle")-1);
+        if (curl_ce) {
+            php_printf("[OPA] CurlHandle class found at RINIT\n");
+        }
+    }
+
+    if (!curl_multi_ce && EG(class_table)) {
+        curl_multi_ce = zend_hash_str_find_ptr(EG(class_table), "CurlMultiHandle", sizeof("CurlMultiHandle")-1);
+        if (curl_multi_ce) {
+            php_printf("[OPA] CurlMultiHandle class found at RINIT\n");
+        }
+    }
+
+    if (!curl_share_ce && EG(class_table)) {
+        curl_share_ce = zend_hash_str_find_ptr(EG(class_table), "CurlShareHandle", sizeof("CurlShareHandle")-1);
+        if (curl_share_ce) {
+            php_printf("[OPA] CurlShareHandle class found at RINIT\n");
         }
     }
     
