@@ -108,10 +108,13 @@ jobs:
       
       - name: Start agent
         run: |
+          # Use host.docker.internal to access ClickHouse service via host
+          # GitHub Actions services expose ports to localhost, so we access via host gateway
           docker run -d \
             --name opa-agent \
             --network opa_network \
-            -e CLICKHOUSE_URL=http://clickhouse:8123 \
+            --add-host host.docker.internal:host-gateway \
+            -e CLICKHOUSE_URL=http://host.docker.internal:8123 \
             -e TRANSPORT_TCP=:9090 \
             -p 8081:8080 \
             -p 9090:9090 \
