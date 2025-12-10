@@ -26,6 +26,9 @@ jobs:
     name: SQL E2E Test (PHP ${{ matrix.php_version }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
     strategy:
       matrix:
         php_version: ['8.3', '8.4', '8.5']
@@ -54,44 +57,31 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
       - name: Create Docker network
         run: docker network create opa_network || true
       
-      - name: Checkout parent repository (for agent)
-        id: checkout-parent
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/opa
-          path: parent-repo
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
-        continue-on-error: true
-      
-      - name: Build agent
-        id: build-agent
-        if: steps.checkout-parent.outcome == 'success'
-        working-directory: parent-repo/agent
+      - name: Pull agent image
         run: |
-          if [ ! -f Dockerfile ]; then
-            echo "ERROR: Dockerfile not found in parent-repo/agent"
-            exit 1
-          fi
-          docker build --no-cache -t opa-agent .
-          docker tag opa-agent:latest ghcr.io/thegrimmchester/opa-agent:latest
-        continue-on-error: true
-      
-      - name: Use pre-built agent image (if build failed or checkout failed)
-        if: steps.build-agent.outcome == 'failure' || steps.checkout-parent.outcome == 'failure' || steps.build-agent.outcome == 'skipped'
-        run: |
-          echo "Agent build failed or parent repo checkout failed, trying to use pre-built image"
+          echo "Pulling published agent image from registry"
           if docker pull ghcr.io/thegrimmchester/opa-agent:latest; then
             docker tag ghcr.io/thegrimmchester/opa-agent:latest opa-agent:latest
             echo "Using latest tag"
           elif docker pull ghcr.io/thegrimmchester/opa-agent:main; then
             docker tag ghcr.io/thegrimmchester/opa-agent:main opa-agent:latest
             echo "Using main tag"
+          elif docker pull ghcr.io/thegrimmchester/opa-agent:sha-$(echo ${{ github.sha }} | cut -c1-7); then
+            docker tag ghcr.io/thegrimmchester/opa-agent:sha-$(echo ${{ github.sha }} | cut -c1-7) opa-agent:latest
+            echo "Using SHA tag"
           else
-            echo "ERROR: Could not pull agent image and build failed"
+            echo "ERROR: Could not pull agent image from registry"
+            echo "Tried tags: latest, main, sha-$(echo ${{ github.sha }} | cut -c1-7)"
             echo "Available images:"
             docker images | grep opa-agent || echo "No opa-agent images found"
             exit 1

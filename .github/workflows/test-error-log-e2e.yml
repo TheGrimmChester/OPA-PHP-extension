@@ -1,4 +1,4 @@
-name: cURL Profiling E2E Test
+name: Error and Log Tracking E2E Test
 
 on:
   push:
@@ -8,9 +8,9 @@ on:
       - '**/*.h'
       - 'Dockerfile*'
       - 'docker-compose*.yml'
-      - 'test_curl*.sh'
-      - 'test_http_mock_server.py'
-      - '.github/workflows/test-curl-e2e.yml'
+      - 'test_error_log*.sh'
+      - 'tests/error_log*.php'
+      - '.github/workflows/test-error-log-e2e.yml'
   pull_request:
     branches: [ main, develop ]
     paths:
@@ -18,14 +18,14 @@ on:
       - '**/*.h'
       - 'Dockerfile*'
       - 'docker-compose*.yml'
-      - 'test_curl*.sh'
-      - 'test_http_mock_server.py'
-      - '.github/workflows/test-curl-e2e.yml'
+      - 'test_error_log*.sh'
+      - 'tests/error_log*.php'
+      - '.github/workflows/test-error-log-e2e.yml'
   workflow_dispatch:
 
 jobs:
-  test-curl-e2e:
-    name: cURL E2E Test (PHP ${{ matrix.php_version }})
+  test-error-log-e2e:
+    name: Error/Log E2E Test (PHP ${{ matrix.php_version }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -127,16 +127,19 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 curl jq lsof
+          sudo apt-get install -y curl jq
       
-      - name: Run cURL E2E test
+      - name: Run Error/Log E2E test
         env:
           CI_MODE: 1
           API_URL: http://localhost:8081
           PROJECT_ROOT: ${{ github.workspace }}/..
+          CLICKHOUSE_HOST: clickhouse
+          CLICKHOUSE_PORT: 9000
+          CLICKHOUSE_HTTP_PORT: 8123
         run: |
-          chmod +x test_curl_ci_e2e.sh test_http_mock_server.py
-          ./test_curl_ci_e2e.sh --ci
+          chmod +x test_error_log_ci_e2e.sh
+          ./test_error_log_ci_e2e.sh --ci
       
       - name: Cleanup
         if: always()
@@ -145,4 +148,3 @@ jobs:
           docker stop opa-agent || true
           docker rm opa-agent || true
           docker network rm opa_network || true
-
