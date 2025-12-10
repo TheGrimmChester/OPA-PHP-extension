@@ -25,8 +25,13 @@ on:
 
 jobs:
   test-curl-e2e:
+    name: cURL E2E Test (PHP ${{ matrix.php_version }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      matrix:
+        php_version: ['8.3', '8.4', '8.5']
+      fail-fast: false
     
     services:
       clickhouse:
@@ -55,9 +60,10 @@ jobs:
         run: docker network create opa_network || true
       
       - name: Checkout parent repository (for agent)
+        id: checkout-parent
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/myapm
+          repository: ${{ github.repository_owner }}/opa
           path: parent-repo
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
@@ -65,19 +71,43 @@ jobs:
       
       - name: Build agent
         id: build-agent
+        if: steps.checkout-parent.outcome == 'success'
         working-directory: parent-repo/agent
         run: |
-          docker build --no-cache -t myapm-agent .
-          docker tag myapm-agent:latest ghcr.io/thegrimmchester/opa-agent:latest
+          if [ ! -f Dockerfile ]; then
+            echo "ERROR: Dockerfile not found in parent-repo/agent"
+            exit 1
+          fi
+          docker build --no-cache -t opa-agent .
+          docker tag opa-agent:latest ghcr.io/thegrimmchester/opa-agent:latest
         continue-on-error: true
       
-      - name: Use pre-built agent image (if build failed)
-        if: steps.build-agent.outcome == 'failure'
+      - name: Use pre-built agent image (if build failed or checkout failed)
+        if: steps.build-agent.outcome == 'failure' || steps.checkout-parent.outcome == 'failure' || steps.build-agent.outcome == 'skipped'
         run: |
-          echo "Agent build failed, trying to use pre-built image"
-          docker pull ghcr.io/thegrimmchester/opa-agent:latest || docker pull ghcr.io/thegrimmchester/opa-agent:main || true
-          docker tag ghcr.io/thegrimmchester/opa-agent:latest myapm-agent:latest 2>/dev/null || \
-          docker tag ghcr.io/thegrimmchester/opa-agent:main myapm-agent:latest 2>/dev/null || true
+          echo "Agent build failed or parent repo checkout failed, trying to use pre-built image"
+          if docker pull ghcr.io/thegrimmchester/opa-agent:latest; then
+            docker tag ghcr.io/thegrimmchester/opa-agent:latest opa-agent:latest
+            echo "Using latest tag"
+          elif docker pull ghcr.io/thegrimmchester/opa-agent:main; then
+            docker tag ghcr.io/thegrimmchester/opa-agent:main opa-agent:latest
+            echo "Using main tag"
+          else
+            echo "ERROR: Could not pull agent image and build failed"
+            echo "Available images:"
+            docker images | grep opa-agent || echo "No opa-agent images found"
+            exit 1
+          fi
+      
+      - name: Verify agent image exists
+        run: |
+          if ! docker images opa-agent:latest --format "{{.Repository}}:{{.Tag}}" | grep -q "opa-agent:latest"; then
+            echo "ERROR: Agent image opa-agent:latest does not exist"
+            docker images
+            exit 1
+          fi
+          echo "Agent image verified:"
+          docker images opa-agent:latest
       
       - name: Start agent
         run: |
@@ -87,20 +117,22 @@ jobs:
             -e CLICKHOUSE_URL=http://clickhouse:8123 \
             -e TRANSPORT_TCP=:9090 \
             -p 8081:8080 \
-            myapm-agent:latest
+            opa-agent:latest
           sleep 5
           for i in {1..30}; do
             if curl -f http://localhost:8081/api/health > /dev/null 2>&1; then
               echo "Agent is ready"
               break
             fi
+            echo "Waiting for agent... ($i/30)"
             sleep 1
           done
           curl -f http://localhost:8081/api/health || exit 1
       
       - name: Build PHP extension image
         run: |
-          docker build --no-cache -t php-extension-test .
+          echo "Building PHP extension for PHP ${{ matrix.php_version }}"
+          docker build --no-cache --build-arg PHP_VERSION=${{ matrix.php_version }} -t php-extension-test .
       
       - name: Install dependencies
         run: |
@@ -119,7 +151,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker-compose -f docker-compose.test.yml down || true
+          docker compose -f docker-compose.test.yml down || true
           docker stop opa-agent || true
           docker rm opa-agent || true
           docker network rm opa_network || true

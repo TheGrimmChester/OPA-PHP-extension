@@ -35,7 +35,8 @@ RUN pecl install redis || echo "Warning: Redis extension installation failed (ne
 
 WORKDIR /usr/src/opa
 
-COPY *.c *.h config.m4 /usr/src/opa/
+COPY config.m4 configure.ac /usr/src/opa/
+COPY src/ /usr/src/opa/src/
 
 RUN phpize && \
     ./configure --enable-opa && \
