@@ -15,6 +15,6 @@ if test "$PHP_OPA" != "no"; then
   PHP_CHECK_LIBRARY(mysqlclient, mysql_init,
     [AC_DEFINE(HAVE_MYSQLI, 1, [MySQLi support available])], [], [])
   
-  PHP_NEW_EXTENSION(opa, opa.c span.c call_node.c transport.c serialize.c opa_api.c error_tracking.c, $ext_shared, , -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DCOMPILE_DL_OPA=1)
+  PHP_NEW_EXTENSION(opa, src/opa.c src/span.c src/call_node.c src/transport.c src/serialize.c src/opa_api.c src/error_tracking.c, $ext_shared, , -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DCOMPILE_DL_OPA=1)
   PHP_SUBST(OPA_SHARED_LIBADD)
 fi
