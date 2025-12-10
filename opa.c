@@ -822,6 +822,7 @@ static zend_class_entry *curl_share_ce = NULL;
 // Helper to detect curl calls by checking if first argument is a CurlHandle object
 // This is stable across PHP 8.x regardless of function name/type/handler issues
 static int is_curl_call(zend_execute_data *execute_data, zval **curl_handle_out) {
+    debug_log("[is_curl_call] ENTRY: execute_data=%p", execute_data);
     if (!execute_data) {
         debug_log("[is_curl_call] execute_data=NULL");
         return 0;
@@ -1484,10 +1485,15 @@ void opa_execute_ex(zend_execute_data *execute_data) {
     
     // Detect curl_exec calls - try is_curl_call first (works when function_name is NULL)
     // Then fallback to function name detection
+    debug_log("[execute_ex] Before curl detection: execute_data=%p, func=%p, function_name=%s", 
+        execute_data, execute_data ? execute_data->func : NULL, function_name ? function_name : "NULL");
     if (execute_data && execute_data->func) {
         uint32_t num_args = ZEND_CALL_NUM_ARGS(execute_data);
+        debug_log("[execute_ex] Checking curl: num_args=%u", num_args);
         if (num_args > 0) {
+            debug_log("[execute_ex] Calling is_curl_call with num_args=%u", num_args);
             curl_func_after = is_curl_call(execute_data, &curl_handle_after);
+            debug_log("[execute_ex] is_curl_call returned: %d", curl_func_after);
             if (curl_func_after) {
                 // Check if it's curl_exec by argument count (curl_exec has 1 arg)
                 if (num_args == 1) {
@@ -1496,7 +1502,12 @@ void opa_execute_ex(zend_execute_data *execute_data) {
                     curl_func_type_after = get_curl_function_type(execute_data);
                 }
             }
+        } else {
+            debug_log("[execute_ex] Skipping is_curl_call: num_args=%u (need > 0)", num_args);
         }
+    } else {
+        debug_log("[execute_ex] Skipping curl detection: execute_data=%p, func=%p", 
+            execute_data, execute_data ? execute_data->func : NULL);
     }
     
     // Fallback: function name detection (for older PHP versions or when is_curl_call fails)
