@@ -45,13 +45,23 @@ fi
 TESTS_PASSED=0
 TESTS_FAILED=0
 
+# Detect docker compose command (support both 'docker compose' and 'docker-compose')
+if command -v docker-compose >/dev/null 2>&1 && docker-compose version >/dev/null 2>&1; then
+    DOCKER_COMPOSE="docker-compose"
+elif docker compose version >/dev/null 2>&1; then
+    DOCKER_COMPOSE="docker compose"
+else
+    log_error "Neither 'docker compose' nor 'docker-compose' is available"
+    exit 1
+fi
+
 # Cleanup function
 cleanup() {
     local exit_code=$?
     cd "${PHP_EXTENSION_DIR}" || true
     
     # Stop MySQL test container
-    docker compose -f docker-compose.test.yml down > /dev/null 2>&1 || true
+    ${DOCKER_COMPOSE} -f docker-compose.test.yml down > /dev/null 2>&1 || true
     
     return $exit_code
 }
@@ -109,17 +119,24 @@ start_mysql() {
     log_info "Starting MySQL test database..."
     
     # Start MySQL using docker compose
-    docker compose -f docker-compose.test.yml up -d mysql-test 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
+    local compose_output
+    compose_output=$(${DOCKER_COMPOSE} -f docker-compose.test.yml up -d mysql-test 2>&1) || true
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        echo "$compose_output" | grep -v "Creating\|Created\|Starting\|Started" || true
+    fi
     
     # Wait for MySQL to be ready
     local max_attempts=30
     local attempt=0
     while [[ $attempt -lt $max_attempts ]]; do
-        if docker compose -f docker-compose.test.yml exec -T mysql-test mysqladmin ping -h localhost -u root -p"${MYSQL_ROOT_PASSWORD}" --silent 2>/dev/null; then
+        if ${DOCKER_COMPOSE} -f docker-compose.test.yml exec -T mysql-test mysqladmin ping -h localhost -u root -p"${MYSQL_ROOT_PASSWORD}" --silent 2>/dev/null; then
             log_info "MySQL is ready"
             
+            # Give MySQL a moment to fully initialize after health check
+            sleep 2
+            
             # Create database and user if they don't exist
-            docker compose -f docker-compose.test.yml exec -T mysql-test mysql -u root -p"${MYSQL_ROOT_PASSWORD}" <<EOF 2>/dev/null || true
+            ${DOCKER_COMPOSE} -f docker-compose.test.yml exec -T mysql-test mysql -u root -p"${MYSQL_ROOT_PASSWORD}" <<EOF 2>/dev/null || true
 CREATE DATABASE IF NOT EXISTS ${MYSQL_DATABASE};
 CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
 GRANT ALL PRIVILEGES ON ${MYSQL_DATABASE}.* TO '${MYSQL_USER}'@'%';
@@ -137,7 +154,7 @@ EOF
     
     log_error "MySQL failed to start"
     if [[ "$VERBOSE" -eq 1 ]]; then
-        docker compose -f docker-compose.test.yml logs mysql-test 2>&1 | tail -20
+        ${DOCKER_COMPOSE} -f docker-compose.test.yml logs mysql-test 2>&1 | tail -20
     fi
     return 1
 }
@@ -317,7 +334,7 @@ EOF
     MYSQL_DATABASE="$MYSQL_DATABASE" \
     MYSQL_USER="$MYSQL_USER" \
     MYSQL_PASSWORD="$MYSQL_PASSWORD" \
-    docker compose -f docker-compose.test.yml run --rm \
+    ${DOCKER_COMPOSE} -f docker-compose.test.yml run --rm \
         -e MYSQL_HOST="$MYSQL_HOST" \
         -e MYSQL_PORT="$MYSQL_PORT" \
         -e MYSQL_DATABASE="$MYSQL_DATABASE" \
@@ -335,7 +352,8 @@ EOF
     rm -f "$test_script"
     
     # Give agent time to process and batch traces
-    sleep 5
+    # Agent batches traces every 1 second or when 100 traces are collected
+    sleep 8
     
     # Check agent health after waiting
     if [[ "$VERBOSE" -eq 1 ]] || [[ "$CI_MODE" -eq 1 ]]; then
@@ -375,9 +393,22 @@ query_clickhouse() {
         echo "$result"
         return $exit_code
     else
-        # Fallback: try docker-compose (for local testing)
-        result=$(docker compose exec -T clickhouse clickhouse-client --query "$query" 2>&1)
-        exit_code=$?
+        # Fallback: try docker-compose from main project (for local testing)
+        if [[ -f "${PROJECT_ROOT}/docker-compose.yml" ]]; then
+            result=$(cd "${PROJECT_ROOT}" && ${DOCKER_COMPOSE} exec -T clickhouse clickhouse-client --query "$query" 2>&1)
+            exit_code=$?
+        else
+            # Last resort: try direct docker exec on clickhouse container
+            local clickhouse_name
+            clickhouse_name=$(docker ps --filter "name=clickhouse" --format "{{.Names}}" | head -1)
+            if [[ -n "$clickhouse_name" ]]; then
+                result=$(docker exec "$clickhouse_name" clickhouse-client --query "$query" 2>&1)
+                exit_code=$?
+            else
+                result="ClickHouse container not found"
+                exit_code=1
+            fi
+        fi
         
         if [[ $exit_code -ne 0 ]] && [[ "$VERBOSE" -eq 1 ]]; then
             log_warn "ClickHouse query failed via docker-compose (exit code: $exit_code): $result"
@@ -414,7 +445,9 @@ wait_for_trace() {
         fi
     fi
     
-    local max_attempts=30
+    # Agent batches traces every 1 second or when 100 traces are collected
+    # Allow more time for batching and ClickHouse write operations
+    local max_attempts=45
     local attempt=0
     
     while [[ $attempt -lt $max_attempts ]]; do
@@ -623,17 +656,18 @@ main() {
     echo "Running tests..."
     echo ""
     
-    # Add a small delay to ensure MySQL is fully ready for connections
-    sleep 1
+    # Add a delay to ensure MySQL is fully ready for connections
+    # MySQL healthcheck passes when it can ping, but it may need more time for connections
+    sleep 3
     
     # Run PHP test
     if ! run_php_test; then
         log_error "PHP test failed"
         if [[ "$VERBOSE" -eq 1 ]] || [[ "$CI_MODE" -eq 1 ]]; then
             log_info "Checking MySQL container status..."
-            docker compose -f docker-compose.test.yml ps mysql-test 2>&1 || true
-            log_info "Checking MySQL logs (last 20 lines)..."
-            docker compose -f docker-compose.test.yml logs --tail 20 mysql-test 2>&1 || true
+                ${DOCKER_COMPOSE} -f docker-compose.test.yml ps mysql-test 2>&1 || true
+                log_info "Checking MySQL logs (last 20 lines)..."
+                ${DOCKER_COMPOSE} -f docker-compose.test.yml logs --tail 20 mysql-test 2>&1 || true
         fi
         exit 1
     fi
