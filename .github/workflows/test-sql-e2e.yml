@@ -108,13 +108,15 @@ jobs:
       
       - name: Start agent
         run: |
-          # Use host.docker.internal to access ClickHouse service via host
-          # GitHub Actions services expose ports to localhost, so we access via host gateway
+          # Use 172.17.0.1 (Docker bridge gateway) to access ClickHouse service via host
+          # GitHub Actions services expose ports to localhost, and 172.17.0.1 is the default bridge gateway
+          # This is more reliable than host.docker.internal in GitHub Actions environment
+          echo "Starting agent with ClickHouse URL: http://172.17.0.1:8123"
           docker run -d \
             --name opa-agent \
             --network opa_network \
             --add-host host.docker.internal:host-gateway \
-            -e CLICKHOUSE_URL=http://host.docker.internal:8123 \
+            -e CLICKHOUSE_URL=http://172.17.0.1:8123 \
             -e TRANSPORT_TCP=:9090 \
             -p 8081:8080 \
             -p 9090:9090 \
@@ -129,6 +131,14 @@ jobs:
             sleep 1
           done
           curl -f http://localhost:8081/api/health || exit 1
+          
+          # Check agent logs for ClickHouse connection issues
+          echo "Agent logs (last 50 lines):"
+          docker logs opa-agent --tail 50 || true
+          
+          # Test if agent can reach ClickHouse
+          echo "Testing ClickHouse connectivity from agent container..."
+          docker exec opa-agent wget --spider -q http://172.17.0.1:8123/ping && echo "ClickHouse is reachable from agent" || echo "WARNING: ClickHouse may not be reachable from agent"
       
       - name: Build PHP extension image
         run: |
