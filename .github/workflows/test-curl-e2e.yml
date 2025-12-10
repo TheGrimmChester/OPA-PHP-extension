@@ -69,24 +69,33 @@ jobs:
       - name: Create Docker network
         run: docker network create opa_network || true
       
-      - name: Pull agent image
+      - name: Pull or build agent image
+        id: agent-image
         run: |
-          echo "Pulling published agent image from registry"
+          echo "Attempting to pull published agent image from registry"
           if docker pull ghcr.io/thegrimmchester/opa-agent:latest; then
             docker tag ghcr.io/thegrimmchester/opa-agent:latest opa-agent:latest
-            echo "Using latest tag"
+            echo "Using latest tag from registry"
+            echo "image_source=registry" >> $GITHUB_OUTPUT
           elif docker pull ghcr.io/thegrimmchester/opa-agent:main; then
             docker tag ghcr.io/thegrimmchester/opa-agent:main opa-agent:latest
-            echo "Using main tag"
+            echo "Using main tag from registry"
+            echo "image_source=registry" >> $GITHUB_OUTPUT
           elif docker pull ghcr.io/thegrimmchester/opa-agent:sha-$(echo ${{ github.sha }} | cut -c1-7); then
             docker tag ghcr.io/thegrimmchester/opa-agent:sha-$(echo ${{ github.sha }} | cut -c1-7) opa-agent:latest
-            echo "Using SHA tag"
+            echo "Using SHA tag from registry"
+            echo "image_source=registry" >> $GITHUB_OUTPUT
           else
-            echo "ERROR: Could not pull agent image from registry"
-            echo "Tried tags: latest, main, sha-$(echo ${{ github.sha }} | cut -c1-7)"
-            echo "Available images:"
-            docker images | grep opa-agent || echo "No opa-agent images found"
-            exit 1
+            echo "Published images not found, building from agent repository"
+            git clone --depth 1 https://github.com/TheGrimmChester/OPA-Agent.git agent-repo || exit 1
+            cd agent-repo
+            if [ ! -f Dockerfile ]; then
+              echo "ERROR: Dockerfile not found in agent repository"
+              exit 1
+            fi
+            docker build --no-cache -t opa-agent:latest .
+            echo "Built agent image from repository"
+            echo "image_source=build" >> $GITHUB_OUTPUT
           fi
       
       - name: Verify agent image exists
