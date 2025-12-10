@@ -1490,13 +1490,29 @@ void opa_execute_ex(zend_execute_data *execute_data) {
     int curl_func_after = 0;
     int curl_func_type_after = 0;
     
-    // Detect curl_exec calls using function name (stable in PHP 8.4)
-    // After segfault fix, we can now safely detect curl functions
-    if (function_name && strcmp(function_name, "curl_exec") == 0) {
+    // Detect curl_exec calls - try is_curl_call first (works when function_name is NULL)
+    // Then fallback to function name detection
+    if (execute_data && execute_data->func) {
+        uint32_t num_args = ZEND_CALL_NUM_ARGS(execute_data);
+        if (num_args > 0) {
+            curl_func_after = is_curl_call(execute_data, &curl_handle_after);
+            if (curl_func_after) {
+                // Check if it's curl_exec by argument count (curl_exec has 1 arg)
+                if (num_args == 1) {
+                    curl_func_type_after = 1; // curl_exec
+                } else {
+                    curl_func_type_after = get_curl_function_type(execute_data);
+                }
+            }
+        }
+    }
+    
+    // Fallback: function name detection (for older PHP versions or when is_curl_call fails)
+    if (!curl_func_after && function_name && strcmp(function_name, "curl_exec") == 0) {
         curl_func_after = 1;
         curl_func_type_after = 1; // curl_exec
         
-        // Try to get curl handle from first argument (AFTER execution, but function name check is safe)
+        // Try to get curl handle from first argument
         if (ZEND_CALL_NUM_ARGS(execute_data) > 0) {
             curl_handle_after = ZEND_CALL_ARG(execute_data, 1);
             // Validate handle is valid
@@ -1505,19 +1521,6 @@ void opa_execute_ex(zend_execute_data *execute_data) {
             }
         }
     }
-    
-    // TODO: Re-enable is_curl_call once segfault is fixed
-    /*
-    if (execute_data && execute_data->func) {
-        uint32_t num_args = ZEND_CALL_NUM_ARGS(execute_data);
-        if (num_args > 0) {
-            curl_func_after = is_curl_call(execute_data, &curl_handle_after);
-            if (curl_func_after) {
-                curl_func_type_after = get_curl_function_type(execute_data);
-            }
-        }
-    }
-    */
     
     debug_log("[execute_ex] AFTER curl check: curl_func_after=%d, curl_func_type_after=%d, call_id=%s", 
         curl_func_after, curl_func_type_after, call_id ? call_id : "NULL");
