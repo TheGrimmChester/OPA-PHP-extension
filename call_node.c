@@ -125,6 +125,14 @@ void record_http_request(const char *url, const char *method, int status_code, s
     call_node_t *current_call = NULL;
     if (global_collector->call_stack_top) {
         current_call = global_collector->call_stack_top;
+    } else {
+        // No active call stack - HTTP requests executed at top level
+        // Create a root call node to attach HTTP requests to
+        char *root_call_id = opa_enter_function("__root__", NULL, __FILE__, __LINE__, 0);
+        if (root_call_id) {
+            efree(root_call_id);
+            current_call = global_collector->call_stack_top;
+        }
     }
     
     // Lazily allocate http_requests array when first HTTP request is recorded
