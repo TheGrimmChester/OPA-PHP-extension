@@ -178,7 +178,7 @@ void record_http_request(const char *url, const char *method, int status_code, s
 void record_http_request_enhanced(const char *url, const char *method, int status_code, 
     size_t bytes_sent, size_t bytes_received, double duration, const char *error,
     const char *uri_path, const char *query_string, const char *request_headers, 
-    const char *response_headers, size_t response_size, double dns_time, 
+    const char *response_headers, size_t response_size, size_t request_size, double dns_time, 
     double connect_time, double total_time) {
     
     // Call the basic record_http_request first
@@ -203,6 +203,16 @@ void record_http_request_enhanced(const char *url, const char *method, int statu
         if (num_requests > 0) {
             zval *last_request = zend_hash_index_find(Z_ARRVAL_P(current_call->http_requests), num_requests - 1);
             if (last_request && Z_TYPE_P(last_request) == IS_ARRAY) {
+                // Use response_size as fallback for bytes_received if bytes_received is 0
+                if (bytes_received == 0 && response_size > 0) {
+                    add_assoc_long(last_request, "bytes_received", (long)response_size);
+                }
+                
+                // Use request_size as fallback for bytes_sent if bytes_sent is 0
+                if (bytes_sent == 0 && request_size > 0) {
+                    add_assoc_long(last_request, "bytes_sent", (long)request_size);
+                }
+                
                 // Add enhanced fields
                 if (uri_path) {
                     add_assoc_string(last_request, "uri", (char *)uri_path);
@@ -220,6 +230,9 @@ void record_http_request_enhanced(const char *url, const char *method, int statu
                 }
                 if (response_size > 0) {
                     add_assoc_long(last_request, "response_size", (long)response_size);
+                }
+                if (request_size > 0) {
+                    add_assoc_long(last_request, "request_size", (long)request_size);
                 }
                 if (dns_time > 0.0) {
                     add_assoc_double(last_request, "dns_time", dns_time);

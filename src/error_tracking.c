@@ -107,6 +107,7 @@ static char* serialize_stack_trace(zval *trace) {
     smart_string_appends(&json, "]");
     smart_string_0(&json);
     
+    // Always return a valid JSON array (even if empty)
     if (json.c && json.len > 0) {
         char *result = emalloc(json.len + 1);
         if (result) {
@@ -117,8 +118,13 @@ static char* serialize_stack_trace(zval *trace) {
         return result;
     }
     
+    // Return empty array if no frames
     smart_string_free(&json);
-    return NULL;
+    char *empty_array = emalloc(3);
+    if (empty_array) {
+        strcpy(empty_array, "[]");
+    }
+    return empty_array;
 }
 
 // Send error to agent (exported for use from opa_api.c)
@@ -216,6 +222,7 @@ void send_error_to_agent(int error_type, const char *error_message, const char *
     } else {
         smart_string_appends(&json, "php-fpm");
     }
+    smart_string_appends(&json, "\""); // Close service string
     
     // Add timestamp
     long timestamp_ms = get_timestamp_ms();
@@ -367,25 +374,242 @@ static void opa_exception_handler(zval *exception) {
 // NOTE: opa_track_error() is defined in opa_api.c, not here
 // This file only contains the internal error tracking functions
 
-// Initialize error tracking - use shutdown function approach
+// Check if a log level should be tracked based on INI configuration
+static int should_track_log_level(const char *level) {
+    if (!OPA_G(log_levels) || strlen(OPA_G(log_levels)) == 0) {
+        return 0; // No levels configured
+    }
+    
+    // Parse comma-separated list
+    char *levels_copy = estrdup(OPA_G(log_levels));
+    if (!levels_copy) {
+        return 0;
+    }
+    
+    char *token = strtok(levels_copy, ",");
+    int found = 0;
+    
+    while (token != NULL) {
+        // Trim whitespace
+        while (*token == ' ') token++;
+        char *end = token + strlen(token) - 1;
+        while (end > token && *end == ' ') {
+            *end = '\0';
+            end--;
+        }
+        
+        if (strcasecmp(token, level) == 0) {
+            found = 1;
+            break;
+        }
+        token = strtok(NULL, ",");
+    }
+    
+    efree(levels_copy);
+    return found;
+}
+
+// Parse log message to extract level (e.g., [ERROR], [WARN], [CRITICAL])
+static const char* parse_log_level(const char *message) {
+    if (!message || strlen(message) < 3) {
+        return "info"; // Default level
+    }
+    
+    // Check for [LEVEL] prefix
+    if (message[0] == '[') {
+        const char *end = strchr(message, ']');
+        if (end && end > message + 1) {
+            size_t len = end - message - 1;
+            if (len > 0 && len < 20) {
+                char level[21];
+                memcpy(level, message + 1, len);
+                level[len] = '\0';
+                
+                // Normalize to lowercase
+                for (int i = 0; level[i]; i++) {
+                    if (level[i] >= 'A' && level[i] <= 'Z') {
+                        level[i] = level[i] - 'A' + 'a';
+                    }
+                }
+                
+                // Check if it's a known level
+                if (strcmp(level, "critical") == 0 || strcmp(level, "crit") == 0) {
+                    return "critical";
+                } else if (strcmp(level, "error") == 0 || strcmp(level, "err") == 0) {
+                    return "error";
+                } else if (strcmp(level, "warning") == 0 || strcmp(level, "warn") == 0) {
+                    return "warn";
+                }
+            }
+        }
+    }
+    
+    // Check for common patterns
+    if (strncasecmp(message, "error:", 6) == 0 || strncasecmp(message, "error ", 6) == 0) {
+        return "error";
+    }
+    if (strncasecmp(message, "warning:", 8) == 0 || strncasecmp(message, "warning ", 8) == 0) {
+        return "warn";
+    }
+    if (strncasecmp(message, "critical:", 9) == 0 || strncasecmp(message, "critical ", 9) == 0) {
+        return "critical";
+    }
+    
+    return "info"; // Default
+}
+
+// Send log message to agent
+void send_log_to_agent(const char *level, const char *message, const char *file, int line) {
+    if (!OPA_G(enabled) || !OPA_G(track_logs)) {
+        return;
+    }
+    
+    // Check if this log level should be tracked
+    if (!should_track_log_level(level)) {
+        return;
+    }
+    
+    // Get current trace/span IDs
+    char *trace_id = root_span_trace_id ? root_span_trace_id : generate_id();
+    char *span_id = root_span_span_id ? root_span_span_id : generate_id();
+    
+    // Build log JSON
+    smart_string json = {0};
+    smart_string_appends(&json, "{\"type\":\"log\",");
+    smart_string_appends(&json, "\"trace_id\":\"");
+    smart_string_appends(&json, trace_id);
+    smart_string_appends(&json, "\",\"span_id\":");
+    if (span_id) {
+        smart_string_appends(&json, "\"");
+        smart_string_appends(&json, span_id);
+        smart_string_appends(&json, "\"");
+    } else {
+        smart_string_appends(&json, "null");
+    }
+    smart_string_appends(&json, ",\"id\":\"");
+    char *log_id = generate_id();
+    smart_string_appends(&json, log_id);
+    efree(log_id);
+    smart_string_appends(&json, "\",\"level\":\"");
+    smart_string_appends(&json, level);
+    smart_string_appends(&json, "\",\"message\":\"");
+    if (message) {
+        json_escape_string(&json, message, strlen(message));
+    }
+    smart_string_appends(&json, "\"");
+    
+    // Add metadata
+    smart_string_appends(&json, ",\"service\":\"");
+    if (OPA_G(service)) {
+        json_escape_string(&json, OPA_G(service), strlen(OPA_G(service)));
+    } else {
+        smart_string_appends(&json, "php-fpm");
+    }
+    smart_string_appends(&json, "\""); // Close service string
+    
+    // Add timestamp
+    long timestamp_ms = get_timestamp_ms();
+    char ts_str[64];
+    snprintf(ts_str, sizeof(ts_str), "%ld", timestamp_ms);
+    smart_string_appends(&json, ",\"timestamp_ms\":");
+    smart_string_appends(&json, ts_str);
+    
+    // Add fields (file and line if available)
+    smart_string_appends(&json, ",\"fields\":{");
+    int fields_first = 1; // Track first field in fields object
+    if (file) {
+        smart_string_appends(&json, "\"file\":\"");
+        json_escape_string(&json, file, strlen(file));
+        smart_string_appends(&json, "\"");
+        fields_first = 0;
+    }
+    if (line > 0) {
+        if (!fields_first) {
+            smart_string_appends(&json, ",");
+        }
+        char line_str[32];
+        snprintf(line_str, sizeof(line_str), "\"line\":%d", line);
+        smart_string_appends(&json, line_str);
+        fields_first = 0;
+    }
+    smart_string_appends(&json, "}");
+    
+    smart_string_appends(&json, "}");
+    smart_string_0(&json);
+    
+    if (json.c && json.len > 0) {
+        char *msg = emalloc(json.len + 1);
+        if (msg) {
+            memcpy(msg, json.c, json.len);
+            msg[json.len] = '\0';
+            send_message_direct(msg, 1); // Send with compression
+        }
+        smart_string_free(&json);
+    } else {
+        smart_string_free(&json);
+    }
+    
+    if (trace_id != root_span_trace_id) efree(trace_id);
+    if (span_id != root_span_span_id) efree(span_id);
+}
+
+// Note: Error handler registration in PHP 8.4 is complex
+// We rely on PHP applications to call opa_track_error() from their error handlers
+// or use shutdown functions for fatal errors
+
+// Store original error_log function
+static zend_function *orig_error_log_func = NULL;
+static zif_handler orig_error_log_handler = NULL;
+
+// Wrapper for error_log() function
+static void zif_opa_error_log(zend_execute_data *execute_data, zval *return_value) {
+    // Track log if enabled - get message from first parameter
+    if (OPA_G(enabled) && OPA_G(track_logs) && ZEND_CALL_NUM_ARGS(execute_data) > 0) {
+        zval *message_zv = ZEND_CALL_ARG(execute_data, 1);
+        if (message_zv && Z_TYPE_P(message_zv) == IS_STRING) {
+            const char *level = parse_log_level(Z_STRVAL_P(message_zv));
+            const char *file = zend_get_executed_filename();
+            uint32_t line = zend_get_executed_lineno();
+            send_log_to_agent(level, Z_STRVAL_P(message_zv), file, (int)line);
+        }
+    }
+    
+    // Call original error_log function
+    if (orig_error_log_handler) {
+        orig_error_log_handler(execute_data, return_value);
+    }
+}
+
+// Initialize error tracking
 void opa_init_error_tracking(void) {
     if (!OPA_G(enabled)) {
         return;
     }
     
-    // Register shutdown function to check for uncaught exceptions
-    // This is more reliable than trying to hook into error handlers
-    // The PHP application can also call opa_track_error() from its own error handlers
+    // Hook error_log() function if log tracking is enabled
+    if (OPA_G(track_logs)) {
+        orig_error_log_func = zend_hash_str_find_ptr(CG(function_table), "error_log", sizeof("error_log")-1);
+        if (orig_error_log_func && orig_error_log_func->type == ZEND_INTERNAL_FUNCTION) {
+            orig_error_log_handler = orig_error_log_func->internal_function.handler;
+            orig_error_log_func->internal_function.handler = zif_opa_error_log;
+            if (OPA_G(debug_log_enabled)) {
+                debug_log("[OPA] error_log() hook registered");
+            }
+        }
+    }
+    
+    // Note: Error handler registration is complex in PHP 8.4
+    // We rely on the PHP application to call opa_track_error() from their error handlers
+    // or use the shutdown function approach for fatal errors
 }
 
 // Cleanup error tracking
 void opa_cleanup_error_tracking(void) {
-    // TEMPORARILY DISABLED: zend_replace_error_handling API changed in PHP 8.4
-    /*
-    if (original_error_handling.error_handler) {
-        zend_error_handling current;
-        zend_replace_error_handling(EH_NORMAL, NULL, &current);
+    // Restore original error_log handler
+    if (orig_error_log_func && orig_error_log_handler) {
+        orig_error_log_func->internal_function.handler = orig_error_log_handler;
+        orig_error_log_func = NULL;
+        orig_error_log_handler = NULL;
     }
-    */
 }
 

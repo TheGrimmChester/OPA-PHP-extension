@@ -55,6 +55,9 @@ ZEND_BEGIN_MODULE_GLOBALS(opa)
     char *language_version;
     char *framework;
     char *framework_version;
+    zend_bool track_errors; // Enable/disable error tracking
+    zend_bool track_logs; // Enable/disable log tracking
+    char *log_levels; // Comma-separated list: critical,error,warning
 ZEND_END_MODULE_GLOBALS(opa)
 
 // Declare extern for other files - actual declaration is in opa.c
@@ -185,6 +188,7 @@ void record_redis_operation(const char *command, const char *key, int hit, doubl
 // Error tracking functions
 void opa_init_error_tracking(void);
 void opa_cleanup_error_tracking(void);
+void send_log_to_agent(const char *level, const char *message, const char *file, int line);
 
 // Collector functions
 opa_collector_t* opa_collector_init(void);

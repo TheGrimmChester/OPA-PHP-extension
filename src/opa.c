@@ -45,6 +45,9 @@ PHP_INI_BEGIN()
     STD_PHP_INI_ENTRY("opa.language_version", "", PHP_INI_ALL, OnUpdateString, language_version, zend_opa_globals, opa_globals)
     STD_PHP_INI_ENTRY("opa.framework", "", PHP_INI_ALL, OnUpdateString, framework, zend_opa_globals, opa_globals)
     STD_PHP_INI_ENTRY("opa.framework_version", "", PHP_INI_ALL, OnUpdateString, framework_version, zend_opa_globals, opa_globals)
+    STD_PHP_INI_ENTRY("opa.track_errors", "1", PHP_INI_ALL, OnUpdateBool, track_errors, zend_opa_globals, opa_globals)
+    STD_PHP_INI_ENTRY("opa.track_logs", "1", PHP_INI_ALL, OnUpdateBool, track_logs, zend_opa_globals, opa_globals)
+    STD_PHP_INI_ENTRY("opa.log_levels", "critical,error", PHP_INI_ALL, OnUpdateString, log_levels, zend_opa_globals, opa_globals)
 PHP_INI_END()
 
 // Global state (declared in opa.h, defined here)
@@ -1540,6 +1543,7 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         double connect_time = 0.0;
         double total_time = 0.0;
         size_t response_size = curl_bytes_received;
+        size_t request_size = curl_bytes_sent;
         
         // Use curl_handle_after obtained from function name detection
         if (curl_handle_after && (Z_TYPE_P(curl_handle_after) == IS_RESOURCE || Z_TYPE_P(curl_handle_after) == IS_OBJECT)) {
@@ -1594,7 +1598,15 @@ void opa_execute_ex(zend_execute_data *execute_data) {
                                 request_headers_str = estrdup(Z_STRVAL_P(header_out_val));
                             }
                             
-                            // Get response size
+                            // Get request size (size_upload)
+                            zval *size_upload_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "size_upload", sizeof("size_upload") - 1);
+                            if (size_upload_val && Z_TYPE_P(size_upload_val) == IS_DOUBLE) {
+                                request_size = (size_t)Z_DVAL_P(size_upload_val);
+                            } else if (size_upload_val && Z_TYPE_P(size_upload_val) == IS_LONG) {
+                                request_size = (size_t)Z_LVAL_P(size_upload_val);
+                            }
+                            
+                            // Get response size (size_download)
                             zval *size_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "size_download", sizeof("size_download") - 1);
                             if (size_val && Z_TYPE_P(size_val) == IS_DOUBLE) {
                                 response_size = (size_t)Z_DVAL_P(size_val);
@@ -1694,7 +1706,7 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         // Record HTTP request with enhanced details
         record_http_request_enhanced(curl_url, curl_method, status_code, curl_bytes_sent, curl_bytes_received, 
             curl_duration, error, uri_path, query_string, request_headers_str, response_headers_str, 
-            response_size, dns_time, connect_time, total_time);
+            response_size, request_size, dns_time, connect_time, total_time);
         debug_log("[execute_ex] Recorded HTTP request: %s %s, status=%d, duration=%.6f", 
             curl_method ? curl_method : "GET", curl_url ? curl_url : "unknown", status_code, curl_duration);
         
@@ -1831,6 +1843,7 @@ static void zif_opa_curl_exec(zend_execute_data *execute_data, zval *return_valu
     double connect_time = 0.0;
     double total_time = 0.0;
     size_t response_size = bytes_received;
+    size_t request_size = bytes_sent;
     
     // Call curl_getinfo to get all details
     zval curl_getinfo_func, curl_getinfo_args[1], curl_getinfo_ret;
@@ -1888,7 +1901,15 @@ static void zif_opa_curl_exec(zend_execute_data *execute_data, zval *return_valu
                     response_headers_str = estrdup(Z_STRVAL_P(header_in_val));
                 }
                 
-                // Get response size
+                // Get request size (size_upload)
+                zval *size_upload_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "size_upload", sizeof("size_upload") - 1);
+                if (size_upload_val && Z_TYPE_P(size_upload_val) == IS_DOUBLE) {
+                    request_size = (size_t)Z_DVAL_P(size_upload_val);
+                } else if (size_upload_val && Z_TYPE_P(size_upload_val) == IS_LONG) {
+                    request_size = (size_t)Z_LVAL_P(size_upload_val);
+                }
+                
+                // Get response size (size_download)
                 zval *size_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "size_download", sizeof("size_download") - 1);
                 if (size_val && Z_TYPE_P(size_val) == IS_DOUBLE) {
                     response_size = (size_t)Z_DVAL_P(size_val);
@@ -1987,7 +2008,7 @@ static void zif_opa_curl_exec(zend_execute_data *execute_data, zval *return_valu
     // Record HTTP request with enhanced details
     record_http_request_enhanced(curl_url, curl_method, status_code, bytes_sent, bytes_received, 
         duration, error, uri_path, query_string, request_headers_str, response_headers_str, 
-        response_size, dns_time, connect_time, total_time);
+        response_size, request_size, dns_time, connect_time, total_time);
     debug_log("[zif_opa_curl_exec] Recorded HTTP request: %s %s, status=%d, duration=%.6f", 
         curl_method ? curl_method : "GET", curl_url ? curl_url : "unknown", status_code, duration);
     
@@ -2336,6 +2357,9 @@ PHP_MINIT_FUNCTION(opa) {
         debug_log("[MINIT] curl_exec not found or not internal");
     }
     
+    // Initialize error and log tracking
+    opa_init_error_tracking();
+    
     return SUCCESS;
 }
 
@@ -2393,6 +2417,9 @@ PHP_MSHUTDOWN_FUNCTION(opa) {
         orig_curl_exec_func = NULL;
         orig_curl_exec_handler = NULL;
     }
+    
+    // Cleanup error and log tracking
+    opa_cleanup_error_tracking();
     
     // During MSHUTDOWN, the Zend heap is being destroyed
     // PHP will try to destroy the hash table automatically via zend_hash_graceful_reverse_destroy
