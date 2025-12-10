@@ -319,6 +319,24 @@ EOF
     return $php_exit_code
 }
 
+# Helper function to query ClickHouse
+# In CI mode, ClickHouse runs as a GitHub Actions service, not in docker-compose
+query_clickhouse() {
+    local query="$1"
+    local clickhouse_container
+    
+    # Try to find ClickHouse container (GitHub Actions service)
+    clickhouse_container=$(docker ps --filter "ancestor=clickhouse/clickhouse-server:23.3" --format "{{.ID}}" | head -1)
+    
+    if [[ -n "$clickhouse_container" ]]; then
+        # Use docker exec on the service container
+        docker exec "$clickhouse_container" clickhouse-client --query "$query" 2>&1
+    else
+        # Fallback: try docker-compose (for local testing)
+        docker compose exec -T clickhouse clickhouse-client --query "$query" 2>&1 || echo ""
+    fi
+}
+
 # Wait for trace to be stored
 wait_for_trace() {
     cd "${PROJECT_ROOT}" || return 1
@@ -331,16 +349,14 @@ wait_for_trace() {
     while [[ $attempt -lt $max_attempts ]]; do
         local trace_id=""
         local query_result
-        query_result=$(docker compose exec -T clickhouse clickhouse-client --query \
-            "SELECT trace_id FROM opa.spans_min WHERE service = 'sql-ci-test' ORDER BY start_ts DESC LIMIT 1" 2>&1)
+        query_result=$(query_clickhouse "SELECT trace_id FROM opa.spans_min WHERE service = 'sql-ci-test' ORDER BY start_ts DESC LIMIT 1")
         
         if [[ $? -eq 0 ]] && [[ -n "$query_result" ]] && [[ ! "$query_result" =~ "not running" ]]; then
             trace_id=$(echo "$query_result" | tr -d '\n\r ' | head -1)
         fi
         
         if [[ -z "${trace_id:-}" ]] || [[ "${trace_id:-}" == "" ]] || [[ "${trace_id:-}" == "null" ]]; then
-            query_result=$(docker compose exec -T clickhouse clickhouse-client --query \
-                "SELECT trace_id FROM opa.spans_min WHERE start_ts > now() - INTERVAL 2 MINUTE ORDER BY start_ts DESC LIMIT 1" 2>&1)
+            query_result=$(query_clickhouse "SELECT trace_id FROM opa.spans_min WHERE start_ts > now() - INTERVAL 2 MINUTE ORDER BY start_ts DESC LIMIT 1")
             if [[ $? -eq 0 ]] && [[ -n "$query_result" ]] && [[ ! "$query_result" =~ "not running" ]]; then
                 trace_id=$(echo "$query_result" | tr -d '\n\r ' | head -1)
             fi
