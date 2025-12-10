@@ -114,6 +114,7 @@ jobs:
             -e CLICKHOUSE_URL=http://clickhouse:8123 \
             -e TRANSPORT_TCP=:9090 \
             -p 8081:8080 \
+            -p 9090:9090 \
             opa-agent:latest
           sleep 5
           for i in {1..30}; do

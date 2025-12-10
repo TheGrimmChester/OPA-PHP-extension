@@ -37,6 +37,14 @@ services:
       retries: 10
     command: --default-authentication-plugin=mysql_native_password
 
+  php:
+    image: php-extension-test
+    networks:
+      - opa_network
+    volumes:
+      - ./tests:/var/www/html/tests:ro
+    working_dir: /var/www/html
+
 networks:
   opa_network:
     external: true

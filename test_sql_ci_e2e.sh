@@ -297,18 +297,18 @@ EOF
     MYSQL_USER="$MYSQL_USER" \
     MYSQL_PASSWORD="$MYSQL_PASSWORD" \
     docker-compose -f docker-compose.test.yml run --rm \
-        -e OPA_ENABLED=1 \
-        -e OPA_SOCKET_PATH=opa-agent:9090 \
-        -e OPA_SAMPLING_RATE=1.0 \
-        -e OPA_COLLECT_INTERNAL_FUNCTIONS=1 \
-        -e OPA_DEBUG_LOG=0 \
-        -e OPA_SERVICE=sql-ci-test \
         -e MYSQL_HOST="$MYSQL_HOST" \
         -e MYSQL_PORT="$MYSQL_PORT" \
         -e MYSQL_DATABASE="$MYSQL_DATABASE" \
         -e MYSQL_USER="$MYSQL_USER" \
         -e MYSQL_PASSWORD="$MYSQL_PASSWORD" \
-        php php /var/www/html/tests/test_sql_ci_e2e.php 2>&1 | grep -v "^Container" || true
+        php php -d opa.socket_path=opa-agent:9090 \
+            -d opa.enabled=1 \
+            -d opa.sampling_rate=1.0 \
+            -d opa.collect_internal_functions=1 \
+            -d opa.debug_log=0 \
+            -d opa.service=sql-ci-test \
+            /var/www/html/tests/test_sql_ci_e2e.php 2>&1 | grep -v "^Container" || true
     
     local php_exit_code=$?
     rm -f "$test_script"

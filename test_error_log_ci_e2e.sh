@@ -142,18 +142,18 @@ run_php_test() {
     fi
     
     docker run --rm --network opa_network \
-        -e OPA_ENABLED=1 \
-        -e OPA_SOCKET_PATH=opa-agent:9090 \
-        -e OPA_SAMPLING_RATE=1.0 \
-        -e OPA_COLLECT_INTERNAL_FUNCTIONS=1 \
-        -e OPA_DEBUG_LOG=0 \
-        -e OPA_SERVICE=error-log-ci-test \
-        -e OPA_TRACK_ERRORS=1 \
-        -e OPA_TRACK_LOGS=1 \
-        -e OPA_LOG_LEVELS="critical,error,warning" \
         -v "${test_script}:/var/www/html/test.php:ro" \
         php-extension-test \
-        php /var/www/html/test.php 2>&1 | grep -v "^Container" || true
+        php -d opa.socket_path=opa-agent:9090 \
+            -d opa.enabled=1 \
+            -d opa.sampling_rate=1.0 \
+            -d opa.collect_internal_functions=1 \
+            -d opa.debug_log=0 \
+            -d opa.service=error-log-ci-test \
+            -d opa.track_errors=1 \
+            -d opa.track_logs=1 \
+            -d opa.log_levels="critical,error,warning" \
+            /var/www/html/test.php 2>&1 | grep -v "^Container" || true
     
     local php_exit_code=$?
     
