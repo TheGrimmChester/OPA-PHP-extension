@@ -822,84 +822,73 @@ static zend_class_entry *curl_share_ce = NULL;
 // Helper to detect curl calls by checking if first argument is a CurlHandle object
 // This is stable across PHP 8.x regardless of function name/type/handler issues
 static int is_curl_call(zend_execute_data *execute_data, zval **curl_handle_out) {
-    // Defensive checks - be very careful here to avoid segfaults
     if (!execute_data) {
+        debug_log("[is_curl_call] execute_data=NULL");
         return 0;
     }
-    
-    // Check if execute_data is in a valid memory range (basic sanity check)
-    // We can't do much more without risking segfault, so just check pointer is not NULL
-    
+
     zend_function *func = execute_data->func;
     if (!func) {
+        debug_log("[is_curl_call] func=NULL");
         return 0;
     }
-    
-    /* Must have at least 1 argument - use safe access */
-    uint32_t num_args = 0;
-    // Try to get num_args safely - if this crashes, we'll know the issue
-    num_args = ZEND_CALL_NUM_ARGS(execute_data);
+
+    uint32_t num_args = ZEND_CALL_NUM_ARGS(execute_data);
+    debug_log("[is_curl_call] num_args=%u", num_args);
     if (num_args < 1) {
         return 0;
     }
-    
-    /* First arg is potential handle - use safe access */
-    zval *arg1 = NULL;
-    // Use ZEND_CALL_ARG macro - if this crashes, execute_data is invalid
-    arg1 = ZEND_CALL_ARG(execute_data, 1);
+
+    zval *arg1 = ZEND_CALL_ARG(execute_data, 1);
     if (!arg1) {
+        debug_log("[is_curl_call] arg1=NULL");
         return 0;
     }
-    
-    // Validate arg1 is readable (not undefined) - check type before accessing
-    if (Z_TYPE_P(arg1) == IS_UNDEF || Z_TYPE_P(arg1) == IS_NULL) {
-        return 0;
-    }
-    
-    /* PHP 8+: CurlHandle, CurlMultiHandle, CurlShareHandle objects */
+
+    debug_log("[is_curl_call] arg1 type=%d", Z_TYPE_P(arg1));
+
     if (Z_TYPE_P(arg1) == IS_OBJECT) {
-        // Use Z_OBJCE_P macro which is safer than manual access
         zend_class_entry *ce = Z_OBJCE_P(arg1);
         if (!ce) {
+            debug_log("[is_curl_call] IS_OBJECT but ce=NULL");
             return 0;
         }
-        
-        // Check by class entry pointer first (most reliable)
+
+        const char *name = ce->name ? ZSTR_VAL(ce->name) : "<no name>";
+        debug_log("[is_curl_call] object ce=%p name=%s", ce, name);
+
+        // 1) pointer match if we ever resolved them in RINIT/MINIT
         if ((curl_ce && ce == curl_ce) ||
             (curl_multi_ce && ce == curl_multi_ce) ||
             (curl_share_ce && ce == curl_share_ce)) {
-            if (curl_handle_out) {
-                *curl_handle_out = arg1;
-            }
+            debug_log("[is_curl_call] matched by class entry pointer");
+            if (curl_handle_out) *curl_handle_out = arg1;
             return 1;
         }
-        
-        // Fallback: check by class name (works even if class entry pointers aren't set)
+
+        // 2) name-based match (robust on 8.0+)
         if (ce->name) {
-            const char *class_name = ZSTR_VAL(ce->name);
-            size_t class_name_len = ZSTR_LEN(ce->name);
-            
-            if ((class_name_len == sizeof("CurlHandle")-1 && memcmp(class_name, "CurlHandle", sizeof("CurlHandle")-1) == 0) ||
-                (class_name_len == sizeof("CurlMultiHandle")-1 && memcmp(class_name, "CurlMultiHandle", sizeof("CurlMultiHandle")-1) == 0) ||
-                (class_name_len == sizeof("CurlShareHandle")-1 && memcmp(class_name, "CurlShareHandle", sizeof("CurlShareHandle")-1) == 0)) {
-                if (curl_handle_out) {
-                    *curl_handle_out = arg1;
-                }
+            size_t len = ZSTR_LEN(ce->name);
+            const char *cn = ZSTR_VAL(ce->name);
+
+            if ((len == sizeof("CurlHandle")-1      && memcmp(cn, "CurlHandle",      sizeof("CurlHandle")-1)      == 0) ||
+                (len == sizeof("CurlMultiHandle")-1 && memcmp(cn, "CurlMultiHandle", sizeof("CurlMultiHandle")-1) == 0) ||
+                (len == sizeof("CurlShareHandle")-1 && memcmp(cn, "CurlShareHandle", sizeof("CurlShareHandle")-1) == 0)) {
+
+                debug_log("[is_curl_call] matched by class name=%s", cn);
+                if (curl_handle_out) *curl_handle_out = arg1;
                 return 1;
             }
         }
     }
-    
-    /* Optional: legacy resource support if you care about <8.0 */
+
     if (Z_TYPE_P(arg1) == IS_RESOURCE) {
-        // For PHP < 8.0, curl handles were resources
-        // We can check resource type if needed, but for PHP 8.4 we focus on objects
-        if (curl_handle_out) {
-            *curl_handle_out = arg1;
-        }
-        return 1; // Assume it's a curl resource
+        debug_log("[is_curl_call] resource handle, treating as curl for <8.0");
+        if (curl_handle_out) *curl_handle_out = arg1;
+        return 1;
     }
-    
+
+    debug_log("[is_curl_call] NOT curl (arg1 type %d)", Z_TYPE_P(arg1));
     return 0;
 }
 
@@ -1537,8 +1526,8 @@ void opa_execute_ex(zend_execute_data *execute_data) {
     
     // Process curl_exec calls and capture HTTP request details
     if (curl_func_after && curl_func_type_after == 1) {
-        debug_log("[execute_ex] Processing curl_exec - curl_func_after=%d, curl_func_type_after=%d, call_id=%s", 
-            curl_func_after, curl_func_type_after, call_id ? call_id : "NULL");
+        debug_log("[execute_ex] Processing curl_exec - curl_func_after=%d, curl_func_type_after=%d, call_id=%s, curl_handle_after=%p", 
+            curl_func_after, curl_func_type_after, call_id ? call_id : "NULL", curl_handle_after);
         
         // Calculate duration and bytes from BEFORE section
         double curl_end_time = get_time_seconds();
