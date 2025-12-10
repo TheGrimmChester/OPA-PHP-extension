@@ -14,7 +14,7 @@
 echo "=== cURL Profiling Test ===\n\n";
 
 // Test configuration
-$test_url = getenv('TEST_URL') ?: 'https://httpbin.org';
+$test_url = getenv('TEST_URL') ?: 'https://aisenseapi.com/services/v1/ping';
 $test_timeout = 10;
 
 echo "Test Configuration:\n";
@@ -46,7 +46,7 @@ function test_result($passed, $test_name, $details = '') {
 echo "Test 1: Basic GET request\n";
 try {
     $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, "$test_url/get?test=basic_get");
+    curl_setopt($ch, CURLOPT_URL, $test_url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_TIMEOUT, $test_timeout);
     curl_setopt($ch, CURLOPT_HEADER, true);

@@ -320,37 +320,16 @@ char* safe_serialize_request(void);
 // FPM pattern: SG(request_info) NULL → PG(http_globals) populated
 // CRITICAL: Must call zend_is_auto_global() to initialize $_SERVER before accessing PG(http_globals)
 char* serialize_http_request_json_universal(void) {
-    char debug_buf[512];
-    int debug_len;
-    
-    /* TARGETED DEBUG 1: Verify function is being called */
-    fprintf(stderr, "[OPA SERIALIZER] FUNCTION CALLED\n");
-    
     /* CRITICAL FIX: Initialize $_SERVER using zend_is_auto_global() before accessing PG(http_globals) */
     zend_string *server_name = zend_string_init("_SERVER", sizeof("_SERVER")-1, 0);
     zend_is_auto_global(server_name);
     zend_string_release(server_name);
     
-    fprintf(stderr, "[OPA SERIALIZER] Called zend_is_auto_global(_SERVER)\n");
-    
-    /* TARGETED DEBUG 2: Check PG(http_globals) state AFTER initialization */
-    zval *pg_server = &PG(http_globals)[TRACK_VARS_SERVER];
-    debug_len = snprintf(debug_buf, sizeof(debug_buf), 
-                        "[OPA SERIALIZER] PG server=%p, type=%d, is_array=%d, num_elements=%d\n", 
-                        pg_server,
-                        pg_server ? Z_TYPE_P(pg_server) : -1,
-                        pg_server && Z_TYPE_P(pg_server) == IS_ARRAY,
-                        (pg_server && Z_TYPE_P(pg_server) == IS_ARRAY) ? (int)zend_hash_num_elements(Z_ARRVAL_P(pg_server)) : 0);
-    fprintf(stderr, "%s", debug_buf);
-    
     /* FPM PRIORITY 1: PG(http_globals)[TRACK_VARS_SERVER] - NOW properly initialized */
     zval *server = &PG(http_globals)[TRACK_VARS_SERVER];
     
-    /* TARGETED DEBUG 3: Detailed PG(http_globals) investigation */
     if (server && Z_TYPE_P(server) == IS_ARRAY) {
         int num_elements = (int)zend_hash_num_elements(Z_ARRVAL_P(server));
-        debug_len = snprintf(debug_buf, sizeof(debug_buf), "[OPA SERIALIZER] PG server is ARRAY with %d elements\n", num_elements);
-        fprintf(stderr, "%s", debug_buf);
         
         if (num_elements > 0) {
             zval *method_zv = zend_hash_str_find(Z_ARRVAL_P(server), "REQUEST_METHOD", sizeof("REQUEST_METHOD")-1);
@@ -358,32 +337,8 @@ char* serialize_http_request_json_universal(void) {
             zval *query_zv = zend_hash_str_find(Z_ARRVAL_P(server), "QUERY_STRING", sizeof("QUERY_STRING")-1);
             zval *remote_zv = zend_hash_str_find(Z_ARRVAL_P(server), "REMOTE_ADDR", sizeof("REMOTE_ADDR")-1);
             
-            /* TARGETED DEBUG 4: Check what we found */
-            debug_len = snprintf(debug_buf, sizeof(debug_buf), 
-                                "[OPA SERIALIZER] Found: method=%p, uri=%p, query=%p, remote=%p\n",
-                                method_zv, uri_zv, query_zv, remote_zv);
-            fprintf(stderr, "%s", debug_buf);
-            
-            if (method_zv) {
-                debug_len = snprintf(debug_buf, sizeof(debug_buf), 
-                                    "[OPA SERIALIZER] method_zv type=%d, is_string=%d\n",
-                                    Z_TYPE_P(method_zv), Z_TYPE_P(method_zv) == IS_STRING);
-                fprintf(stderr, "%s", debug_buf);
-            }
-            if (uri_zv) {
-                debug_len = snprintf(debug_buf, sizeof(debug_buf), 
-                                    "[OPA SERIALIZER] uri_zv type=%d, is_string=%d\n",
-                                    Z_TYPE_P(uri_zv), Z_TYPE_P(uri_zv) == IS_STRING);
-                fprintf(stderr, "%s", debug_buf);
-            }
-            
             if (method_zv && Z_TYPE_P(method_zv) == IS_STRING &&
                 uri_zv && Z_TYPE_P(uri_zv) == IS_STRING) {
-                
-                debug_len = snprintf(debug_buf, sizeof(debug_buf), 
-                                    "[OPA SERIALIZER] PG HIT! method=%s uri=%s\n",
-                                    Z_STRVAL_P(method_zv), Z_STRVAL_P(uri_zv));
-                fprintf(stderr, "%s", debug_buf);
                 
                 char buf[1024];
                 snprintf(buf, sizeof(buf),
@@ -395,27 +350,12 @@ char* serialize_http_request_json_universal(void) {
                     query_zv && Z_TYPE_P(query_zv) == IS_STRING ? Z_STRVAL_P(query_zv) : "",
                     remote_zv && Z_TYPE_P(remote_zv) == IS_STRING ? Z_STRVAL_P(remote_zv) : "unknown");
                 
-                debug_len = snprintf(debug_buf, sizeof(debug_buf), "[OPA SERIALIZER] Returning JSON: %s\n", buf);
-                fprintf(stderr, "%s", debug_buf);
-                
                 return strdup(buf);
-            } else {
-                fprintf(stderr, "[OPA SERIALIZER] PG found but method/uri not valid strings\n");
             }
-        } else {
-            fprintf(stderr, "[OPA SERIALIZER] PG server array is EMPTY (num_elements=0)\n");
         }
-    } else {
-        fprintf(stderr, "[OPA SERIALIZER] PG server is NOT an array (server=%p, type=%d)\n", 
-                server, server ? Z_TYPE_P(server) : -1);
     }
     
     /* PRIORITY 2: SAPI fallback (CLI/Apache) */
-    debug_len = snprintf(debug_buf, sizeof(debug_buf), 
-                        "[OPA] PG MISS -> SAPI method=%s uri=%s\n",
-                        SG(request_info).request_method ? SG(request_info).request_method : "NULL",
-                        SG(request_info).request_uri ? SG(request_info).request_uri : "NULL");
-    fprintf(stderr, "%s", debug_buf);
     
     char buf[512];
     snprintf(buf, sizeof(buf),
@@ -1439,35 +1379,9 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         if (num_args_before > 0) {
             arg1_before = ZEND_CALL_ARG(execute_data, 1);
         } else if (execute_data->func->type == ZEND_INTERNAL_FUNCTION) {
-            // For internal functions, try accessing through ZEND_CALL_VAR_NUM
-            // This might work even if ZEND_CALL_NUM_ARGS returns 0
-            debug_log("[execute_ex] BEFORE: Internal function with num_args=0, trying direct access");
-            // Try to access first argument directly (might be at execute_data + offset)
-            // This is a workaround for PHP 8.4 internal function argument access
-            if (execute_data->This && Z_TYPE(execute_data->This) == IS_OBJECT) {
-                // For methods, This is the object
-                zend_class_entry *ce = Z_OBJCE(execute_data->This);
-                if (ce && ce->name) {
-                    const char *class_name = ZSTR_VAL(ce->name);
-                    size_t class_name_len = ZSTR_LEN(ce->name);
-                    debug_log("[execute_ex] BEFORE: This is object, class=%.*s", (int)class_name_len, class_name);
-                    if ((class_name_len == sizeof("CurlHandle")-1 && memcmp(class_name, "CurlHandle", sizeof("CurlHandle")-1) == 0) ||
-                        (class_name_len == sizeof("CurlMultiHandle")-1 && memcmp(class_name, "CurlMultiHandle", sizeof("CurlMultiHandle")-1) == 0) ||
-                        (class_name_len == sizeof("CurlShareHandle")-1 && memcmp(class_name, "CurlShareHandle", sizeof("CurlShareHandle")-1) == 0)) {
-                        curl_func_before = 1;
-                        curl_handle_before = &execute_data->This;
-                        curl_start_time = get_time_seconds();
-                        curl_bytes_sent_before = get_bytes_sent();
-                        curl_bytes_received_before = get_bytes_received();
-                        debug_log("[execute_ex] BEFORE: Detected curl call via This, storing handle");
-                    }
-                }
-            }
-            // Also try ZEND_CALL_VAR_NUM for first argument (might work for internal functions)
-            arg1_before = ZEND_CALL_VAR_NUM(execute_data, 0);
-            if (arg1_before) {
-                debug_log("[execute_ex] BEFORE: Got arg1 via ZEND_CALL_VAR_NUM(0), type=%d", Z_TYPE_P(arg1_before));
-            }
+            // For internal functions with num_args=0, we can't access arguments directly
+            // This is a limitation - we'll need to detect curl_exec another way
+            debug_log("[execute_ex] BEFORE: Internal function with num_args=0, cannot access arguments");
         }
         
         if (arg1_before && Z_TYPE_P(arg1_before) == IS_OBJECT) {
@@ -1856,6 +1770,236 @@ static zend_function *orig_pdo_query_func = NULL;
 static zif_handler orig_pdo_query_handler = NULL;
 static zend_function *orig_pdo_stmt_execute_func = NULL;
 static zif_handler orig_pdo_stmt_execute_handler = NULL;
+static zend_function *orig_curl_exec_func = NULL;
+static zif_handler orig_curl_exec_handler = NULL;
+
+/* cURL Profiling Hook */
+
+// curl_exec wrapper handler (internal function signature)
+static void zif_opa_curl_exec(zend_execute_data *execute_data, zval *return_value) {
+    // Get curl handle from arguments
+    zval *curl_handle = NULL;
+    if (ZEND_CALL_NUM_ARGS(execute_data) > 0) {
+        curl_handle = ZEND_CALL_ARG(execute_data, 1);
+    }
+    
+    if (!curl_handle || (Z_TYPE_P(curl_handle) != IS_RESOURCE && Z_TYPE_P(curl_handle) != IS_OBJECT)) {
+        // No valid curl handle - just call original and return
+        if (orig_curl_exec_handler) {
+            orig_curl_exec_handler(execute_data, return_value);
+        } else if (orig_curl_exec_func && orig_curl_exec_func->internal_function.handler) {
+            orig_curl_exec_func->internal_function.handler(execute_data, return_value);
+        } else {
+            ZVAL_FALSE(return_value);
+        }
+        return;
+    }
+    
+    // Record timing before call
+    double start_time = get_time_seconds();
+    size_t bytes_sent_before = get_bytes_sent();
+    size_t bytes_received_before = get_bytes_received();
+    
+    // Call original handler
+    if (orig_curl_exec_handler) {
+        orig_curl_exec_handler(execute_data, return_value);
+    } else if (orig_curl_exec_func && orig_curl_exec_func->internal_function.handler) {
+        orig_curl_exec_func->internal_function.handler(execute_data, return_value);
+    } else {
+        ZVAL_FALSE(return_value);
+        return;
+    }
+    
+    // Calculate duration and bytes after call
+    double end_time = get_time_seconds();
+    double duration = end_time - start_time;
+    size_t bytes_sent_after = get_bytes_sent();
+    size_t bytes_received_after = get_bytes_received();
+    size_t bytes_sent = bytes_sent_after - bytes_sent_before;
+    size_t bytes_received = bytes_received_after - bytes_received_before;
+    
+    // Extract HTTP request details using curl_getinfo
+    char *curl_url = NULL;
+    char *curl_method = NULL;
+    int status_code = 0;
+    const char *error = NULL;
+    char *request_headers_str = NULL;
+    char *response_headers_str = NULL;
+    char *uri_path = NULL;
+    char *query_string = NULL;
+    double dns_time = 0.0;
+    double connect_time = 0.0;
+    double total_time = 0.0;
+    size_t response_size = bytes_received;
+    
+    // Call curl_getinfo to get all details
+    zval curl_getinfo_func, curl_getinfo_args[1], curl_getinfo_ret;
+    ZVAL_UNDEF(&curl_getinfo_func);
+    ZVAL_UNDEF(&curl_getinfo_args[0]);
+    ZVAL_UNDEF(&curl_getinfo_ret);
+    
+    ZVAL_STRING(&curl_getinfo_func, "curl_getinfo");
+    ZVAL_COPY(&curl_getinfo_args[0], curl_handle);
+    
+    zend_fcall_info fci;
+    zend_fcall_info_cache fcc;
+    if (zend_fcall_info_init(&curl_getinfo_func, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
+        fci.size = sizeof(fci);
+        ZVAL_UNDEF(&fci.function_name);
+        fci.object = NULL;
+        fci.param_count = 1;
+        fci.params = curl_getinfo_args;
+        fci.retval = &curl_getinfo_ret;
+        
+        if (zend_call_function(&fci, &fcc) == SUCCESS) {
+            if (Z_TYPE(curl_getinfo_ret) == IS_ARRAY) {
+                // Get URL
+                zval *url_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "url", sizeof("url") - 1);
+                if (url_val && Z_TYPE_P(url_val) == IS_STRING) {
+                    curl_url = estrdup(Z_STRVAL_P(url_val));
+                }
+                
+                // Get HTTP method
+                zval *method_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "request_method", sizeof("request_method") - 1);
+                if (method_val && Z_TYPE_P(method_val) == IS_STRING) {
+                    curl_method = estrdup(Z_STRVAL_P(method_val));
+                } else {
+                    curl_method = estrdup("GET");
+                }
+                
+                // Get status code
+                zval *status_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "http_code", sizeof("http_code") - 1);
+                if (status_val && Z_TYPE_P(status_val) == IS_LONG) {
+                    status_code = Z_LVAL_P(status_val);
+                }
+                
+                // Get request headers
+                zval *header_out_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "request_header", sizeof("request_header") - 1);
+                if (!header_out_val) {
+                    header_out_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "request_header_out", sizeof("request_header_out") - 1);
+                }
+                if (header_out_val && Z_TYPE_P(header_out_val) == IS_STRING) {
+                    request_headers_str = estrdup(Z_STRVAL_P(header_out_val));
+                }
+                
+                // Get response headers
+                zval *header_in_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "response_header", sizeof("response_header") - 1);
+                if (header_in_val && Z_TYPE_P(header_in_val) == IS_STRING) {
+                    response_headers_str = estrdup(Z_STRVAL_P(header_in_val));
+                }
+                
+                // Get response size
+                zval *size_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "size_download", sizeof("size_download") - 1);
+                if (size_val && Z_TYPE_P(size_val) == IS_DOUBLE) {
+                    response_size = (size_t)Z_DVAL_P(size_val);
+                } else if (size_val && Z_TYPE_P(size_val) == IS_LONG) {
+                    response_size = (size_t)Z_LVAL_P(size_val);
+                }
+                
+                // Get timing information
+                zval *dns_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "namelookup_time", sizeof("namelookup_time") - 1);
+                if (dns_val && Z_TYPE_P(dns_val) == IS_DOUBLE) {
+                    dns_time = Z_DVAL_P(dns_val);
+                }
+                
+                zval *conn_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "connect_time", sizeof("connect_time") - 1);
+                if (conn_val && Z_TYPE_P(conn_val) == IS_DOUBLE) {
+                    connect_time = Z_DVAL_P(conn_val);
+                }
+                
+                zval *total_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "total_time", sizeof("total_time") - 1);
+                if (total_val && Z_TYPE_P(total_val) == IS_DOUBLE) {
+                    total_time = Z_DVAL_P(total_val);
+                }
+                
+                // Extract URI path and query string from URL
+                if (curl_url) {
+                    const char *path_start = strstr(curl_url, "://");
+                    if (path_start) {
+                        path_start += 3;
+                        const char *path_end = strchr(path_start, '/');
+                        if (path_end) {
+                            const char *query_start = strchr(path_end, '?');
+                            if (query_start) {
+                                size_t path_len = query_start - path_end;
+                                uri_path = estrndup(path_end, path_len);
+                                query_string = estrdup(query_start + 1);
+                            } else {
+                                uri_path = estrdup(path_end);
+                            }
+                        }
+                    }
+                }
+            }
+            zval_dtor(&curl_getinfo_ret);
+        }
+    }
+    zval_dtor(&curl_getinfo_func);
+    zval_dtor(&curl_getinfo_args[0]);
+    
+    // Get error if any
+    zval curl_error_func, curl_error_args[1], curl_error_ret;
+    ZVAL_UNDEF(&curl_error_func);
+    ZVAL_UNDEF(&curl_error_args[0]);
+    ZVAL_UNDEF(&curl_error_ret);
+    
+    ZVAL_STRING(&curl_error_func, "curl_error");
+    ZVAL_COPY(&curl_error_args[0], curl_handle);
+    
+    if (zend_fcall_info_init(&curl_error_func, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
+        fci.size = sizeof(fci);
+        ZVAL_UNDEF(&fci.function_name);
+        fci.object = NULL;
+        fci.param_count = 1;
+        fci.params = curl_error_args;
+        fci.retval = &curl_error_ret;
+        
+        if (zend_call_function(&fci, &fcc) == SUCCESS) {
+            if (Z_TYPE(curl_error_ret) == IS_STRING && Z_STRLEN(curl_error_ret) > 0) {
+                error = estrdup(Z_STRVAL(curl_error_ret));
+            }
+            zval_dtor(&curl_error_ret);
+        }
+    }
+    zval_dtor(&curl_error_func);
+    zval_dtor(&curl_error_args[0]);
+    
+    // Log HTTP response code
+    if (status_code > 0) {
+        char fields[512];
+        snprintf(fields, sizeof(fields), 
+            "{\"method\":\"%s\",\"url\":\"%s\",\"status_code\":%d,\"duration_ms\":%.2f,\"bytes_sent\":%zu,\"bytes_received\":%zu}",
+            curl_method ? curl_method : "GET", 
+            curl_url ? curl_url : "unknown", 
+            status_code, 
+            duration * 1000.0,
+            bytes_sent,
+            bytes_received);
+        if (status_code >= 500) {
+            log_error("HTTP request failed with server error", error ? error : "Server error", fields);
+        } else if (status_code >= 400) {
+            log_warn("HTTP request failed with client error", fields);
+        } else {
+            log_info("HTTP request completed", fields);
+        }
+    }
+    
+    // Record HTTP request with enhanced details
+    record_http_request_enhanced(curl_url, curl_method, status_code, bytes_sent, bytes_received, 
+        duration, error, uri_path, query_string, request_headers_str, response_headers_str, 
+        response_size, dns_time, connect_time, total_time);
+    debug_log("[zif_opa_curl_exec] Recorded HTTP request: %s %s, status=%d, duration=%.6f", 
+        curl_method ? curl_method : "GET", curl_url ? curl_url : "unknown", status_code, duration);
+    
+    // Cleanup
+    if (curl_url) efree((void *)curl_url);
+    if (curl_method) efree((void *)curl_method);
+    if (error) efree((void *)error);
+    if (uri_path) efree((void *)uri_path);
+    if (query_string) efree((void *)query_string);
+    if (request_headers_str) efree((void *)request_headers_str);
+    if (response_headers_str) efree((void *)response_headers_str);
+}
 
 // Helper: Get current time in microseconds
 static double get_microtime(void) {
@@ -1953,8 +2097,10 @@ PHP_FUNCTION(opaphp_mysqli_query) {
     
     // Log SQL query with timing
     if (query) {
-        php_printf("[OPA SQL Profiling] MySQLi Query: %s | Time: %.3fms | Rows: %ld\n", 
+        if (OPA_G(debug_log_enabled)) {
+            php_printf("[OPA SQL Profiling] MySQLi Query: %s | Time: %.3fms | Rows: %ld\n", 
                    ZSTR_VAL(query), elapsed, rows_affected);
+        }
         
         // Send SQL query data to agent via record_sql_query
         // Duration is in milliseconds, convert to seconds for record_sql_query
@@ -2022,8 +2168,10 @@ PHP_METHOD(PDO, query) {
     
     // Log SQL query
     if (sql) {
-        php_printf("[OPA SQL Profiling] PDO Query: %s | Time: %.3fms | Rows: %ld\n", 
+        if (OPA_G(debug_log_enabled)) {
+            php_printf("[OPA SQL Profiling] PDO Query: %s | Time: %.3fms | Rows: %ld\n", 
                    ZSTR_VAL(sql), elapsed, row_count);
+        }
         
         // Send SQL query data to agent via record_sql_query
         double duration_seconds = elapsed / 1000.0;
@@ -2088,8 +2236,10 @@ PHP_METHOD(PDOStatement, execute) {
     
     // Log SQL query
     if (sql) {
-        php_printf("[OPA SQL Profiling] PDOStatement Execute: %s | Time: %.3fms | Rows: %ld\n", 
+        if (OPA_G(debug_log_enabled)) {
+            php_printf("[OPA SQL Profiling] PDOStatement Execute: %s | Time: %.3fms | Rows: %ld\n", 
                    sql, elapsed, row_count);
+        }
         
         // Send SQL query data to agent via record_sql_query
         double duration_seconds = elapsed / 1000.0;
@@ -2135,9 +2285,9 @@ PHP_MINIT_FUNCTION(opa) {
         orig_mysqli_query_handler = orig_mysqli_query_func->internal_function.handler;
         // Replace with our handler
         orig_mysqli_query_func->internal_function.handler = zif_opaphp_mysqli_query;
-        php_printf("[OPA] MySQLi query hook registered\n");
-    } else {
-        php_printf("[OPA] MySQLi query function not found at MINIT\n");
+        if (OPA_G(debug_log_enabled)) {
+            php_printf("[OPA] MySQLi query hook registered\n");
+        }
     }
     
     // PDO::query hook
@@ -2147,12 +2297,10 @@ PHP_MINIT_FUNCTION(opa) {
         if (orig_pdo_query_func && orig_pdo_query_func->type == ZEND_INTERNAL_FUNCTION) {
             orig_pdo_query_handler = orig_pdo_query_func->internal_function.handler;
             orig_pdo_query_func->internal_function.handler = zim_PDO_query;
-            php_printf("[OPA] PDO::query hook registered\n");
-        } else {
-            php_printf("[OPA] PDO::query method not found at MINIT\n");
+            if (OPA_G(debug_log_enabled)) {
+                php_printf("[OPA] PDO::query hook registered\n");
+            }
         }
-    } else {
-        php_printf("[OPA] PDO class not found at MINIT\n");
     }
     
     // PDOStatement::execute hook
@@ -2162,12 +2310,10 @@ PHP_MINIT_FUNCTION(opa) {
         if (orig_pdo_stmt_execute_func && orig_pdo_stmt_execute_func->type == ZEND_INTERNAL_FUNCTION) {
             orig_pdo_stmt_execute_handler = orig_pdo_stmt_execute_func->internal_function.handler;
             orig_pdo_stmt_execute_func->internal_function.handler = zim_PDOStatement_execute;
-            php_printf("[OPA] PDOStatement::execute hook registered\n");
-        } else {
-            php_printf("[OPA] PDOStatement::execute method not found at MINIT\n");
+            if (OPA_G(debug_log_enabled)) {
+                php_printf("[OPA] PDOStatement::execute hook registered\n");
+            }
         }
-    } else {
-        php_printf("[OPA] PDOStatement class not found at MINIT\n");
     }
     
     // PHP 8.4: Get CurlHandle class entry pointers for reliable detection
@@ -2176,7 +2322,19 @@ PHP_MINIT_FUNCTION(opa) {
     curl_ce = NULL;
     curl_multi_ce = NULL;
     curl_share_ce = NULL;
-    php_printf("[OPA] CurlHandle class lookup deferred to RINIT (class_table not available at MINIT)\n");
+    
+    // Hook curl_exec directly at MINIT time
+    zend_function *f = zend_hash_str_find_ptr(CG(function_table), "curl_exec", sizeof("curl_exec")-1);
+    if (f && f->type == ZEND_INTERNAL_FUNCTION) {
+        orig_curl_exec_func = f;
+        // Store original handler BEFORE replacing it
+        orig_curl_exec_handler = f->internal_function.handler;
+        // Replace handler with our wrapper
+        f->internal_function.handler = zif_opa_curl_exec;
+        debug_log("[MINIT] Hooked curl_exec: orig handler=%p", orig_curl_exec_handler);
+    } else {
+        debug_log("[MINIT] curl_exec not found or not internal");
+    }
     
     return SUCCESS;
 }
@@ -2228,6 +2386,12 @@ PHP_MSHUTDOWN_FUNCTION(opa) {
         orig_pdo_stmt_execute_func->internal_function.handler = orig_pdo_stmt_execute_handler;
         orig_pdo_stmt_execute_func = NULL;
         orig_pdo_stmt_execute_handler = NULL;
+    }
+    
+    if (orig_curl_exec_func && orig_curl_exec_handler) {
+        orig_curl_exec_func->internal_function.handler = orig_curl_exec_handler;
+        orig_curl_exec_func = NULL;
+        orig_curl_exec_handler = NULL;
     }
     
     // During MSHUTDOWN, the Zend heap is being destroyed
@@ -2314,56 +2478,6 @@ PHP_RINIT_FUNCTION(opa) {
         }
     }
     
-    // SIMPLE TEST - Write to file to verify code path is executing
-    FILE *test_file = fopen("/tmp/opa_rinit_test.log", "a");
-    if (test_file) {
-        fprintf(test_file, "[OPA RINIT] EXECUTING - timestamp=%ld\n", (long)time(NULL));
-        fprintf(test_file, "[OPA RINIT] method=%s | uri=%s | query=%s | content=%d\n",
-            SG(request_info).request_method ? SG(request_info).request_method : "NULL",
-            SG(request_info).request_uri ? SG(request_info).request_uri : "NULL", 
-            SG(request_info).query_string ? SG(request_info).query_string : "NULL",
-            SG(request_info).content_length);
-        fclose(test_file);
-    }
-    
-    // IMMEDIATE DEBUG - write(2) bypasses PHP buffers and survives shutdown
-    char debug_buf[512];
-    int len = snprintf(debug_buf, sizeof(debug_buf),
-        "[OPA RINIT] method=%s | uri=%s | query=%s | content=%d\n",
-        SG(request_info).request_method ? SG(request_info).request_method : "NULL",
-        SG(request_info).request_uri ? SG(request_info).request_uri : "NULL", 
-        SG(request_info).query_string ? SG(request_info).query_string : "NULL",
-        SG(request_info).content_length);
-    fprintf(stderr, "%s", debug_buf);  /* stderr - survives shutdown */
-    
-    // FPM-Specific SAPI Check - PG(http_globals) populated EARLIER than SG() in FPM
-    if (sapi_module.name && strstr(sapi_module.name, "fpm")) {
-        fprintf(stderr, "[OPA] FPM detected\n");
-        
-        // Check PG(http_globals) - populated EARLIER than SG() in FPM
-        zval *server = &PG(http_globals)[TRACK_VARS_SERVER];
-        len = snprintf(debug_buf, sizeof(debug_buf), "[OPA] PG(http_globals) server=%p, type=%d, is_array=%d\n", 
-            server, server ? Z_TYPE_P(server) : -1, server && Z_TYPE_P(server) == IS_ARRAY);
-        fprintf(stderr, "%s", debug_buf);
-        
-        if (server && Z_TYPE_P(server) == IS_ARRAY) {
-            zval *method = zend_hash_str_find(Z_ARRVAL_P(server), "REQUEST_METHOD", sizeof("REQUEST_METHOD")-1);
-            zval *uri = zend_hash_str_find(Z_ARRVAL_P(server), "REQUEST_URI", sizeof("REQUEST_URI")-1);
-            len = snprintf(debug_buf, sizeof(debug_buf), "[OPA] PG method=%p, uri=%p\n", method, uri);
-            fprintf(stderr, "%s", debug_buf);
-            
-            if (method && Z_TYPE_P(method) == IS_STRING) {
-                len = snprintf(debug_buf, sizeof(debug_buf), "[OPA] PG method=%s\n", Z_STRVAL_P(method));
-                fprintf(stderr, "%s", debug_buf);
-            }
-            if (uri && Z_TYPE_P(uri) == IS_STRING) {
-                len = snprintf(debug_buf, sizeof(debug_buf), "[OPA] PG uri=%s\n", Z_STRVAL_P(uri));
-                fprintf(stderr, "%s", debug_buf);
-            }
-        } else {
-            fprintf(stderr, "[OPA] PG(http_globals) NOT available (server=%p)\n", server);
-        }
-    }
     
     // Reset per-request state
     profiling_active = 1; // Hardcode enabled for now (avoid OPA_G access)
@@ -2422,37 +2536,17 @@ PHP_RINIT_FUNCTION(opa) {
     
     // Try to capture HTTP request - check both PG(http_globals) and SG(request_info)
     if (!is_cli) {
-            /* TARGETED DEBUG: Verify we're entering HTTP capture block */
-            fprintf(stderr, "[OPA RINIT] Entering HTTP capture block (is_cli=%d)\n", is_cli);
-            
             // HTTP request - use universal serializer (tries PG first for FPM, then SG for Apache)
             char *req_info = serialize_http_request_json_universal();
             
-            /* TARGETED DEBUG: Verify serializer returned something */
-            fprintf(stderr, "[OPA RINIT] serialize_http_request_json_universal() returned: %p\n", req_info);
-            
             debug_log("[RINIT] serialize_http_request_json_universal() returned: %p, content=%.200s", req_info, req_info ? req_info : "NULL");
             
-            // DEBUG - Log the result
-            if (req_info) {
-                len = snprintf(debug_buf, sizeof(debug_buf), "[OPA RINIT] JSON len=%zu, content=%.200s\n", strlen(req_info), req_info);
-                fprintf(stderr, "%s", debug_buf);
-            } else {
-                fprintf(stderr, "[OPA RINIT] JSON is NULL\n");
-            }
-            
             if (req_info && strlen(req_info) > 2) {
-                /* TARGETED DEBUG: Verify we're storing the data */
-                fprintf(stderr, "[OPA RINIT] Storing http_request_json (len=%zu)\n", strlen(req_info));
-                
                 // Free old value if exists
                 if (root_span_http_request_json) {
-                    fprintf(stderr, "[OPA RINIT] Freeing old http_request_json\n");
                     free(root_span_http_request_json);
                 }
                 root_span_http_request_json = req_info;
-                fprintf(stderr, "[OPA RINIT] http_request_json stored: %p, content=%.200s\n", 
-                        root_span_http_request_json, root_span_http_request_json);
                 debug_log("[RINIT] root_span_http_request_json set to: %p, content=%.200s", root_span_http_request_json, root_span_http_request_json ? root_span_http_request_json : "NULL");
                 
                 // Try to extract method and URI from the JSON or use SG(request_info) as fallback
@@ -2734,12 +2828,6 @@ PHP_RSHUTDOWN_FUNCTION(opa) {
     // Skip logging in CLI mode
     int is_cli = (sapi_module.name && strcmp(sapi_module.name, "cli") == 0);
     
-    // SIMPLE TEST - Verify RSHUTDOWN is executing
-    FILE *test_file = fopen("/tmp/opa_rinit_test.log", "a");
-    if (test_file) {
-        fprintf(test_file, "[OPA RSHUTDOWN] EXECUTING - timestamp=%ld\n", (long)time(NULL));
-        fclose(test_file);
-    }
     
     debug_log("[RSHUTDOWN] START - is_cli=%d, collector=%p", is_cli, global_collector);
     

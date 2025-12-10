@@ -1,0 +1,47 @@
+# Compilation artifacts
+*.o
+*.lo
+*.la
+*.so
+*.dep
+*.a
+.libs/
+modules/
+
+# Autotools generated files
+config.h
+config.h.in
+config.h.in~
+config.log
+config.status
+config.nice
+configure
+configure~
+autom4te.cache/
+libtool
+
+# Makefiles (generated)
+Makefile
+Makefile.fragments
+Makefile.objects
+
+# Build directories
+build/
+*.cache
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.log
+*.core
+core-dumps/
+

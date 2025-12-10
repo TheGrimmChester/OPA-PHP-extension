@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  mock-http-server:
+    image: python:3-alpine
+    container_name: opa-mock-http-server
+    volumes:
+      - ./test_http_mock_server.py:/app/server.py:ro
+    working_dir: /app
+    command: python3 server.py 8888
+    ports:
+      - "8888:8888"
+    networks:
+      - opa_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8888/status/200"]
+      interval: 2s
+      timeout: 1s
+      retries: 5
+
+  mysql-test:
+    image: mysql:8.0
+    container_name: opa-mysql-test
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_password}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-test_db}
+      MYSQL_USER: ${MYSQL_USER:-test_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-test_password}
+    ports:
+      - "3307:3306"
+    networks:
+      - opa_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_password"]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+    command: --default-authentication-plugin=mysql_native_password
+
+networks:
+  opa_network:
+    external: true
+
