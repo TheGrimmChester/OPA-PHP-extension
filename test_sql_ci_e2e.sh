@@ -51,7 +51,7 @@ cleanup() {
     cd "${PHP_EXTENSION_DIR}" || true
     
     # Stop MySQL test container
-    docker-compose -f docker-compose.test.yml down > /dev/null 2>&1 || true
+    docker compose -f docker-compose.test.yml down > /dev/null 2>&1 || true
     
     return $exit_code
 }
@@ -108,18 +108,18 @@ start_mysql() {
     
     log_info "Starting MySQL test database..."
     
-    # Start MySQL using docker-compose
-    docker-compose -f docker-compose.test.yml up -d mysql-test 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
+    # Start MySQL using docker compose
+    docker compose -f docker-compose.test.yml up -d mysql-test 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
     
     # Wait for MySQL to be ready
     local max_attempts=30
     local attempt=0
     while [[ $attempt -lt $max_attempts ]]; do
-        if docker-compose -f docker-compose.test.yml exec -T mysql-test mysqladmin ping -h localhost -u root -p"${MYSQL_ROOT_PASSWORD}" --silent 2>/dev/null; then
+        if docker compose -f docker-compose.test.yml exec -T mysql-test mysqladmin ping -h localhost -u root -p"${MYSQL_ROOT_PASSWORD}" --silent 2>/dev/null; then
             log_info "MySQL is ready"
             
             # Create database and user if they don't exist
-            docker-compose -f docker-compose.test.yml exec -T mysql-test mysql -u root -p"${MYSQL_ROOT_PASSWORD}" <<EOF 2>/dev/null || true
+            docker compose -f docker-compose.test.yml exec -T mysql-test mysql -u root -p"${MYSQL_ROOT_PASSWORD}" <<EOF 2>/dev/null || true
 CREATE DATABASE IF NOT EXISTS ${MYSQL_DATABASE};
 CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
 GRANT ALL PRIVILEGES ON ${MYSQL_DATABASE}.* TO '${MYSQL_USER}'@'%';
@@ -134,7 +134,7 @@ EOF
     
     log_error "MySQL failed to start"
     if [[ "$VERBOSE" -eq 1 ]]; then
-        docker-compose -f docker-compose.test.yml logs mysql-test 2>&1 | tail -20
+        docker compose -f docker-compose.test.yml logs mysql-test 2>&1 | tail -20
     fi
     return 1
 }
@@ -296,7 +296,7 @@ EOF
     MYSQL_DATABASE="$MYSQL_DATABASE" \
     MYSQL_USER="$MYSQL_USER" \
     MYSQL_PASSWORD="$MYSQL_PASSWORD" \
-    docker-compose -f docker-compose.test.yml run --rm \
+    docker compose -f docker-compose.test.yml run --rm \
         -e MYSQL_HOST="$MYSQL_HOST" \
         -e MYSQL_PORT="$MYSQL_PORT" \
         -e MYSQL_DATABASE="$MYSQL_DATABASE" \
@@ -331,7 +331,7 @@ wait_for_trace() {
     while [[ $attempt -lt $max_attempts ]]; do
         local trace_id=""
         local query_result
-        query_result=$(docker-compose exec -T clickhouse clickhouse-client --query \
+        query_result=$(docker compose exec -T clickhouse clickhouse-client --query \
             "SELECT trace_id FROM opa.spans_min WHERE service = 'sql-ci-test' ORDER BY start_ts DESC LIMIT 1" 2>&1)
         
         if [[ $? -eq 0 ]] && [[ -n "$query_result" ]] && [[ ! "$query_result" =~ "not running" ]]; then
@@ -339,7 +339,7 @@ wait_for_trace() {
         fi
         
         if [[ -z "${trace_id:-}" ]] || [[ "${trace_id:-}" == "" ]] || [[ "${trace_id:-}" == "null" ]]; then
-            query_result=$(docker-compose exec -T clickhouse clickhouse-client --query \
+            query_result=$(docker compose exec -T clickhouse clickhouse-client --query \
                 "SELECT trace_id FROM opa.spans_min WHERE start_ts > now() - INTERVAL 2 MINUTE ORDER BY start_ts DESC LIMIT 1" 2>&1)
             if [[ $? -eq 0 ]] && [[ -n "$query_result" ]] && [[ ! "$query_result" =~ "not running" ]]; then
                 trace_id=$(echo "$query_result" | tr -d '\n\r ' | head -1)

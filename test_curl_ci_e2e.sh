@@ -47,7 +47,7 @@ cleanup() {
     cd "${PHP_EXTENSION_DIR}" || true
     
     # Stop mock server container
-    docker-compose -f docker-compose.test.yml down > /dev/null 2>&1 || true
+    docker compose -f docker-compose.test.yml down > /dev/null 2>&1 || true
     
     return $exit_code
 }
@@ -104,8 +104,8 @@ start_mock_server() {
     
     log_info "Starting mock HTTP server as Docker service..."
     
-    # Start mock server using docker-compose
-    docker-compose -f docker-compose.test.yml up -d mock-http-server 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
+    # Start mock server using docker compose
+    docker compose -f docker-compose.test.yml up -d mock-http-server 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
     
     # Wait for server to be ready (check from host)
     local max_attempts=20
@@ -122,7 +122,7 @@ start_mock_server() {
     
     log_error "Mock server failed to start"
     if [[ "$VERBOSE" -eq 1 ]]; then
-        docker-compose -f docker-compose.test.yml logs mock-http-server 2>&1 | tail -20
+        docker compose -f docker-compose.test.yml logs mock-http-server 2>&1 | tail -20
     fi
     return 1
 }
@@ -254,7 +254,7 @@ EOF
     
     log_info "Using mock server URL for container: $MOCK_SERVER_URL"
     
-    MOCK_SERVER_URL="$MOCK_SERVER_URL" docker-compose -f docker-compose.test.yml run --rm \
+    MOCK_SERVER_URL="$MOCK_SERVER_URL" docker compose -f docker-compose.test.yml run --rm \
         -e MOCK_SERVER_URL="$MOCK_SERVER_URL" \
         php php -d opa.socket_path=opa-agent:9090 \
             -d opa.enabled=1 \
@@ -285,7 +285,7 @@ wait_for_trace() {
     while [[ $attempt -lt $max_attempts ]]; do
         local trace_id=""
         local query_result
-        query_result=$(docker-compose exec -T clickhouse clickhouse-client --query \
+        query_result=$(docker compose exec -T clickhouse clickhouse-client --query \
             "SELECT trace_id FROM opa.spans_min WHERE service = 'curl-ci-test' ORDER BY start_ts DESC LIMIT 1" 2>&1)
         
         if [[ $? -eq 0 ]] && [[ -n "$query_result" ]] && [[ ! "$query_result" =~ "not running" ]]; then
@@ -293,7 +293,7 @@ wait_for_trace() {
         fi
         
         if [[ -z "${trace_id:-}" ]] || [[ "${trace_id:-}" == "" ]] || [[ "${trace_id:-}" == "null" ]]; then
-            query_result=$(docker-compose exec -T clickhouse clickhouse-client --query \
+            query_result=$(docker compose exec -T clickhouse clickhouse-client --query \
                 "SELECT trace_id FROM opa.spans_min WHERE start_ts > now() - INTERVAL 2 MINUTE ORDER BY start_ts DESC LIMIT 1" 2>&1)
             if [[ $? -eq 0 ]] && [[ -n "$query_result" ]] && [[ ! "$query_result" =~ "not running" ]]; then
                 trace_id=$(echo "$query_result" | tr -d '\n\r ' | head -1)
