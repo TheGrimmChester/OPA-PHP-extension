@@ -1,0 +1,312 @@
+name: Manual Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.2.3). Leave empty for auto-increment.'
+        required: false
+        type: string
+      build_extensions:
+        description: 'Build extensions before release'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    if: inputs.build_extensions == true
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php_version: ['8.3', '8.4', '8.5']
+        include:
+          - php_version: '8.3'
+            php_package: 'php8.3-dev'
+          - php_version: '8.4'
+            php_package: 'php8.4-dev'
+          - php_version: '8.5'
+            php_package: 'php8.5-dev'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up PHP
+        run: |
+          sudo add-apt-repository ppa:ondrej/php -y
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.php_package }} liblz4-dev build-essential autoconf libtool pkg-config
+      
+      - name: Build extension
+        run: |
+          phpize
+          ./configure --enable-opa
+          make
+      
+      - name: Create release directory
+        run: |
+          mkdir -p dist/php${{ matrix.php_version }}
+          cp modules/opa.so dist/php${{ matrix.php_version }}/opa.so
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opa-php${{ matrix.php_version }}
+          path: dist/php${{ matrix.php_version }}/opa.so
+          retention-days: 30
+
+  download-latest-artifacts:
+    if: inputs.build_extensions == false
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y unzip curl jq
+      
+      - name: Get latest workflow run ID
+        id: workflow_run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: runs } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'auto-build-extensions.yml',
+              status: 'success',
+              per_page: 1
+            });
+            
+            if (runs.workflow_runs.length === 0) {
+              core.setFailed('No successful workflow runs found. Please build extensions first or enable "build_extensions" option.');
+              return;
+            }
+            
+            const runId = runs.workflow_runs[0].id;
+            core.setOutput('run_id', runId);
+            console.log(`Found latest successful run: ${runId}`);
+      
+      - name: Download and extract artifacts
+        run: |
+          RUN_ID="${{ steps.workflow_run.outputs.run_id }}"
+          mkdir -p dist
+          
+          # Get list of artifacts
+          ARTIFACTS_JSON=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts")
+          
+          # Extract artifact IDs for opa-php* artifacts
+          echo "$ARTIFACTS_JSON" | jq -r '.artifacts[] | select(.name | startswith("opa-php")) | "\(.name)|\(.id)"' | while IFS='|' read -r name id; do
+            if [ -z "$name" ] || [ -z "$id" ]; then
+              continue
+            fi
+            echo "Downloading $name (ID: $id)..."
+            
+            # Get download URL (follow redirects)
+            DOWNLOAD_URL=$(curl -s -I -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${id}/zip" | \
+              grep -i location | cut -d' ' -f2 | tr -d '\r')
+            
+            if [ -z "$DOWNLOAD_URL" ]; then
+              echo "Failed to get download URL for $name"
+              exit 1
+            fi
+            
+            # Download and extract
+            curl -s -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "$DOWNLOAD_URL" -o "/tmp/${name}.zip"
+            
+            unzip -q -o "/tmp/${name}.zip" -d "dist/${name}"
+            rm "/tmp/${name}.zip"
+            
+            echo "Extracted $name to dist/${name}/"
+          done
+          
+          # Verify we got the artifacts
+          if [ ! -d "dist/opa-php8.3" ] && [ ! -d "dist/opa-php8.4" ] && [ ! -d "dist/opa-php8.5" ]; then
+            echo "Error: No opa-php artifacts were downloaded"
+            exit 1
+          fi
+          
+          echo "All artifacts downloaded successfully";
+
+  release:
+    needs: [build, download-latest-artifacts]
+    if: always() && (needs.build.result == 'success' || needs.download-latest-artifacts.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Download artifacts (if built in this workflow)
+        if: needs.build.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: opa-php*
+          merge-multiple: false
+      
+      - name: Copy artifacts (if downloaded from previous run)
+        if: needs.download-latest-artifacts.result == 'success'
+        run: |
+          # Artifacts from download-latest-artifacts job are already in dist/
+          # Just ensure they're accessible
+          mkdir -p dist
+          if [ -d "dist/opa-php8.3" ] || [ -d "dist/opa-php8.4" ] || [ -d "dist/opa-php8.5" ]; then
+            echo "Artifacts found from previous workflow run"
+          fi
+      
+      - name: Reorganize artifacts
+        run: |
+          # Reorganize downloaded artifacts into expected structure
+          mkdir -p dist/release
+          # Debug: show structure
+          echo "Artifact structure:"
+          find dist -type f -name "*.so" || echo "No .so files found"
+          find dist -type d || echo "No directories found"
+          # Find and copy .so files from artifact subdirectories (handle nested paths)
+          # Rename to include PHP version to avoid conflicts
+          for version in 8.3 8.4 8.5; do
+            FOUND=false
+            # Try different possible paths
+            if [ -f "dist/opa-php${version}/dist/php${version}/opa.so" ]; then
+              cp "dist/opa-php${version}/dist/php${version}/opa.so" "dist/release/opa-php${version}.so"
+              FOUND=true
+            elif [ -f "dist/opa-php${version}/opa.so" ]; then
+              cp "dist/opa-php${version}/opa.so" "dist/release/opa-php${version}.so"
+              FOUND=true
+            elif [ -f "dist/php${version}/opa.so" ]; then
+              cp "dist/php${version}/opa.so" "dist/release/opa-php${version}.so"
+              FOUND=true
+            else
+              # Try to find the file recursively
+              SO_FILE=$(find "dist/opa-php${version}" -type f -name "*.so" 2>/dev/null | head -1)
+              if [ -n "$SO_FILE" ]; then
+                cp "$SO_FILE" "dist/release/opa-php${version}.so"
+                FOUND=true
+              fi
+            fi
+            if [ "$FOUND" = false ]; then
+              echo "Warning: Could not find opa.so for PHP ${version}"
+            fi
+          done
+          # Verify files exist
+          echo "Final release files:"
+          ls -la dist/release/*.so || echo "No .so files found in dist/release/"
+          # Check if we have at least one file
+          if [ ! -f "dist/release/opa-php8.3.so" ] && [ ! -f "dist/release/opa-php8.4.so" ] && [ ! -f "dist/release/opa-php8.5.so" ]; then
+            echo "Error: No .so files found for release!"
+            exit 1
+          fi
+          # Clean up artifact directories
+          rm -rf dist/opa-php8.3 dist/opa-php8.4 dist/opa-php8.5 dist/php8.3 dist/php8.4 dist/php8.5
+      
+      - name: Generate version tag
+        id: version
+        run: |
+          # Fetch all tags
+          git fetch --tags || true
+          
+          if [ -n "${{ inputs.version }}" ]; then
+            # Use provided version
+            NEW_VERSION="${{ inputs.version }}"
+            # Ensure it starts with 'v'
+            if [[ ! "$NEW_VERSION" =~ ^v ]]; then
+              NEW_VERSION="v${NEW_VERSION}"
+            fi
+          else
+            # Get the latest tag
+            LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            
+            if [ -z "$LATEST_TAG" ]; then
+              # No tags exist, start with v0.0.1
+              echo "No existing tags found, starting with v0.0.1"
+              NEW_VERSION="v0.0.1"
+            else
+              echo "Latest tag: $LATEST_TAG"
+              
+              # Extract version number (remove 'v' prefix)
+              VERSION_NUM=$(echo "$LATEST_TAG" | sed 's/^v//')
+              
+              # Split version into parts
+              IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION_NUM"
+              
+              # Handle cases where version might not have all parts
+              MAJOR=${MAJOR:-0}
+              MINOR=${MINOR:-0}
+              PATCH=${PATCH:-0}
+              
+              # Increment patch version
+              PATCH=$((PATCH + 1))
+              
+              # Create new version
+              NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+            fi
+          fi
+          
+          echo "New version: $NEW_VERSION"
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$NEW_VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Generate release description
+        id: release_desc
+        run: |
+          # Fetch all tags
+          git fetch --tags || true
+          
+          # Get the latest tag
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          
+          DESCRIPTION="## Release ${{ steps.version.outputs.version }}"
+          DESCRIPTION="${DESCRIPTION}"$'\n\n'
+          DESCRIPTION="${DESCRIPTION}Release created from commit: [\`${{ github.sha }}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})"
+          DESCRIPTION="${DESCRIPTION}"$'\n\n'
+          
+          if [ -z "$LATEST_TAG" ]; then
+            DESCRIPTION="${DESCRIPTION}### Changes in this release"$'\n'
+            DESCRIPTION="${DESCRIPTION}$(git log --oneline -20 --pretty=format:'- %s (%h)')"
+          else
+            DESCRIPTION="${DESCRIPTION}### Changes since $LATEST_TAG"$'\n'
+            DESCRIPTION="${DESCRIPTION}$(git log ${LATEST_TAG}..HEAD --oneline --pretty=format:'- %s (%h)' || echo '- No commits found')"
+            DESCRIPTION="${DESCRIPTION}"$'\n\n'
+            DESCRIPTION="${DESCRIPTION}### Files Changed"$'\n'
+            CHANGED_FILES=$(git diff --name-status ${LATEST_TAG}..HEAD | head -20 || echo "No changes")
+            DESCRIPTION="${DESCRIPTION}\`\`\`"$'\n'
+            DESCRIPTION="${DESCRIPTION}${CHANGED_FILES}"$'\n'
+            DESCRIPTION="${DESCRIPTION}\`\`\`"
+          fi
+          
+          DESCRIPTION="${DESCRIPTION}"$'\n\n'
+          DESCRIPTION="${DESCRIPTION}### Built Extensions"$'\n'
+          DESCRIPTION="${DESCRIPTION}- **PHP 8.3**: \`opa-php8.3.so\`"$'\n'
+          DESCRIPTION="${DESCRIPTION}- **PHP 8.4**: \`opa-php8.4.so\`"$'\n'
+          DESCRIPTION="${DESCRIPTION}- **PHP 8.5**: \`opa-php8.5.so\`"$'\n\n'
+          DESCRIPTION="${DESCRIPTION}### Installation"$'\n'
+          DESCRIPTION="${DESCRIPTION}Download the appropriate extension file for your PHP version from the assets below."
+          
+          echo "description<<EOF" >> $GITHUB_OUTPUT
+          echo "$DESCRIPTION" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Release ${{ steps.version.outputs.version }}
+          body: ${{ steps.release_desc.outputs.description }}
+          files: |
+            dist/release/*.so
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

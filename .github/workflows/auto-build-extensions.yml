@@ -1,0 +1,53 @@
+name: Auto Build Extensions
+
+on:
+  push:
+    branches: [ main, master ]
+    # Exclude tags to avoid duplicate builds
+    tags-ignore:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php_version: ['8.3', '8.4', '8.5']
+        include:
+          - php_version: '8.3'
+            php_package: 'php8.3-dev'
+          - php_version: '8.4'
+            php_package: 'php8.4-dev'
+          - php_version: '8.5'
+            php_package: 'php8.5-dev'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up PHP
+        run: |
+          sudo add-apt-repository ppa:ondrej/php -y
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.php_package }} liblz4-dev build-essential autoconf libtool pkg-config
+      
+      - name: Build extension
+        run: |
+          phpize
+          ./configure --enable-opa
+          make
+      
+      - name: Create release directory
+        run: |
+          mkdir -p dist/php${{ matrix.php_version }}
+          cp modules/opa.so dist/php${{ matrix.php_version }}/opa.so
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opa-php${{ matrix.php_version }}
+          path: dist/php${{ matrix.php_version }}/opa.so
+          retention-days: 30
+
