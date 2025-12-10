@@ -1290,13 +1290,16 @@ void opa_exit_function(const char *call_id) {
 
 // zend_execute_ex hook ()
 void opa_execute_ex(zend_execute_data *execute_data) {
+    // TEMPORARILY DISABLED: Remove profiling_active gate for debugging
     // Fast-path: if not actively profiling, call original immediately
+    /*
     if (!profiling_active) {
         if (original_zend_execute_ex) {
             original_zend_execute_ex(execute_data);
         }
         return;
     }
+    */
     
     // Safety check: ensure original handler exists and execute_data is valid
     if (!original_zend_execute_ex || !execute_data) {
