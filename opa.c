@@ -1419,13 +1419,42 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         }
     }
     
-    // Check for curl_exec in BEFORE section (capture timing before execution)
+    // Check for curl_exec in BEFORE section (capture timing and handle before execution)
     int curl_func_before = 0;
+    zval *curl_handle_before = NULL;
     double curl_start_time = 0.0;
     size_t curl_bytes_sent_before = 0;
     size_t curl_bytes_received_before = 0;
     
-    if (function_name && strcmp(function_name, "curl_exec") == 0) {
+    // Try to detect curl by checking arguments BEFORE execution (when they're still available)
+    if (execute_data && execute_data->func) {
+        uint32_t num_args_before = ZEND_CALL_NUM_ARGS(execute_data);
+        debug_log("[execute_ex] BEFORE: num_args=%u, function_name=%s", num_args_before, function_name ? function_name : "NULL");
+        if (num_args_before > 0) {
+            zval *arg1_before = ZEND_CALL_ARG(execute_data, 1);
+            if (arg1_before && Z_TYPE_P(arg1_before) == IS_OBJECT) {
+                zend_class_entry *ce = Z_OBJCE_P(arg1_before);
+                if (ce && ce->name) {
+                    const char *class_name = ZSTR_VAL(ce->name);
+                    size_t class_name_len = ZSTR_LEN(ce->name);
+                    debug_log("[execute_ex] BEFORE: arg1 is object, class=%.*s", (int)class_name_len, class_name);
+                    if ((class_name_len == sizeof("CurlHandle")-1 && memcmp(class_name, "CurlHandle", sizeof("CurlHandle")-1) == 0) ||
+                        (class_name_len == sizeof("CurlMultiHandle")-1 && memcmp(class_name, "CurlMultiHandle", sizeof("CurlMultiHandle")-1) == 0) ||
+                        (class_name_len == sizeof("CurlShareHandle")-1 && memcmp(class_name, "CurlShareHandle", sizeof("CurlShareHandle")-1) == 0)) {
+                        curl_func_before = 1;
+                        curl_handle_before = arg1_before;
+                        curl_start_time = get_time_seconds();
+                        curl_bytes_sent_before = get_bytes_sent();
+                        curl_bytes_received_before = get_bytes_received();
+                        debug_log("[execute_ex] BEFORE: Detected curl call, storing handle");
+                    }
+                }
+            }
+        }
+    }
+    
+    // Fallback: function name detection
+    if (!curl_func_before && function_name && strcmp(function_name, "curl_exec") == 0) {
         curl_func_before = 1;
         curl_start_time = get_time_seconds();
         curl_bytes_sent_before = get_bytes_sent();
