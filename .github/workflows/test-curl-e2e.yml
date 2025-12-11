@@ -59,6 +59,40 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       
+      - name: Set up Docker Compose
+        run: |
+          echo "Verifying Docker Compose availability..."
+          if docker compose version >/dev/null 2>&1; then
+            echo "Docker Compose v2 is available"
+            docker compose version
+          elif docker-compose version >/dev/null 2>&1; then
+            echo "Docker Compose v1 is available"
+            docker-compose version
+          else
+            echo "ERROR: Neither 'docker compose' nor 'docker-compose' is available"
+            exit 1
+          fi
+      
+      - name: Verify ClickHouse service is accessible
+        run: |
+          echo "Waiting for ClickHouse service to be ready..."
+          max_attempts=30
+          attempt=0
+          while [ $attempt -lt $max_attempts ]; do
+            if curl -sf http://localhost:8123/ping > /dev/null 2>&1; then
+              echo "ClickHouse service is accessible on localhost:8123"
+              curl -sf http://localhost:8123/ping
+              break
+            fi
+            echo "Waiting for ClickHouse... ($attempt/$max_attempts)"
+            sleep 1
+            attempt=$((attempt + 1))
+          done
+          if [ $attempt -eq $max_attempts ]; then
+            echo "ERROR: ClickHouse service is not accessible after $max_attempts attempts"
+            exit 1
+          fi
+      
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -67,7 +101,12 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Create Docker network
-        run: docker network create opa_network || true
+        run: |
+          echo "Creating Docker network opa_network..."
+          docker network create opa_network || true
+          echo "Verifying network exists..."
+          docker network inspect opa_network || (echo "ERROR: Network opa_network was not created" && exit 1)
+          echo "Network opa_network is ready"
       
       - name: Pull or build agent image
         id: agent-image
@@ -108,12 +147,33 @@ jobs:
           echo "Agent image verified:"
           docker images opa-agent:latest
       
+      - name: Verify ClickHouse connectivity from host
+        run: |
+          echo "Testing ClickHouse connectivity from host..."
+          # Test both localhost and bridge gateway
+          if curl -sf http://localhost:8123/ping > /dev/null 2>&1; then
+            echo "✓ ClickHouse is accessible on localhost:8123"
+          else
+            echo "✗ ClickHouse is NOT accessible on localhost:8123"
+            exit 1
+          fi
+          
+          # Test bridge gateway (what containers will use)
+          if curl -sf http://172.17.0.1:8123/ping > /dev/null 2>&1; then
+            echo "✓ ClickHouse is accessible on 172.17.0.1:8123 (bridge gateway)"
+          else
+            echo "⚠ ClickHouse may not be accessible on 172.17.0.1:8123 (this is expected in some CI environments)"
+          fi
+      
       - name: Start agent
         run: |
           # Use 172.17.0.1 (Docker bridge gateway) to access ClickHouse service via host
           # GitHub Actions services expose ports to localhost, and 172.17.0.1 is the default bridge gateway
           # This is more reliable than host.docker.internal in GitHub Actions environment
-          echo "Starting agent with ClickHouse URL: http://172.17.0.1:8123"
+          echo "Starting agent with configuration:"
+          echo "  - CLICKHOUSE_URL=http://172.17.0.1:8123"
+          echo "  - TRANSPORT_TCP=:9090"
+          echo "  - Network: opa_network"
           docker run -d \
             --name opa-agent \
             --network opa_network \
@@ -123,16 +183,30 @@ jobs:
             -p 8081:8080 \
             -p 9090:9090 \
             opa-agent:latest
+          
+          echo "Waiting for agent to start..."
           sleep 5
-          for i in {1..30}; do
+          
+          # Wait for agent health check
+          max_attempts=30
+          attempt=0
+          while [ $attempt -lt $max_attempts ]; do
             if curl -f http://localhost:8081/api/health > /dev/null 2>&1; then
-              echo "Agent is ready"
+              echo "✓ Agent is ready and healthy"
+              curl -sf http://localhost:8081/api/health | head -20 || true
               break
             fi
-            echo "Waiting for agent... ($i/30)"
+            echo "Waiting for agent... ($attempt/$max_attempts)"
             sleep 1
+            attempt=$((attempt + 1))
           done
-          curl -f http://localhost:8081/api/health || exit 1
+          
+          if [ $attempt -eq $max_attempts ]; then
+            echo "ERROR: Agent did not become ready after $max_attempts attempts"
+            echo "Agent logs (last 50 lines):"
+            docker logs opa-agent --tail 50 || true
+            exit 1
+          fi
           
           # Check agent logs for ClickHouse connection issues
           echo "Agent logs (last 50 lines):"
@@ -140,7 +214,80 @@ jobs:
           
           # Test if agent can reach ClickHouse
           echo "Testing ClickHouse connectivity from agent container..."
-          docker exec opa-agent wget --spider -q http://172.17.0.1:8123/ping && echo "ClickHouse is reachable from agent" || echo "WARNING: ClickHouse may not be reachable from agent"
+          if docker exec opa-agent wget --spider -q http://172.17.0.1:8123/ping 2>&1; then
+            echo "✓ ClickHouse is reachable from agent container via 172.17.0.1:8123"
+          else
+            echo "⚠ WARNING: ClickHouse may not be reachable from agent container"
+            echo "Attempting alternative connection test..."
+            docker exec opa-agent wget --spider -q http://host.docker.internal:8123/ping 2>&1 && echo "✓ ClickHouse is reachable via host.docker.internal" || echo "✗ ClickHouse is not reachable via host.docker.internal"
+          fi
+      
+      - name: Verify agent configuration
+        run: |
+          echo "Verifying agent configuration..."
+          echo "Agent container network:"
+          docker inspect opa-agent --format '{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}' || true
+          
+          echo "Agent environment variables:"
+          docker exec opa-agent env | grep -E "(CLICKHOUSE|TRANSPORT)" || true
+          
+          echo "Agent can reach opa-agent hostname:"
+          docker exec opa-agent getent hosts opa-agent || echo "⚠ opa-agent hostname not resolvable (this may be expected)"
+      
+      - name: Verify agent connection from network
+        run: |
+          echo "Verifying agent connection from Docker network..."
+          
+          # Check if agent port 9090 is listening
+          echo "Checking if agent is listening on port 9090..."
+          if docker exec opa-agent netstat -tuln 2>/dev/null | grep -q ":9090" || docker exec opa-agent ss -tuln 2>/dev/null | grep -q ":9090"; then
+            echo "✓ Agent is listening on port 9090"
+          else
+            echo "⚠ Could not verify agent is listening on port 9090 (netstat/ss may not be available)"
+          fi
+          
+          # Test connection from a temporary container on the same network
+          echo "Testing TCP connection to agent from network container..."
+          if docker run --rm --network opa_network \
+            alpine:latest \
+            sh -c "apk add --no-cache bash >/dev/null 2>&1 && timeout 3 bash -c 'echo > /dev/tcp/opa-agent/9090' 2>/dev/null && echo 'Connection successful'" 2>&1 | grep -q "Connection successful"; then
+            echo "✓ Agent TCP port 9090 is accessible from network containers"
+          else
+            echo "⚠ Direct TCP test completed (testing with netcat instead)"
+          fi
+          
+          # Alternative test using telnet or nc if available
+          echo "Testing agent connection with alternative method..."
+          docker run --rm --network opa_network \
+            alpine:latest \
+            sh -c "apk add --no-cache netcat-openbsd >/dev/null 2>&1 && nc -zv opa-agent 9090 2>&1 || echo 'Connection test attempted'" || true
+          
+          # Verify agent hostname resolution
+          echo "Verifying agent hostname resolution from network..."
+          docker run --rm --network opa_network \
+            alpine:latest \
+            getent hosts opa-agent && echo "✓ opa-agent hostname resolves correctly" || echo "✗ opa-agent hostname does not resolve"
+          
+          # Check agent API endpoint
+          echo "Verifying agent API endpoint..."
+          if curl -sf http://localhost:8081/api/health > /dev/null 2>&1; then
+            echo "✓ Agent API is accessible on localhost:8081"
+            echo "Agent health response:"
+            curl -sf http://localhost:8081/api/health | head -5 || true
+          else
+            echo "✗ Agent API is not accessible on localhost:8081"
+            exit 1
+          fi
+          
+          # Verify agent can receive traces (check if it's processing)
+          echo "Checking agent trace processing capability..."
+          agent_status=$(curl -sf http://localhost:8081/api/health 2>/dev/null || echo "")
+          if [ -n "$agent_status" ]; then
+            echo "✓ Agent is healthy and ready to receive connections"
+          else
+            echo "✗ Agent health check failed"
+            exit 1
+          fi
       
       - name: Build PHP extension image
         run: |
@@ -151,6 +298,32 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3 curl jq lsof
+      
+      - name: Verify test configuration
+        run: |
+          echo "Verifying test configuration..."
+          echo "PHP INI settings that will be used:"
+          echo "  - opa.socket_path=opa-agent:9090"
+          echo "  - opa.enabled=1"
+          echo "  - opa.sampling_rate=1.0"
+          echo "  - opa.collect_internal_functions=1"
+          echo "  - opa.debug_log=0"
+          echo "  - opa.service=curl-ci-test"
+          echo ""
+          echo "Environment variables:"
+          echo "  - CI_MODE=1"
+          echo "  - API_URL=http://localhost:8081"
+          echo "  - PROJECT_ROOT=${{ github.workspace }}/.."
+          echo ""
+          echo "Verifying agent is accessible from host:"
+          curl -sf http://localhost:8081/api/health > /dev/null && echo "✓ Agent API is accessible" || (echo "✗ Agent API is not accessible" && exit 1)
+          echo ""
+          echo "Verifying PHP extension image exists:"
+          docker images php-extension-test --format "{{.Repository}}:{{.Tag}}" | head -1 || (echo "✗ PHP extension image not found" && exit 1)
+          echo "✓ PHP extension image exists"
+          echo ""
+          echo "Verifying network connectivity:"
+          docker network inspect opa_network --format '{{range .Containers}}{{.Name}} {{end}}' | grep -q opa-agent && echo "✓ Agent is on opa_network" || echo "⚠ Agent may not be on opa_network"
       
       - name: Run cURL E2E test
         env:

@@ -1,4 +1,4 @@
-name: Error and Log Tracking E2E Test
+name: Error Profiling E2E Test
 
 on:
   push:
@@ -8,9 +8,9 @@ on:
       - '**/*.h'
       - 'Dockerfile*'
       - 'docker-compose*.yml'
-      - 'test_error_log*.sh'
-      - 'tests/error_log*.php'
-      - '.github/workflows/test-error-log-e2e.yml'
+      - 'test_errors*.sh'
+      - 'tests/test_errors*.php'
+      - '.github/workflows/test-errors-e2e.yml'
   pull_request:
     branches: [ main, develop ]
     paths:
@@ -18,16 +18,16 @@ on:
       - '**/*.h'
       - 'Dockerfile*'
       - 'docker-compose*.yml'
-      - 'test_error_log*.sh'
-      - 'tests/error_log*.php'
-      - '.github/workflows/test-error-log-e2e.yml'
+      - 'test_errors*.sh'
+      - 'tests/test_errors*.php'
+      - '.github/workflows/test-errors-e2e.yml'
   workflow_dispatch:
 
 jobs:
-  test-error-log-e2e:
-    name: Error/Log E2E Test (PHP ${{ matrix.php_version }})
+  test-errors-e2e:
+    name: Error Profiling E2E Test (PHP ${{ matrix.php_version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: read
@@ -308,7 +308,7 @@ jobs:
           echo "  - opa.sampling_rate=1.0"
           echo "  - opa.collect_internal_functions=1"
           echo "  - opa.debug_log=0"
-          echo "  - opa.service=error-log-ci-test"
+          echo "  - opa.service=error-ci-test"
           echo "  - opa.track_errors=1"
           echo "  - opa.track_logs=1"
           echo "  - opa.log_levels=critical,error,warning"
@@ -320,6 +320,7 @@ jobs:
           echo "  - CLICKHOUSE_HOST=clickhouse"
           echo "  - CLICKHOUSE_PORT=9000"
           echo "  - CLICKHOUSE_HTTP_PORT=8123"
+          echo "  - SERVICE_NAME=error-ci-test"
           echo ""
           echo "Verifying agent is accessible from host:"
           curl -sf http://localhost:8081/api/health > /dev/null && echo "✓ Agent API is accessible" || (echo "✗ Agent API is not accessible" && exit 1)
@@ -331,7 +332,7 @@ jobs:
           echo "Verifying network connectivity:"
           docker network inspect opa_network --format '{{range .Containers}}{{.Name}} {{end}}' | grep -q opa-agent && echo "✓ Agent is on opa_network" || echo "⚠ Agent may not be on opa_network"
       
-      - name: Run Error/Log E2E test
+      - name: Run Error Profiling E2E test
         env:
           CI_MODE: 1
           API_URL: http://localhost:8081
@@ -339,9 +340,10 @@ jobs:
           CLICKHOUSE_HOST: clickhouse
           CLICKHOUSE_PORT: 9000
           CLICKHOUSE_HTTP_PORT: 8123
+          SERVICE_NAME: error-ci-test
         run: |
-          chmod +x test_error_log_ci_e2e.sh
-          ./test_error_log_ci_e2e.sh --ci
+          chmod +x test_errors_ci_e2e.sh
+          ./test_errors_ci_e2e.sh --ci
       
       - name: Cleanup
         if: always()
