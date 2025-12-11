@@ -97,14 +97,61 @@ test_result() {
     fi
 }
 
-# Query ClickHouse
+# Helper function to query ClickHouse
+# In CI mode, ClickHouse runs as a GitHub Actions service, not in docker-compose
 clickhouse_query() {
     local query="$1"
-    docker run --rm --network opa_network \
+    local clickhouse_container
+    local result
+    local exit_code
+    
+    # Try to find ClickHouse container (GitHub Actions service)
+    clickhouse_container=$(docker ps --filter "ancestor=clickhouse/clickhouse-server:23.3" --format "{{.ID}}" | head -1)
+    
+    if [[ -z "$clickhouse_container" ]]; then
+        # Also try by name pattern (GitHub Actions service containers have specific naming)
+        clickhouse_container=$(docker ps --filter "name=clickhouse" --format "{{.ID}}" | head -1)
+    fi
+    
+    if [[ -n "$clickhouse_container" ]]; then
+        # Use docker exec on the service container (no host/port needed, we're inside the container)
+        result=$(docker exec "$clickhouse_container" clickhouse-client --query "$query" 2>&1)
+        exit_code=$?
+        
+        if [[ $exit_code -eq 0 ]]; then
+            echo "$result"
+            return 0
+        elif [[ "$VERBOSE" -eq 1 ]] || [[ "$CI_MODE" -eq 1 ]]; then
+            log_warn "ClickHouse query failed via docker exec (exit code: $exit_code): $result"
+        fi
+    fi
+    
+    # Fallback: try docker-compose from main project (for local testing)
+    if [[ -f "${PROJECT_ROOT}/docker-compose.yml" ]]; then
+        result=$(cd "${PROJECT_ROOT}" && docker compose exec -T clickhouse clickhouse-client --query "$query" 2>&1)
+        exit_code=$?
+        if [[ $exit_code -eq 0 ]]; then
+            echo "$result"
+            return 0
+        elif [[ "$VERBOSE" -eq 1 ]]; then
+            log_warn "ClickHouse query failed via docker-compose (exit code: $exit_code): $result"
+        fi
+    fi
+    
+    # Last resort: try native protocol via host network (for CI when container not found by name)
+    result=$(docker run --rm --network host \
         clickhouse/clickhouse-client:23.3 \
-        --host "${CLICKHOUSE_HOST}" \
-        --port "${CLICKHOUSE_PORT}" \
-        --query "$query" 2>/dev/null || echo ""
+        --host 127.0.0.1 \
+        --port "${CLICKHOUSE_PORT:-9000}" \
+        --query "$query" 2>&1)
+    exit_code=$?
+    
+    if [[ $exit_code -ne 0 ]] && [[ "$VERBOSE" -eq 1 ]]; then
+        log_warn "ClickHouse query failed via host network (exit code: $exit_code): $result"
+    fi
+    
+    echo "$result"
+    return $exit_code
 }
 
 # Check if services are running
@@ -118,12 +165,27 @@ check_services() {
     fi
     log_info "Agent is accessible"
     
-    # Check ClickHouse
-    if ! clickhouse_query "SELECT 1" > /dev/null 2>&1; then
+    # Check ClickHouse - try multiple methods
+    local clickhouse_ok=false
+    if clickhouse_query "SELECT 1" > /dev/null 2>&1; then
+        clickhouse_ok=true
+    else
+        # Try alternative: direct connection via localhost
+        if docker run --rm --network host \
+            clickhouse/clickhouse-client:23.3 \
+            --host localhost \
+            --port "${CLICKHOUSE_HTTP_PORT:-8123}" \
+            --query "SELECT 1" > /dev/null 2>&1; then
+            clickhouse_ok=true
+        fi
+    fi
+    
+    if [[ "$clickhouse_ok" == "true" ]]; then
+        log_info "ClickHouse is accessible"
+    else
         log_error "ClickHouse is not accessible"
         return 1
     fi
-    log_info "ClickHouse is accessible"
     
     return 0
 }
