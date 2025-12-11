@@ -76,6 +76,7 @@ jobs:
         with:
           context: .
           push: ${{ steps.meta.outputs.should_push == 'true' }}
+          platforms: linux/amd64,linux/arm64/v8
           build-args: |
             PHP_VERSION=${{ matrix.php_version }}
           tags: ${{ steps.meta.outputs.tags }}
