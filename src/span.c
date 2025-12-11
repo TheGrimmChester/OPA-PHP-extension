@@ -647,6 +647,15 @@ char* produce_span_json_from_values(
     } else {
         debug_log("[produce_span_json_from_values] http_response_json is NULL or empty (this is OK for CLI requests)");
     }
+    // Add expand_spans flag to tags (default: true for multiple spans mode)
+    if (!tag_first) json_buffer_append_str(&buf, ",");
+    json_buffer_append_str(&buf, "\"expand_spans\":");
+    if (OPA_G(expand_spans)) {
+        json_buffer_append_str(&buf, "true");
+    } else {
+        json_buffer_append_str(&buf, "false");
+    }
+    tag_first = 0;
     json_buffer_append_str(&buf, "}");
     
     // Aggregate network metrics from call stack

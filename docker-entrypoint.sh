@@ -75,6 +75,7 @@ update_ini_setting "OPA_LANGUAGE" "opa.language"
 update_ini_setting "OPA_LANGUAGE_VERSION" "opa.language_version"
 update_ini_setting "OPA_FRAMEWORK" "opa.framework"
 update_ini_setting "OPA_FRAMEWORK_VERSION" "opa.framework_version"
+update_ini_setting "OPA_EXPAND_SPANS" "opa.expand_spans"
 
 # Execute the original docker-php-entrypoint (or the command passed)
 if [ "$1" = "php-fpm" ]; then

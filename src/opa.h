@@ -58,6 +58,7 @@ ZEND_BEGIN_MODULE_GLOBALS(opa)
     zend_bool track_errors; // Enable/disable error tracking
     zend_bool track_logs; // Enable/disable log tracking
     char *log_levels; // Comma-separated list: critical,error,warning
+    zend_bool expand_spans; // 1 = multiple spans (default), 0 = full span
 ZEND_END_MODULE_GLOBALS(opa)
 
 // Declare extern for other files - actual declaration is in opa.c

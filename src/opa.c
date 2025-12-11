@@ -48,6 +48,7 @@ PHP_INI_BEGIN()
     STD_PHP_INI_ENTRY("opa.track_errors", "1", PHP_INI_ALL, OnUpdateBool, track_errors, zend_opa_globals, opa_globals)
     STD_PHP_INI_ENTRY("opa.track_logs", "1", PHP_INI_ALL, OnUpdateBool, track_logs, zend_opa_globals, opa_globals)
     STD_PHP_INI_ENTRY("opa.log_levels", "critical,error", PHP_INI_ALL, OnUpdateString, log_levels, zend_opa_globals, opa_globals)
+    STD_PHP_INI_ENTRY("opa.expand_spans", "1", PHP_INI_ALL, OnUpdateBool, expand_spans, zend_opa_globals, opa_globals)
 PHP_INI_END()
 
 // Global state (declared in opa.h, defined here)
