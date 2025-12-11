@@ -134,6 +134,8 @@ typedef struct _opa_collector_t {
     double end_time; // Request end time
     size_t start_memory; // Request start memory
     size_t end_memory; // Request end memory
+    zval *global_sql_queries; // Global SQL queries array (independent of call nodes)
+    pthread_mutex_t global_sql_mutex; // Mutex for thread-safe access to global_sql_queries
 } opa_collector_t;
 
 // Global state (declared in opa.c)

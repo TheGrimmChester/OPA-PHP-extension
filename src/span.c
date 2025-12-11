@@ -114,7 +114,7 @@ static void aggregate_network_bytes_from_calls(size_t *total_sent, size_t *total
     }
 }
 
-// Aggregate SQL queries from all call nodes in the collector
+// Aggregate SQL queries from all call nodes in the collector AND global SQL queries array
 // Returns the number of SQL queries found
 static int aggregate_sql_queries_from_calls(json_buffer_t *buf) {
     int query_count = 0;
@@ -127,6 +127,7 @@ static int aggregate_sql_queries_from_calls(json_buffer_t *buf) {
     json_buffer_append_str(buf, "[");
     int first = 1;
     
+    // First, add SQL queries from call nodes
     call_node_t *call = global_collector->calls;
     while (call) {
         if (call->magic == OPA_CALL_NODE_MAGIC && 
@@ -156,7 +157,36 @@ static int aggregate_sql_queries_from_calls(json_buffer_t *buf) {
         call = call->next;
     }
     
+    // Then, add SQL queries from global array (captured outside of call stack)
+    pthread_mutex_lock(&global_collector->global_sql_mutex);
+    if (global_collector->global_sql_queries && 
+        Z_TYPE_P(global_collector->global_sql_queries) == IS_ARRAY &&
+        zend_hash_num_elements(Z_ARRVAL_P(global_collector->global_sql_queries)) > 0) {
+        
+        HashTable *ht = Z_ARRVAL_P(global_collector->global_sql_queries);
+        zval *val;
+        ZEND_HASH_FOREACH_VAL(ht, val) {
+            if (!first) {
+                json_buffer_append_str(buf, ",");
+            }
+            // Serialize SQL query zval to JSON
+            smart_string temp_buf = {0};
+            serialize_zval_json(&temp_buf, val);
+            smart_string_0(&temp_buf);
+            if (temp_buf.c && temp_buf.len > 0) {
+                json_buffer_append(buf, temp_buf.c, temp_buf.len);
+                query_count++;
+            }
+            smart_string_free(&temp_buf);
+            first = 0;
+        } ZEND_HASH_FOREACH_END();
+        debug_log("[aggregate_sql_queries_from_calls] Added %d SQL queries from global array", 
+            zend_hash_num_elements(Z_ARRVAL_P(global_collector->global_sql_queries)));
+    }
+    pthread_mutex_unlock(&global_collector->global_sql_mutex);
+    
     json_buffer_append_str(buf, "]");
+    debug_log("[aggregate_sql_queries_from_calls] Total SQL queries aggregated: %d", query_count);
     return query_count;
 }
 

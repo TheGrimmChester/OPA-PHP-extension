@@ -742,13 +742,16 @@ int is_pdo_method(zend_execute_data *execute_data) {
     // Check if it's a method call
     if (execute_data->func->common.scope) {
         const char *class_name = ZSTR_VAL(execute_data->func->common.scope->name);
+        debug_log("[is_pdo_method] Checking class: %s", class_name);
         if (strcmp(class_name, "PDO") == 0 || strcmp(class_name, "PDOStatement") == 0) {
             if (execute_data->func->common.function_name) {
                 const char *method_name = ZSTR_VAL(execute_data->func->common.function_name);
+                debug_log("[is_pdo_method] Checking method: %s::%s", class_name, method_name);
                 if (strcmp(method_name, "prepare") == 0 ||
                     strcmp(method_name, "query") == 0 ||
                     strcmp(method_name, "exec") == 0 ||
                     strcmp(method_name, "execute") == 0) {
+                    debug_log("[is_pdo_method] PDO method detected: %s::%s", class_name, method_name);
                     return 1;
                 }
             }
@@ -1069,6 +1072,8 @@ opa_collector_t* opa_collector_init(void) {
     collector->call_depth = 0;
     collector->call_count = 0;
     collector->active = 0;
+    collector->global_sql_queries = NULL;
+    pthread_mutex_init(&collector->global_sql_mutex, NULL);
     
     return collector;
 }
@@ -1088,6 +1093,18 @@ void opa_collector_start(opa_collector_t *collector) {
     collector->call_depth = 0;
     collector->call_count = 0;
     collector->calls = NULL;
+    
+    // Initialize global SQL queries array
+    pthread_mutex_lock(&collector->global_sql_mutex);
+    if (collector->global_sql_queries) {
+        zval_ptr_dtor(collector->global_sql_queries);
+        efree(collector->global_sql_queries);
+    }
+    collector->global_sql_queries = ecalloc(1, sizeof(zval));
+    if (collector->global_sql_queries) {
+        array_init(collector->global_sql_queries);
+    }
+    pthread_mutex_unlock(&collector->global_sql_mutex);
 }
 
 // Deactivate collector and record end time/memory for the request
@@ -1106,6 +1123,16 @@ void opa_collector_free(opa_collector_t *collector) {
     if (!collector) {
         return;
     }
+    
+    // Free global SQL queries array
+    pthread_mutex_lock(&collector->global_sql_mutex);
+    if (collector->global_sql_queries) {
+        zval_ptr_dtor(collector->global_sql_queries);
+        efree(collector->global_sql_queries);
+        collector->global_sql_queries = NULL;
+    }
+    pthread_mutex_unlock(&collector->global_sql_mutex);
+    pthread_mutex_destroy(&collector->global_sql_mutex);
     
     // Free all calls
     call_node_t *call = collector->calls;
@@ -1283,6 +1310,21 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         class_name = ZSTR_VAL(func->common.scope->name);
     }
     
+    // Debug: Log ALL PDO-related function calls (using php_printf so it's always visible)
+    if (class_name && (strcmp(class_name, "PDO") == 0 || strcmp(class_name, "PDOStatement") == 0)) {
+        php_printf("[OPA execute_ex] PDO CLASS DETECTED: %s::%s (func_type=%d)\n", 
+            class_name, function_name ? function_name : "NULL", func->type);
+        debug_log("[execute_ex] PDO CLASS DETECTED: %s::%s (func_type=%d, scope=%p)", 
+            class_name, function_name ? function_name : "NULL", func->type, func->common.scope);
+    }
+    if (function_name && (strcmp(function_name, "query") == 0 || strcmp(function_name, "exec") == 0 || 
+                         strcmp(function_name, "prepare") == 0 || strcmp(function_name, "execute") == 0)) {
+        php_printf("[OPA execute_ex] PDO METHOD NAME DETECTED: %s (class=%s, func_type=%d)\n", 
+            function_name, class_name ? class_name : "NULL", func->type);
+        debug_log("[execute_ex] PDO METHOD NAME DETECTED: %s (class=%s, func_type=%d)", 
+            function_name, class_name ? class_name : "NULL", func->type);
+    }
+    
     // Determine function type
     if (func->type == ZEND_USER_FUNCTION) {
         function_type = class_name ? 2 : 0; /* method if has class, otherwise user function */
@@ -1320,12 +1362,56 @@ void opa_execute_ex(zend_execute_data *execute_data) {
     }
     
     // Check if this is a PDO method call and capture SQL BEFORE execution
-    int pdo_method = is_pdo_method(execute_data);
+    // Try both is_pdo_method and direct class name check
+    int pdo_method = 0;
+    int is_pdo_class = 0;
+    int is_pdo_method_name = 0;
+    
+    // Check if it's a PDO class method
+    if (class_name && (strcmp(class_name, "PDO") == 0 || strcmp(class_name, "PDOStatement") == 0)) {
+        is_pdo_class = 1;
+    }
+    if (function_name && (strcmp(function_name, "prepare") == 0 || strcmp(function_name, "query") == 0 || 
+                         strcmp(function_name, "exec") == 0 || strcmp(function_name, "execute") == 0)) {
+        is_pdo_method_name = 1;
+    }
+    
+    // Primary check: use is_pdo_method
+    if (execute_data && execute_data->func) {
+        pdo_method = is_pdo_method(execute_data);
+    }
+    
+    // Fallback: check directly by class name and function name
+    if (!pdo_method && is_pdo_class && is_pdo_method_name) {
+        pdo_method = 1;
+        php_printf("[OPA execute_ex] PDO method detected: %s::%s\n", class_name, function_name);
+        debug_log("[execute_ex] PDO method detected via direct class name check: %s::%s", class_name, function_name);
+        
+        // Note: Lazy hook registration removed - variables not accessible in this scope
+        // The hooks should be registered in RINIT
+    }
+    
+    // Additional check: check func->common.scope directly
+    if (!pdo_method && execute_data && execute_data->func && execute_data->func->common.scope) {
+        const char *scope_name = ZSTR_VAL(execute_data->func->common.scope->name);
+        const char *func_name = execute_data->func->common.function_name ? ZSTR_VAL(execute_data->func->common.function_name) : NULL;
+        if (scope_name && func_name && 
+            (strcmp(scope_name, "PDO") == 0 || strcmp(scope_name, "PDOStatement") == 0) &&
+            (strcmp(func_name, "prepare") == 0 || strcmp(func_name, "query") == 0 || 
+             strcmp(func_name, "exec") == 0 || strcmp(func_name, "execute") == 0)) {
+            pdo_method = 1;
+            php_printf("[OPA execute_ex] PDO method detected via func->common.scope: %s::%s\n", scope_name, func_name);
+            debug_log("[execute_ex] PDO method detected via func->common.scope: %s::%s", scope_name, func_name);
+        }
+    }
+    
     char *sql = NULL;
     double query_start_time = 0.0;
     
     if (pdo_method && execute_data) {
         query_start_time = get_time_seconds();
+        debug_log("[execute_ex] PDO method detected BEFORE execution: function_name=%s, class_name=%s", 
+            function_name ? function_name : "NULL", class_name ? class_name : "NULL");
         
         // Get method name
         const char *method_name = function_name;
@@ -1337,15 +1423,22 @@ void opa_execute_ex(zend_execute_data *execute_data) {
                 strcmp(method_name, "query") == 0 || 
                 strcmp(method_name, "exec") == 0) {
                 // SQL is in first argument
-                if (ZEND_CALL_NUM_ARGS(execute_data) > 0) {
+                uint32_t num_args = ZEND_CALL_NUM_ARGS(execute_data);
+                debug_log("[execute_ex] PDO method %s called with %u arguments", method_name, num_args);
+                if (num_args > 0) {
                     zval *arg = ZEND_CALL_ARG(execute_data, 1);
                     if (arg && Z_TYPE_P(arg) == IS_STRING) {
                         sql = estrdup(Z_STRVAL_P(arg));
-                        debug_log("[execute_ex] Captured SQL from %s: %s", method_name, sql);
+                        debug_log("[execute_ex] Captured SQL from %s::%s: %s", pdo_class_name ? pdo_class_name : "PDO", method_name, sql);
+                    } else {
+                        debug_log("[execute_ex] WARNING: First argument is not a string (type=%d)", arg ? Z_TYPE_P(arg) : -1);
                     }
+                } else {
+                    debug_log("[execute_ex] WARNING: PDO method %s called with no arguments", method_name);
                 }
             } else if (strcmp(method_name, "execute") == 0 && pdo_class_name && strcmp(pdo_class_name, "PDOStatement") == 0) {
                 // For execute(), get SQL from PDOStatement's queryString property
+                debug_log("[execute_ex] PDOStatement::execute detected, trying to get queryString");
                 if (Z_TYPE(execute_data->This) == IS_OBJECT) {
                     zend_class_entry *ce = Z_OBJCE(execute_data->This);
                     zval query_string;
@@ -1354,12 +1447,19 @@ void opa_execute_ex(zend_execute_data *execute_data) {
                     if (query_string_prop && Z_TYPE_P(query_string_prop) == IS_STRING) {
                         sql = estrdup(Z_STRVAL_P(query_string_prop));
                         debug_log("[execute_ex] Captured SQL from PDOStatement::execute: %s", sql);
+                    } else {
+                        debug_log("[execute_ex] WARNING: queryString property not found or not a string (type=%d)", 
+                            query_string_prop ? Z_TYPE_P(query_string_prop) : -1);
                     }
                     if (Z_TYPE(query_string) != IS_UNDEF) {
                         zval_dtor(&query_string);
                     }
+                } else {
+                    debug_log("[execute_ex] WARNING: execute_data->This is not an object (type=%d)", Z_TYPE(execute_data->This));
                 }
             }
+        } else {
+            debug_log("[execute_ex] WARNING: PDO method detected but method_name is NULL");
         }
     }
     
@@ -1442,26 +1542,91 @@ void opa_execute_ex(zend_execute_data *execute_data) {
     original_zend_execute_ex(execute_data);
     
     // Capture SQL query AFTER execution if it's a PDO method
-    if (pdo_method && sql && call_id) {
+    if (pdo_method && sql) {
         double query_end_time = get_time_seconds();
         double query_duration = query_end_time - query_start_time;
-        const char *query_type = function_name;
+        const char *query_type = function_name ? function_name : "PDO";
         int rows_affected = -1;
         
-        // Try to get rows_affected from return value if available
-        // Note: In zend_execute_ex, we don't have direct access to return_value
-        // This is a limitation - we'll record 0 for now
+        php_printf("[OPA execute_ex] PDO method detected: pdo_method=%d, sql=%s, call_id=%s, function_name=%s, class_name=%s\n", 
+            pdo_method, sql ? sql : "NULL", call_id ? call_id : "NULL", 
+            function_name ? function_name : "NULL", class_name ? class_name : "NULL");
+        debug_log("[execute_ex] PDO method detected: pdo_method=%d, sql=%s, call_id=%s, function_name=%s, class_name=%s", 
+            pdo_method, sql ? sql : "NULL", call_id ? call_id : "NULL", 
+            function_name ? function_name : "NULL", class_name ? class_name : "NULL");
         
-        // Record SQL query using the current call from collector
-        // Note: In execute_ex context, we don't have easy access to the connection object
-        // to extract hostname, db_system, or db_dsn, so we pass NULL. The dedicated hooks (mysqli_query, PDO::query, 
-        // PDOStatement::execute) will capture the hostname, db_system, and db_dsn properly.
-        record_sql_query(sql, query_duration, NULL, query_type, rows_affected, NULL, NULL, NULL);
-        debug_log("[execute_ex] Recorded SQL query: %s, duration=%.6f", sql, query_duration);
+        // ALWAYS record SQL query - use global collector's global_sql_queries array
+        // This ensures SQL is captured even without call stack
+        if (global_collector && global_collector->magic == OPA_COLLECTOR_MAGIC && global_collector->active) {
+            pthread_mutex_lock(&global_collector->global_sql_mutex);
+            if (!global_collector->global_sql_queries) {
+                global_collector->global_sql_queries = ecalloc(1, sizeof(zval));
+                if (global_collector->global_sql_queries) {
+                    array_init(global_collector->global_sql_queries);
+                    php_printf("[OPA execute_ex] Initialized global_sql_queries array\n");
+                }
+            }
+            if (global_collector->global_sql_queries) {
+                zval query_data;
+                array_init(&query_data);
+                
+                add_assoc_string(&query_data, "query", sql);
+                add_assoc_double(&query_data, "duration", query_duration);
+                add_assoc_double(&query_data, "duration_ms", query_duration * 1000.0);
+                add_assoc_double(&query_data, "timestamp", query_start_time);
+                add_assoc_string(&query_data, "type", (char *)query_type);
+                add_assoc_long(&query_data, "rows_affected", rows_affected);
+                
+                // Determine query type
+                const char *upper_sql = sql;
+                while (*upper_sql && (*upper_sql == ' ' || *upper_sql == '\t' || *upper_sql == '\n')) {
+                    upper_sql++;
+                }
+                if (strncasecmp(upper_sql, "SELECT", 6) == 0) {
+                    add_assoc_string(&query_data, "query_type", "SELECT");
+                } else if (strncasecmp(upper_sql, "INSERT", 6) == 0) {
+                    add_assoc_string(&query_data, "query_type", "INSERT");
+                } else if (strncasecmp(upper_sql, "UPDATE", 6) == 0) {
+                    add_assoc_string(&query_data, "query_type", "UPDATE");
+                } else if (strncasecmp(upper_sql, "DELETE", 6) == 0) {
+                    add_assoc_string(&query_data, "query_type", "DELETE");
+                }
+                
+                add_assoc_string(&query_data, "db_system", "mysql");
+                
+                add_next_index_zval(global_collector->global_sql_queries, &query_data);
+                php_printf("[OPA execute_ex] SQL query added to global array: %s, duration=%.6f, array_size=%d\n", 
+                    sql, query_duration, zend_hash_num_elements(Z_ARRVAL_P(global_collector->global_sql_queries)));
+                debug_log("[execute_ex] SQL query added directly to global array: %s, duration=%.6f", sql, query_duration);
+            } else {
+                php_printf("[OPA execute_ex] ERROR: Failed to initialize global_sql_queries array\n");
+            }
+            pthread_mutex_unlock(&global_collector->global_sql_mutex);
+        } else {
+            php_printf("[OPA execute_ex] ERROR: Cannot record SQL - collector=%p, active=%d, magic=0x%08X\n", 
+                global_collector, global_collector ? global_collector->active : 0, 
+                global_collector ? global_collector->magic : 0);
+        }
+        
+        // Also try to record via record_sql_query (for call node tracking)
+        if (call_id) {
+            record_sql_query(sql, query_duration, NULL, query_type, rows_affected, NULL, "mysql", NULL);
+            debug_log("[execute_ex] Also recorded SQL query via record_sql_query: %s, duration=%.6f, call_id=%s", sql, query_duration, call_id);
+        } else {
+            // Create a root call node if we don't have one
+            char *root_call_id = opa_enter_function("__root__", NULL, __FILE__, __LINE__, 0);
+            if (root_call_id) {
+                efree(root_call_id);
+                record_sql_query(sql, query_duration, NULL, query_type, rows_affected, NULL, "mysql", NULL);
+                debug_log("[execute_ex] Recorded SQL query after creating root call: %s, duration=%.6f", sql, query_duration);
+            }
+        }
         efree(sql);
-    } else if (pdo_method && sql) {
-        // Free SQL if we captured it but don't have a call_id
-        efree(sql);
+    } else if (pdo_method) {
+        php_printf("[OPA execute_ex] PDO method detected but no SQL captured: pdo_method=%d, sql=%p, function_name=%s\n", 
+            pdo_method, sql, function_name ? function_name : "NULL");
+        debug_log("[execute_ex] PDO method detected but no SQL captured: pdo_method=%d, sql=%p, function_name=%s", 
+            pdo_method, sql, function_name ? function_name : "NULL");
     }
     
     // Re-check curl function after execution using argument-based detection
@@ -1784,10 +1949,17 @@ static zend_function *orig_mysqli_query_func = NULL;
 static zif_handler orig_mysqli_query_handler = NULL;
 static zend_function *orig_pdo_query_func = NULL;
 static zif_handler orig_pdo_query_handler = NULL;
+static zend_function *orig_pdo_exec_func = NULL;
+static zif_handler orig_pdo_exec_handler = NULL;
+static zend_function *orig_pdo_prepare_func = NULL;
+static zif_handler orig_pdo_prepare_handler = NULL;
 static zend_function *orig_pdo_stmt_execute_func = NULL;
 static zif_handler orig_pdo_stmt_execute_handler = NULL;
 static zend_function *orig_curl_exec_func = NULL;
 static zif_handler orig_curl_exec_handler = NULL;
+
+// Track if hooks have been registered (to avoid repeated registration)
+static int pdo_hooks_registered = 0;
 
 /* cURL Profiling Hook */
 
@@ -2196,20 +2368,42 @@ PHP_FUNCTION(opaphp_mysqli_query) {
     }
 }
 
-// PDO::query hook
-PHP_METHOD(PDO, query) {
-    zend_string *sql;
-    double start = get_microtime();
+// PDO::query/exec/prepare hook handler (standalone function, not a method)
+// This function replaces the PDO method handlers
+static void zif_opa_pdo_query(zend_execute_data *execute_data, zval *return_value) {
+    php_printf("[OPA zif_opa_pdo_query] HOOK CALLED!\n");
+    debug_log("[PDO method] Hook called");
     
-    // Parse parameters (query takes at least 1 parameter: SQL string)
-    // Additional parameters are optional and handled by original function
+    zend_string *sql = NULL;
+    double start = get_microtime();
+    const char *method_name = "query"; // Default, will be determined from function
+    
+    // Determine which method was called by checking the function
+    if (execute_data && execute_data->func && execute_data->func->common.function_name) {
+        method_name = ZSTR_VAL(execute_data->func->common.function_name);
+        php_printf("[OPA zif_opa_pdo_query] Method: %s\n", method_name);
+    }
+    
+    // Parse parameters (query/exec/prepare take at least 1 parameter: SQL string)
     ZEND_PARSE_PARAMETERS_START(1, -1)
         Z_PARAM_STR(sql)
     ZEND_PARSE_PARAMETERS_END();
     
-    // Call original PDO::query
-    if (orig_pdo_query_handler) {
-        orig_pdo_query_handler(execute_data, return_value);
+    php_printf("[OPA zif_opa_pdo_query] SQL captured: %s\n", sql ? ZSTR_VAL(sql) : "NULL");
+    debug_log("[PDO method] SQL: %s", sql ? ZSTR_VAL(sql) : "NULL");
+    
+    // Call original handler based on which method was called
+    zif_handler orig_handler = NULL;
+    if (strcmp(method_name, "query") == 0 && orig_pdo_query_handler) {
+        orig_handler = orig_pdo_query_handler;
+    } else if (strcmp(method_name, "exec") == 0 && orig_pdo_exec_handler) {
+        orig_handler = orig_pdo_exec_handler;
+    } else if (strcmp(method_name, "prepare") == 0 && orig_pdo_prepare_handler) {
+        orig_handler = orig_pdo_prepare_handler;
+    }
+    
+    if (orig_handler) {
+        orig_handler(execute_data, return_value);
     } else if (orig_pdo_query_func && orig_pdo_query_func->internal_function.handler) {
         orig_pdo_query_func->internal_function.handler(execute_data, return_value);
     }
@@ -2222,50 +2416,40 @@ PHP_METHOD(PDO, query) {
         zend_class_entry *ce = Z_OBJCE_P(return_value);
         const char *class_name = ZSTR_VAL(ce->name);
         
-        // For PDOStatement, get rowCount() (works for INSERT/UPDATE/DELETE)
-        // For SELECT queries, rowCount() returns 0, so we try to fetch and count
-        zval row_count_zv;
-        zval method_name;
-        zval return_zv;
-        ZVAL_OBJ(&return_zv, Z_OBJ_P(return_value));
-        ZVAL_STRING(&method_name, "rowCount");
-        if (call_user_function(EG(function_table), &return_zv, &method_name, &row_count_zv, 0, NULL) == SUCCESS) {
-            if (Z_TYPE(row_count_zv) == IS_LONG) {
-                row_count = Z_LVAL(row_count_zv);
-                
-                // If rowCount is 0, it might be a SELECT query
-                // Try to fetch all rows and count them
-                if (row_count == 0 && sql && (strncasecmp(ZSTR_VAL(sql), "SELECT", 6) == 0)) {
-                    zval fetch_all_zv;
-                    zval fetch_all_method;
-                    ZVAL_STRING(&fetch_all_method, "fetchAll");
-                    if (call_user_function(EG(function_table), &return_zv, &fetch_all_method, &fetch_all_zv, 0, NULL) == SUCCESS) {
-                        if (Z_TYPE(fetch_all_zv) == IS_ARRAY) {
-                            row_count = zend_hash_num_elements(Z_ARRVAL(fetch_all_zv));
-                        }
-                        zval_ptr_dtor(&fetch_all_zv);
-                    }
-                    zval_ptr_dtor(&fetch_all_method);
+        // For PDOStatement (from query/prepare), get rowCount()
+        if (strcmp(class_name, "PDOStatement") == 0) {
+            zval row_count_zv;
+            zval method_name_zv;
+            zval return_zv;
+            ZVAL_OBJ(&return_zv, Z_OBJ_P(return_value));
+            ZVAL_STRING(&method_name_zv, "rowCount");
+            if (call_user_function(EG(function_table), &return_zv, &method_name_zv, &row_count_zv, 0, NULL) == SUCCESS) {
+                if (Z_TYPE(row_count_zv) == IS_LONG) {
+                    row_count = Z_LVAL(row_count_zv);
                 }
+                zval_ptr_dtor(&row_count_zv);
             }
-            zval_ptr_dtor(&row_count_zv);
+            zval_ptr_dtor(&method_name_zv);
+        } else if (strcmp(method_name, "exec") == 0) {
+            // For exec(), return_value is the number of affected rows
+            if (Z_TYPE_P(return_value) == IS_LONG) {
+                row_count = Z_LVAL_P(return_value);
+            }
         }
-        zval_ptr_dtor(&method_name);
     }
     
     // Log SQL query
     if (sql) {
-        if (OPA_G(debug_log_enabled)) {
-            php_printf("[OPA SQL Profiling] PDO Query: %s | Time: %.3fms | Rows: %ld\n", 
-                   ZSTR_VAL(sql), elapsed, row_count);
-        }
+        php_printf("[OPA zif_opa_pdo_query] PDO %s: %s | Time: %.3fms | Rows: %ld\n", 
+               method_name, ZSTR_VAL(sql), elapsed, row_count);
+        debug_log("[PDO %s] SQL: %s, elapsed=%.3fms, rows=%ld", method_name, ZSTR_VAL(sql), elapsed, row_count);
         
         // Extract database hostname, system, and DSN from PDO connection
         char *db_host = NULL;
         char *db_system = NULL;
         char *db_dsn = NULL;
         if (getThis() && Z_TYPE_P(getThis()) == IS_OBJECT) {
-            // PDO::query is called on PDO object, so getThis() is the PDO connection itself
+            // PDO method is called on PDO object, so getThis() is the PDO connection itself
             zval *dsn_prop = zend_read_property(Z_OBJCE_P(getThis()), Z_OBJ_P(getThis()), "dsn", sizeof("dsn") - 1, 1, NULL);
             if (dsn_prop && Z_TYPE_P(dsn_prop) == IS_STRING) {
                 // Parse DSN: "mysql:host=localhost;dbname=test" or "postgresql:host=localhost;dbname=test"
@@ -2319,7 +2503,26 @@ PHP_METHOD(PDO, query) {
         
         // Send SQL query data to agent via record_sql_query
         double duration_seconds = elapsed / 1000.0;
-        record_sql_query(ZSTR_VAL(sql), duration_seconds, NULL, "PDO::query", row_count, db_host, db_system, db_dsn);
+        char query_type_str[64];
+        snprintf(query_type_str, sizeof(query_type_str), "PDO::%s", method_name);
+        
+        php_printf("[OPA zif_opa_pdo_query] Recording SQL: %s, duration=%.3fs, rows=%ld, type=%s\n", 
+            ZSTR_VAL(sql), duration_seconds, row_count, query_type_str);
+        debug_log("[PDO %s] Recording SQL query: %s, duration=%.3fs, rows=%ld", 
+            method_name, ZSTR_VAL(sql), duration_seconds, row_count);
+        
+        // Ensure collector is initialized before recording
+        if (!global_collector) {
+            global_collector = opa_collector_init();
+            if (global_collector) {
+                opa_collector_start(global_collector);
+                php_printf("[OPA zif_opa_pdo_query] Collector initialized on-the-fly\n");
+            }
+        }
+        
+        record_sql_query(ZSTR_VAL(sql), duration_seconds, NULL, query_type_str, row_count, db_host, db_system, db_dsn);
+        php_printf("[OPA zif_opa_pdo_query] SQL query recorded via record_sql_query\n");
+        debug_log("[PDO %s] SQL query recorded", method_name);
         
         // Free the allocated strings
         if (db_host) {
@@ -2334,8 +2537,9 @@ PHP_METHOD(PDO, query) {
     }
 }
 
-// PDOStatement::execute hook
-PHP_METHOD(PDOStatement, execute) {
+// PDOStatement::execute hook handler (standalone function, not a method)
+// This function replaces the PDOStatement::execute method handler
+static void zif_opa_pdo_stmt_execute(zend_execute_data *execute_data, zval *return_value) {
     double start = get_microtime();
     
     // Parse parameters (execute can take 0 or more parameters)
@@ -2459,7 +2663,9 @@ PHP_METHOD(PDOStatement, execute) {
         
         // Send SQL query data to agent via record_sql_query
         double duration_seconds = elapsed / 1000.0;
+        debug_log("[PDOStatement::execute] Recording SQL query: %s, duration=%.3fs, rows=%ld", sql ? sql : "NULL", duration_seconds, row_count);
         record_sql_query(sql, duration_seconds, NULL, "PDOStatement::execute", row_count, db_host, db_system, db_dsn);
+        debug_log("[PDOStatement::execute] SQL query recorded");
         
         // Free the allocated strings
         if (db_host) {
@@ -2475,6 +2681,145 @@ PHP_METHOD(PDOStatement, execute) {
 }
 
 // Module initialization - registers INI settings and hooks zend_execute_ex for function call interception
+// Zend Observer callbacks for PDO methods
+static void opa_observer_pdo_fcall_begin(zend_execute_data *execute_data, zval *return_value) {
+    // Called before PDO method execution
+    if (!execute_data || !execute_data->func) {
+        return;
+    }
+    
+    zend_function *func = execute_data->func;
+    const char *class_name = NULL;
+    const char *method_name = NULL;
+    
+    if (func->common.scope && func->common.scope->name) {
+        class_name = ZSTR_VAL(func->common.scope->name);
+    }
+    if (func->common.function_name) {
+        method_name = ZSTR_VAL(func->common.function_name);
+    }
+    
+    if (class_name && (strcmp(class_name, "PDO") == 0 || strcmp(class_name, "PDOStatement") == 0)) {
+        if (method_name && (strcmp(method_name, "query") == 0 || strcmp(method_name, "exec") == 0 || 
+                           strcmp(method_name, "prepare") == 0 || strcmp(method_name, "execute") == 0)) {
+            debug_log("[observer] PDO method observed: %s::%s", class_name, method_name);
+        }
+    }
+}
+
+static void opa_observer_pdo_fcall_end(zend_execute_data *execute_data, zval *return_value) {
+    // Called after PDO method execution
+    if (!execute_data || !execute_data->func) {
+        return;
+    }
+    
+    zend_function *func = execute_data->func;
+    const char *class_name = NULL;
+    const char *method_name = NULL;
+    char *sql = NULL;
+    double start_time = 0.0;
+    
+    if (func->common.scope && func->common.scope->name) {
+        class_name = ZSTR_VAL(func->common.scope->name);
+    }
+    if (func->common.function_name) {
+        method_name = ZSTR_VAL(func->common.function_name);
+    }
+    
+    if (class_name && (strcmp(class_name, "PDO") == 0 || strcmp(class_name, "PDOStatement") == 0)) {
+        if (method_name && (strcmp(method_name, "query") == 0 || strcmp(method_name, "exec") == 0 || 
+                           strcmp(method_name, "prepare") == 0 || strcmp(method_name, "execute") == 0)) {
+            debug_log("[observer] PDO method ended: %s::%s", class_name, method_name);
+            
+            // Extract SQL
+            if (strcmp(method_name, "query") == 0 || strcmp(method_name, "exec") == 0 || strcmp(method_name, "prepare") == 0) {
+                if (ZEND_CALL_NUM_ARGS(execute_data) > 0) {
+                    zval *arg = ZEND_CALL_ARG(execute_data, 1);
+                    if (arg && Z_TYPE_P(arg) == IS_STRING) {
+                        sql = estrdup(Z_STRVAL_P(arg));
+                    }
+                }
+            } else if (strcmp(method_name, "execute") == 0 && strcmp(class_name, "PDOStatement") == 0) {
+                if (Z_TYPE(execute_data->This) == IS_OBJECT) {
+                    zval *query_string_prop = zend_read_property(Z_OBJCE(execute_data->This), Z_OBJ(execute_data->This), "queryString", sizeof("queryString") - 1, 1, NULL);
+                    if (query_string_prop && Z_TYPE_P(query_string_prop) == IS_STRING) {
+                        sql = estrdup(Z_STRVAL_P(query_string_prop));
+                    }
+                }
+            }
+            
+            if (sql) {
+                double duration = 0.001; // Approximate duration
+                int rows_affected = -1;
+                
+                // Try to get row count from return value
+                if (return_value && Z_TYPE_P(return_value) == IS_OBJECT) {
+                    zend_class_entry *ce = Z_OBJCE_P(return_value);
+                    if (ce && ce->name && strcmp(ZSTR_VAL(ce->name), "PDOStatement") == 0) {
+                        zval row_count_zv;
+                        zval method_name_zv;
+                        zval this_zv;
+                        ZVAL_OBJ(&this_zv, Z_OBJ_P(return_value));
+                        ZVAL_STRING(&method_name_zv, "rowCount");
+                        if (call_user_function(EG(function_table), &this_zv, &method_name_zv, &row_count_zv, 0, NULL) == SUCCESS) {
+                            if (Z_TYPE(row_count_zv) == IS_LONG) {
+                                rows_affected = Z_LVAL(row_count_zv);
+                            }
+                            zval_ptr_dtor(&row_count_zv);
+                        }
+                        zval_ptr_dtor(&method_name_zv);
+                    }
+                }
+                
+                // Record SQL query
+                if (global_collector && global_collector->magic == OPA_COLLECTOR_MAGIC && global_collector->active) {
+                    pthread_mutex_lock(&global_collector->global_sql_mutex);
+                    if (!global_collector->global_sql_queries) {
+                        global_collector->global_sql_queries = ecalloc(1, sizeof(zval));
+                        if (global_collector->global_sql_queries) {
+                            array_init(global_collector->global_sql_queries);
+                        }
+                    }
+                    if (global_collector->global_sql_queries) {
+                        zval query_data;
+                        array_init(&query_data);
+                        
+                        add_assoc_string(&query_data, "query", sql);
+                        add_assoc_double(&query_data, "duration", duration);
+                        add_assoc_double(&query_data, "duration_ms", duration * 1000.0);
+                        add_assoc_double(&query_data, "timestamp", get_time_seconds() - duration);
+                        add_assoc_string(&query_data, "type", (char *)method_name);
+                        add_assoc_long(&query_data, "rows_affected", rows_affected);
+                        
+                        // Determine query type
+                        const char *upper_sql = sql;
+                        while (*upper_sql && (*upper_sql == ' ' || *upper_sql == '\t' || *upper_sql == '\n')) {
+                            upper_sql++;
+                        }
+                        if (strncasecmp(upper_sql, "SELECT", 6) == 0) {
+                            add_assoc_string(&query_data, "query_type", "SELECT");
+                        } else if (strncasecmp(upper_sql, "INSERT", 6) == 0) {
+                            add_assoc_string(&query_data, "query_type", "INSERT");
+                        } else if (strncasecmp(upper_sql, "UPDATE", 6) == 0) {
+                            add_assoc_string(&query_data, "query_type", "UPDATE");
+                        } else if (strncasecmp(upper_sql, "DELETE", 6) == 0) {
+                            add_assoc_string(&query_data, "query_type", "DELETE");
+                        }
+                        
+                        add_assoc_string(&query_data, "db_system", "mysql");
+                        
+                        add_next_index_zval(global_collector->global_sql_queries, &query_data);
+                        debug_log("[observer] SQL query recorded via observer: %s", sql);
+                    }
+                    pthread_mutex_unlock(&global_collector->global_sql_mutex);
+                }
+                
+                efree(sql);
+            }
+        }
+    }
+}
+
 PHP_MINIT_FUNCTION(opa) {
     REGISTER_INI_ENTRIES();
     
@@ -2504,6 +2849,9 @@ PHP_MINIT_FUNCTION(opa) {
             zend_execute_ex = opa_execute_ex;
     }
     
+    // Register Zend Observer for PDO methods (try to find PDO class)
+    // This will be done lazily in RINIT when classes are available
+    
     // Register SQL profiling hooks (lazy registration - try in RINIT as well)
     // MySQLi hook
     orig_mysqli_query_func = zend_hash_str_find_ptr(CG(function_table), "mysqli_query", sizeof("mysqli_query")-1);
@@ -2518,29 +2866,55 @@ PHP_MINIT_FUNCTION(opa) {
     }
     
     // PDO::query hook
-    zend_class_entry *pdo_ce = zend_hash_str_find_ptr(CG(class_table), "PDO", sizeof("PDO")-1);
+    // Try EG(class_table) first (available at RINIT), fallback to CG(class_table)
+    zend_class_entry *pdo_ce = NULL;
+    if (EG(class_table)) {
+        pdo_ce = zend_hash_str_find_ptr(EG(class_table), "PDO", sizeof("PDO")-1);
+    }
+    if (!pdo_ce && CG(class_table)) {
+        pdo_ce = zend_hash_str_find_ptr(CG(class_table), "PDO", sizeof("PDO")-1);
+    }
     if (pdo_ce) {
         orig_pdo_query_func = zend_hash_str_find_ptr(&pdo_ce->function_table, "query", sizeof("query")-1);
         if (orig_pdo_query_func && orig_pdo_query_func->type == ZEND_INTERNAL_FUNCTION) {
             orig_pdo_query_handler = orig_pdo_query_func->internal_function.handler;
-            orig_pdo_query_func->internal_function.handler = zim_PDO_query;
+            orig_pdo_query_func->internal_function.handler = zif_opa_pdo_query;
+            php_printf("[OPA] PDO::query hook registered successfully (original handler=%p, new handler=%p)\n", 
+                (void*)orig_pdo_query_handler, (void*)zif_opa_pdo_query);
             if (OPA_G(debug_log_enabled)) {
-                php_printf("[OPA] PDO::query hook registered\n");
+                php_printf("[OPA] PDO::query hook registered (debug enabled)\n");
             }
+        } else {
+            php_printf("[OPA] WARNING: PDO::query function not found or not internal (func=%p, type=%d)\n", 
+                (void*)orig_pdo_query_func, orig_pdo_query_func ? orig_pdo_query_func->type : -1);
         }
+    } else {
+        php_printf("[OPA] WARNING: PDO class not found in class_table at MINIT\n");
     }
     
     // PDOStatement::execute hook
-    zend_class_entry *pdo_stmt_ce = zend_hash_str_find_ptr(CG(class_table), "PDOStatement", sizeof("PDOStatement")-1);
+    // Try EG(class_table) first (available at RINIT), fallback to CG(class_table)
+    zend_class_entry *pdo_stmt_ce = NULL;
+    if (EG(class_table)) {
+        pdo_stmt_ce = zend_hash_str_find_ptr(EG(class_table), "PDOStatement", sizeof("PDOStatement")-1);
+    }
+    if (!pdo_stmt_ce && CG(class_table)) {
+        pdo_stmt_ce = zend_hash_str_find_ptr(CG(class_table), "PDOStatement", sizeof("PDOStatement")-1);
+    }
     if (pdo_stmt_ce) {
         orig_pdo_stmt_execute_func = zend_hash_str_find_ptr(&pdo_stmt_ce->function_table, "execute", sizeof("execute")-1);
         if (orig_pdo_stmt_execute_func && orig_pdo_stmt_execute_func->type == ZEND_INTERNAL_FUNCTION) {
             orig_pdo_stmt_execute_handler = orig_pdo_stmt_execute_func->internal_function.handler;
-            orig_pdo_stmt_execute_func->internal_function.handler = zim_PDOStatement_execute;
+            orig_pdo_stmt_execute_func->internal_function.handler = zif_opa_pdo_stmt_execute;
+            php_printf("[OPA] PDOStatement::execute hook registered successfully\n");
             if (OPA_G(debug_log_enabled)) {
-                php_printf("[OPA] PDOStatement::execute hook registered\n");
+                php_printf("[OPA] PDOStatement::execute hook registered (debug enabled)\n");
             }
+        } else {
+            php_printf("[OPA] WARNING: PDOStatement::execute function not found or not internal\n");
         }
+    } else {
+        php_printf("[OPA] WARNING: PDOStatement class not found in class_table at MINIT\n");
     }
     
     // PHP 8.4: Get CurlHandle class entry pointers for reliable detection
@@ -2655,8 +3029,10 @@ PHP_MSHUTDOWN_FUNCTION(opa) {
 }
 
 PHP_RINIT_FUNCTION(opa) {
-    // RINIT: Only reset per-request state, do NOT install hooks or access globals
-    // Following best practices: RINIT should only reset counters and lightweight state
+    php_printf("[OPA RINIT] RINIT called!\n");
+    
+    // RINIT: Reset per-request state AND register hooks (PDO classes available by RINIT time)
+    // Following user guidance: Move PDO hook registration to RINIT where classes are available
     
     // Try to register SQL hooks lazily if they weren't found at MINIT
     if (!orig_mysqli_query_func) {
@@ -2667,25 +3043,136 @@ PHP_RINIT_FUNCTION(opa) {
         }
     }
     
-    if (!orig_pdo_query_func) {
-        zend_class_entry *pdo_ce = zend_hash_str_find_ptr(CG(class_table), "PDO", sizeof("PDO")-1);
-        if (pdo_ce) {
-            orig_pdo_query_func = zend_hash_str_find_ptr(&pdo_ce->function_table, "query", sizeof("query")-1);
-            if (orig_pdo_query_func && orig_pdo_query_func->type == ZEND_INTERNAL_FUNCTION) {
-                orig_pdo_query_handler = orig_pdo_query_func->internal_function.handler;
-                orig_pdo_query_func->internal_function.handler = zim_PDO_query;
+    // Register PDO hooks in RINIT (after all extensions have loaded their classes)
+    // Only register once per process (track with static flag)
+    if (!pdo_hooks_registered) {
+        // Try to find PDO class - use CG(class_table) as it's populated by RINIT time
+        zend_class_entry *pdo_ce = NULL;
+        
+        // Primary: Try CG(class_table) - should be populated by RINIT
+        if (CG(class_table)) {
+            pdo_ce = zend_hash_str_find_ptr(CG(class_table), "PDO", sizeof("PDO")-1);
+            if (pdo_ce) {
+                php_printf("[OPA RINIT] Found PDO class in CG(class_table)\n");
             }
+        }
+        
+        // Fallback: Try EG(class_table)
+        if (!pdo_ce && EG(class_table)) {
+            pdo_ce = zend_hash_str_find_ptr(EG(class_table), "PDO", sizeof("PDO")-1);
+            if (pdo_ce) {
+                php_printf("[OPA RINIT] Found PDO class in EG(class_table)\n");
+            }
+        }
+        
+        // Last resort: Try zend_lookup_class
+        if (!pdo_ce) {
+            zend_string *pdo_name = zend_string_init("PDO", sizeof("PDO")-1, 0);
+            pdo_ce = zend_lookup_class(pdo_name);
+            zend_string_release(pdo_name);
+            if (pdo_ce) {
+                php_printf("[OPA RINIT] Found PDO class via zend_lookup_class\n");
+            }
+        }
+        
+        if (pdo_ce) {
+            php_printf("[OPA RINIT] PDO class found! Registering hooks...\n");
+            
+            // Hook PDO::query
+            if (!orig_pdo_query_func) {
+                zend_function *query_func = zend_hash_str_find_ptr(&pdo_ce->function_table, "query", sizeof("query")-1);
+                if (query_func && query_func->type == ZEND_INTERNAL_FUNCTION) {
+                    orig_pdo_query_func = query_func;
+                    orig_pdo_query_handler = query_func->internal_function.handler;
+                    query_func->internal_function.handler = zif_opa_pdo_query;
+                    php_printf("[OPA RINIT] ✓ PDO::query hook registered (original=%p, new=%p)\n", 
+                        (void*)orig_pdo_query_handler, (void*)zif_opa_pdo_query);
+                } else {
+                    php_printf("[OPA RINIT] ✗ PDO::query not found or not internal (func=%p, type=%d)\n", 
+                        (void*)query_func, query_func ? query_func->type : -1);
+                }
+            }
+            
+            // Hook PDO::exec
+            if (!orig_pdo_exec_func) {
+                zend_function *exec_func = zend_hash_str_find_ptr(&pdo_ce->function_table, "exec", sizeof("exec")-1);
+                if (exec_func && exec_func->type == ZEND_INTERNAL_FUNCTION) {
+                    orig_pdo_exec_func = exec_func;
+                    orig_pdo_exec_handler = exec_func->internal_function.handler;
+                    exec_func->internal_function.handler = zif_opa_pdo_query; // Use same handler
+                    php_printf("[OPA RINIT] ✓ PDO::exec hook registered\n");
+                }
+            }
+            
+            // Hook PDO::prepare
+            if (!orig_pdo_prepare_func) {
+                zend_function *prepare_func = zend_hash_str_find_ptr(&pdo_ce->function_table, "prepare", sizeof("prepare")-1);
+                if (prepare_func && prepare_func->type == ZEND_INTERNAL_FUNCTION) {
+                    orig_pdo_prepare_func = prepare_func;
+                    orig_pdo_prepare_handler = prepare_func->internal_function.handler;
+                    prepare_func->internal_function.handler = zif_opa_pdo_query; // Use same handler
+                    php_printf("[OPA RINIT] ✓ PDO::prepare hook registered\n");
+                }
+            }
+            
+            // Mark as registered to avoid repeated attempts
+            pdo_hooks_registered = 1;
+        } else {
+            php_printf("[OPA RINIT] ✗ PDO class not found (CG=%p, EG=%p)\n", 
+                (void*)CG(class_table), (void*)EG(class_table));
         }
     }
     
-    if (!orig_pdo_stmt_execute_func) {
-        zend_class_entry *pdo_stmt_ce = zend_hash_str_find_ptr(CG(class_table), "PDOStatement", sizeof("PDOStatement")-1);
-        if (pdo_stmt_ce) {
-            orig_pdo_stmt_execute_func = zend_hash_str_find_ptr(&pdo_stmt_ce->function_table, "execute", sizeof("execute")-1);
-            if (orig_pdo_stmt_execute_func && orig_pdo_stmt_execute_func->type == ZEND_INTERNAL_FUNCTION) {
-                orig_pdo_stmt_execute_handler = orig_pdo_stmt_execute_func->internal_function.handler;
-                orig_pdo_stmt_execute_func->internal_function.handler = zim_PDOStatement_execute;
+    // Register PDOStatement hooks in RINIT (after all extensions have loaded their classes)
+    // Only register once per process (track with static flag)
+    if (!pdo_hooks_registered) {
+        // Try to find PDOStatement class - use CG(class_table) as it's populated by RINIT time
+        zend_class_entry *pdo_stmt_ce = NULL;
+        
+        // Primary: Try CG(class_table) - should be populated by RINIT
+        if (CG(class_table)) {
+            pdo_stmt_ce = zend_hash_str_find_ptr(CG(class_table), "PDOStatement", sizeof("PDOStatement")-1);
+            if (pdo_stmt_ce) {
+                php_printf("[OPA RINIT] Found PDOStatement class in CG(class_table)\n");
             }
+        }
+        
+        // Fallback: Try EG(class_table)
+        if (!pdo_stmt_ce && EG(class_table)) {
+            pdo_stmt_ce = zend_hash_str_find_ptr(EG(class_table), "PDOStatement", sizeof("PDOStatement")-1);
+            if (pdo_stmt_ce) {
+                php_printf("[OPA RINIT] Found PDOStatement class in EG(class_table)\n");
+            }
+        }
+        
+        // Last resort: Try zend_lookup_class
+        if (!pdo_stmt_ce) {
+            zend_string *pdo_stmt_name = zend_string_init("PDOStatement", sizeof("PDOStatement")-1, 0);
+            pdo_stmt_ce = zend_lookup_class(pdo_stmt_name);
+            zend_string_release(pdo_stmt_name);
+            if (pdo_stmt_ce) {
+                php_printf("[OPA RINIT] Found PDOStatement class via zend_lookup_class\n");
+            }
+        }
+        
+        if (pdo_stmt_ce) {
+            // Hook PDOStatement::execute
+            if (!orig_pdo_stmt_execute_func) {
+                zend_function *execute_func = zend_hash_str_find_ptr(&pdo_stmt_ce->function_table, "execute", sizeof("execute")-1);
+                if (execute_func && execute_func->type == ZEND_INTERNAL_FUNCTION) {
+                    orig_pdo_stmt_execute_func = execute_func;
+                    orig_pdo_stmt_execute_handler = execute_func->internal_function.handler;
+                    execute_func->internal_function.handler = zif_opa_pdo_stmt_execute;
+                    php_printf("[OPA RINIT] ✓ PDOStatement::execute hook registered (original=%p, new=%p)\n", 
+                        (void*)orig_pdo_stmt_execute_handler, (void*)zif_opa_pdo_stmt_execute);
+                } else {
+                    php_printf("[OPA RINIT] ✗ PDOStatement::execute not found or not internal (func=%p, type=%d)\n", 
+                        (void*)execute_func, execute_func ? execute_func->type : -1);
+                }
+            }
+        } else {
+            php_printf("[OPA RINIT] ✗ PDOStatement class not found (CG=%p, EG=%p)\n", 
+                (void*)CG(class_table), (void*)EG(class_table));
         }
     }
     
@@ -2845,9 +3332,24 @@ PHP_RINIT_FUNCTION(opa) {
     // This is required for capturing SQL, HTTP, cache, and Redis operations
     if (!global_collector) {
         global_collector = opa_collector_init();
+        php_printf("[OPA RSHUTDOWN] Collector initialized\n");
     }
     if (global_collector) {
         opa_collector_start(global_collector);
+        php_printf("[OPA RSHUTDOWN] Collector started\n");
+        
+        // Initialize global SQL queries array
+        pthread_mutex_lock(&global_collector->global_sql_mutex);
+        if (global_collector->global_sql_queries) {
+            zval_ptr_dtor(global_collector->global_sql_queries);
+            efree(global_collector->global_sql_queries);
+        }
+        global_collector->global_sql_queries = ecalloc(1, sizeof(zval));
+        if (global_collector->global_sql_queries) {
+            array_init(global_collector->global_sql_queries);
+            php_printf("[OPA RSHUTDOWN] Initialized global_sql_queries array\n");
+        }
+        pthread_mutex_unlock(&global_collector->global_sql_mutex);
     }
     
     return SUCCESS;

@@ -3,11 +3,19 @@
 // Records a SQL query execution in the current function call's context
 // Tracks query text, duration, type, affected rows, database hostname, database system, and DSN for performance analysis
 void record_sql_query(const char *sql, double duration, zval *params, const char *query_type, int rows_affected, const char *db_host, const char *db_system, const char *db_dsn) {
-    if (!OPA_G(enabled) || !profiling_active) return;
+    debug_log("[record_sql_query] Called: sql=%s, enabled=%d, profiling_active=%d", sql ? sql : "NULL", OPA_G(enabled), profiling_active);
+    
+    if (!OPA_G(enabled) || !profiling_active) {
+        debug_log("[record_sql_query] Early return: enabled=%d, profiling_active=%d", OPA_G(enabled), profiling_active);
+        return;
+    }
     
     extern opa_collector_t *global_collector;
     
     if (!global_collector || !global_collector->active || global_collector->magic != OPA_COLLECTOR_MAGIC) {
+        debug_log("[record_sql_query] Early return: collector=%p, active=%d, magic=0x%08X", 
+            global_collector, global_collector ? global_collector->active : 0, 
+            global_collector ? global_collector->magic : 0);
         return;
     }
     
@@ -105,6 +113,81 @@ void record_sql_query(const char *sql, double duration, zval *params, const char
         // Don't destroy or modify query_data - it's stack-allocated and will be cleaned up automatically
         // The zval contents are now owned by sql_queries array
         // Just let it go out of scope naturally
+        debug_log("[record_sql_query] SQL query added to call node: call_id=%s, sql=%s", 
+            current_call->call_id ? current_call->call_id : "NULL", sql ? sql : "NULL");
+    } else {
+        debug_log("[record_sql_query] WARNING: No current_call or sql_queries array available");
+    }
+    
+    // ALSO add to global SQL queries array (independent of call nodes)
+    // This ensures SQL queries are captured even if there's no call stack
+    if (global_collector && global_collector->magic == OPA_COLLECTOR_MAGIC) {
+        pthread_mutex_lock(&global_collector->global_sql_mutex);
+        if (!global_collector->global_sql_queries) {
+            global_collector->global_sql_queries = ecalloc(1, sizeof(zval));
+            if (global_collector->global_sql_queries) {
+                array_init(global_collector->global_sql_queries);
+            }
+        }
+        if (global_collector->global_sql_queries) {
+            zval query_data_global;
+            array_init(&query_data_global);
+            
+            if (sql) {
+                add_assoc_string(&query_data_global, "query", (char *)sql);
+            }
+            add_assoc_double(&query_data_global, "duration", duration);
+            add_assoc_double(&query_data_global, "duration_ms", duration * 1000.0);
+            add_assoc_double(&query_data_global, "timestamp", get_time_seconds() - duration);
+            
+            if (query_type) {
+                add_assoc_string(&query_data_global, "type", (char *)query_type);
+            }
+            
+            add_assoc_long(&query_data_global, "rows_affected", rows_affected);
+            
+            if (sql && strncasecmp(sql, "SELECT", 6) == 0 && rows_affected >= 0) {
+                add_assoc_long(&query_data_global, "rows_returned", rows_affected);
+            }
+            
+            // Determine query type
+            if (sql) {
+                const char *upper_sql = sql;
+                while (*upper_sql && (*upper_sql == ' ' || *upper_sql == '\t' || *upper_sql == '\n')) {
+                    upper_sql++;
+                }
+                if (strncasecmp(upper_sql, "SELECT", 6) == 0) {
+                    add_assoc_string(&query_data_global, "query_type", "SELECT");
+                } else if (strncasecmp(upper_sql, "INSERT", 6) == 0) {
+                    add_assoc_string(&query_data_global, "query_type", "INSERT");
+                } else if (strncasecmp(upper_sql, "UPDATE", 6) == 0) {
+                    add_assoc_string(&query_data_global, "query_type", "UPDATE");
+                } else if (strncasecmp(upper_sql, "DELETE", 6) == 0) {
+                    add_assoc_string(&query_data_global, "query_type", "DELETE");
+                }
+            }
+            
+            // Add database system
+            if (db_system && strlen(db_system) > 0) {
+                add_assoc_string(&query_data_global, "db_system", (char *)db_system);
+            } else {
+                add_assoc_string(&query_data_global, "db_system", "mysql");
+            }
+            
+            // Add database hostname if available
+            if (db_host && strlen(db_host) > 0) {
+                add_assoc_string(&query_data_global, "db_host", (char *)db_host);
+            }
+            
+            // Add database DSN if available
+            if (db_dsn && strlen(db_dsn) > 0) {
+                add_assoc_string(&query_data_global, "db_dsn", (char *)db_dsn);
+            }
+            
+            add_next_index_zval(global_collector->global_sql_queries, &query_data_global);
+            debug_log("[record_sql_query] SQL query also added to global array: sql=%s", sql ? sql : "NULL");
+        }
+        pthread_mutex_unlock(&global_collector->global_sql_mutex);
     }
 }
 
