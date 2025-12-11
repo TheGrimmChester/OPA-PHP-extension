@@ -688,16 +688,308 @@ char* produce_span_json_from_values(
         json_buffer_append_str(&buf, "[]");
     }
     
-    // Serialize call stack - includes all nested data (SQL, HTTP requests, cache, Redis, etc.)
-    debug_log("[produce_span_json_from_values] About to serialize call stack (includes SQL, HTTP requests, cache, Redis operations)");
-    json_buffer_append_str(&buf, ",\"stack\":");
-    serialize_call_stack_from_root_malloc(&buf);
-    debug_log("[produce_span_json_from_values] Call stack serialization completed - all nested data included");
+    // Serialize call stack - only if expand_spans is false (send child spans separately)
+    // If expand_spans is true, we send child spans as separate messages, so no need for stack field
+    if (!OPA_G(expand_spans)) {
+        debug_log("[produce_span_json_from_values] expand_spans=false, serializing call stack in root span");
+        json_buffer_append_str(&buf, ",\"stack\":");
+        serialize_call_stack_from_root_malloc(&buf);
+        debug_log("[produce_span_json_from_values] Call stack serialization completed");
+    } else {
+        debug_log("[produce_span_json_from_values] expand_spans=true, skipping stack (child spans sent separately)");
+        json_buffer_append_str(&buf, ",\"stack\":[]");
+    }
     
     json_buffer_append_str(&buf, "}\n");
     
     
     // Return the buffer data (already malloc'd) - caller will free it
+    return buf.data;
+}
+
+// Produce child span JSON from call node - send each significant call as separate span
+// Returns NULL if call node is not significant (no SQL/HTTP/cache/Redis and duration <= 10ms)
+// Safe to use after fastcgi_finish_request()
+char* produce_child_span_json_from_call_node(
+    call_node_t *call, const char *trace_id, const char *parent_span_id, long root_start_ts
+) {
+    if (!call || call->magic != OPA_CALL_NODE_MAGIC) {
+        return NULL;
+    }
+    
+    // Check if call node is significant (should create a span)
+    int has_sql = (call->sql_queries && Z_TYPE_P(call->sql_queries) == IS_ARRAY && 
+                   zend_hash_num_elements(Z_ARRVAL_P(call->sql_queries)) > 0);
+    int has_http = (call->http_requests && Z_TYPE_P(call->http_requests) == IS_ARRAY && 
+                    zend_hash_num_elements(Z_ARRVAL_P(call->http_requests)) > 0);
+    int has_cache = (call->cache_operations && Z_TYPE_P(call->cache_operations) == IS_ARRAY && 
+                     zend_hash_num_elements(Z_ARRVAL_P(call->cache_operations)) > 0);
+    int has_redis = (call->redis_operations && Z_TYPE_P(call->redis_operations) == IS_ARRAY && 
+                     zend_hash_num_elements(Z_ARRVAL_P(call->redis_operations)) > 0);
+    
+    double end_time = call->end_time > 0.0 ? call->end_time : call->start_time + 0.001;
+    double duration_ms = (end_time - call->start_time) * 1000.0;
+    if (duration_ms < 0.0) duration_ms = 0.0;
+    
+    // Only create span for significant nodes
+    if (!has_sql && !has_http && !has_cache && !has_redis && duration_ms <= 10.0) {
+        return NULL; // Not significant, skip
+    }
+    
+    // Build span name from class::function or just function
+    char *span_name = NULL;
+    if (call->class_name && call->function_name) {
+        size_t name_len = strlen(call->class_name) + 2 + strlen(call->function_name) + 1;
+        span_name = malloc(name_len);
+        if (span_name) {
+            snprintf(span_name, name_len, "%s::%s", call->class_name, call->function_name);
+        }
+    } else if (call->function_name) {
+        size_t name_len = strlen(call->function_name) + 1;
+        span_name = malloc(name_len);
+        if (span_name) {
+            strcpy(span_name, call->function_name);
+        }
+    } else {
+        span_name = strdup("function_call");
+    }
+    
+    if (!span_name) {
+        return NULL; // Memory allocation failed
+    }
+    
+    // Calculate timestamps relative to root span
+    // Approximate: use depth and duration to estimate timing
+    long start_ts = root_start_ts + (long)(call->start_time * 1000.0);
+    long end_ts = root_start_ts + (long)(end_time * 1000.0);
+    if (start_ts < root_start_ts) start_ts = root_start_ts; // Safety check
+    
+    // Calculate CPU time
+    double end_cpu_time = call->end_cpu_time > 0.0 ? call->end_cpu_time : call->start_cpu_time + 0.0005;
+    double cpu_ms = (end_cpu_time - call->start_cpu_time) * 1000.0;
+    if (cpu_ms < 0.0) cpu_ms = 0.0;
+    int cpu_ms_int = (int)cpu_ms;
+    
+    // Use malloc'd buffer (safe after fastcgi_finish_request)
+    json_buffer_t buf;
+    json_buffer_init(&buf);
+    
+    json_buffer_append_str(&buf, "{\"type\":\"span\",\"trace_id\":\"");
+    if (trace_id) {
+        json_buffer_append_str(&buf, trace_id);
+    } else {
+        json_buffer_append_str(&buf, "unknown");
+    }
+    json_buffer_append_str(&buf, "\",\"span_id\":\"");
+    if (call->call_id) {
+        json_buffer_append_str(&buf, call->call_id);
+    } else {
+        json_buffer_append_str(&buf, "unknown");
+    }
+    json_buffer_append_str(&buf, "\"");
+    
+    if (parent_span_id) {
+        json_buffer_append_str(&buf, ",\"parent_id\":\"");
+        json_buffer_append_str(&buf, parent_span_id);
+        json_buffer_append_str(&buf, "\"");
+    }
+    
+    // Service name
+    json_buffer_append_str(&buf, ",\"service\":\"");
+    const char *service_name = OPA_G(service) ? OPA_G(service) : "php-fpm";
+    json_escape_string_malloc(&buf, service_name, strlen(service_name));
+    json_buffer_append_str(&buf, "\",\"name\":\"");
+    json_escape_string_malloc(&buf, span_name, strlen(span_name));
+    json_buffer_append_str(&buf, "\"");
+    
+    // Timestamps
+    char start_ts_str[32], end_ts_str[32], duration_str[32];
+    snprintf(start_ts_str, sizeof(start_ts_str), "%ld", start_ts);
+    snprintf(end_ts_str, sizeof(end_ts_str), "%ld", end_ts);
+    snprintf(duration_str, sizeof(duration_str), "%.3f", duration_ms);
+    
+    json_buffer_append_str(&buf, ",\"start_ts\":");
+    json_buffer_append_str(&buf, start_ts_str);
+    json_buffer_append_str(&buf, ",\"end_ts\":");
+    json_buffer_append_str(&buf, end_ts_str);
+    json_buffer_append_str(&buf, ",\"duration_ms\":");
+    json_buffer_append_str(&buf, duration_str);
+    
+    if (cpu_ms_int > 0) {
+        char cpu_str[32];
+        snprintf(cpu_str, sizeof(cpu_str), "%d", cpu_ms_int);
+        json_buffer_append_str(&buf, ",\"cpu_ms\":");
+        json_buffer_append_str(&buf, cpu_str);
+    }
+    
+    // Status (default to ok for child spans, agent will calculate if needed)
+    json_buffer_append_str(&buf, ",\"status\":\"ok\"");
+    
+    // Language metadata
+    if (OPA_G(language) && strlen(OPA_G(language)) > 0) {
+        json_buffer_append_str(&buf, ",\"language\":\"");
+        json_escape_string_malloc(&buf, OPA_G(language), strlen(OPA_G(language)));
+        json_buffer_append_str(&buf, "\"");
+    }
+    if (OPA_G(language_version) && strlen(OPA_G(language_version)) > 0) {
+        json_buffer_append_str(&buf, ",\"language_version\":\"");
+        json_escape_string_malloc(&buf, OPA_G(language_version), strlen(OPA_G(language_version)));
+        json_buffer_append_str(&buf, "\"");
+    }
+    if (OPA_G(framework) && strlen(OPA_G(framework)) > 0) {
+        json_buffer_append_str(&buf, ",\"framework\":\"");
+        json_escape_string_malloc(&buf, OPA_G(framework), strlen(OPA_G(framework)));
+        json_buffer_append_str(&buf, "\"");
+    }
+    if (OPA_G(framework_version) && strlen(OPA_G(framework_version)) > 0) {
+        json_buffer_append_str(&buf, ",\"framework_version\":\"");
+        json_escape_string_malloc(&buf, OPA_G(framework_version), strlen(OPA_G(framework_version)));
+        json_buffer_append_str(&buf, "\"");
+    }
+    
+    // Tags
+    json_buffer_append_str(&buf, ",\"tags\":{");
+    int tag_first = 1;
+    
+    // Organization and project
+    if (OPA_G(organization_id) && strlen(OPA_G(organization_id)) > 0) {
+        if (!tag_first) json_buffer_append_str(&buf, ",");
+        json_buffer_append_str(&buf, "\"organization_id\":\"");
+        json_escape_string_malloc(&buf, OPA_G(organization_id), strlen(OPA_G(organization_id)));
+        json_buffer_append_str(&buf, "\"");
+        tag_first = 0;
+    }
+    if (OPA_G(project_id) && strlen(OPA_G(project_id)) > 0) {
+        if (!tag_first) json_buffer_append_str(&buf, ",");
+        json_buffer_append_str(&buf, "\"project_id\":\"");
+        json_escape_string_malloc(&buf, OPA_G(project_id), strlen(OPA_G(project_id)));
+        json_buffer_append_str(&buf, "\"");
+        tag_first = 0;
+    }
+    
+    // Add call metadata to tags
+    if (!tag_first) json_buffer_append_str(&buf, ",");
+    json_buffer_append_str(&buf, "\"call_id\":\"");
+    if (call->call_id) {
+        json_buffer_append_str(&buf, call->call_id);
+    }
+    json_buffer_append_str(&buf, "\"");
+    tag_first = 0;
+    
+    if (call->file) {
+        if (!tag_first) json_buffer_append_str(&buf, ",");
+        json_buffer_append_str(&buf, "\"file\":\"");
+        json_escape_string_malloc(&buf, call->file, strlen(call->file));
+        json_buffer_append_str(&buf, "\"");
+        tag_first = 0;
+    }
+    
+    if (call->line > 0) {
+        if (!tag_first) json_buffer_append_str(&buf, ",");
+        char line_str[32];
+        snprintf(line_str, sizeof(line_str), "%d", call->line);
+        json_buffer_append_str(&buf, "\"line\":");
+        json_buffer_append_str(&buf, line_str);
+        tag_first = 0;
+    }
+    
+    char depth_str[32];
+    snprintf(depth_str, sizeof(depth_str), "%d", call->depth);
+    if (!tag_first) json_buffer_append_str(&buf, ",");
+    json_buffer_append_str(&buf, "\"depth\":");
+    json_buffer_append_str(&buf, depth_str);
+    tag_first = 0;
+    
+    json_buffer_append_str(&buf, "}");
+    
+    // Network metrics
+    long net_sent = (long)call->end_bytes_sent - (long)call->start_bytes_sent;
+    long net_received = (long)call->end_bytes_received - (long)call->start_bytes_received;
+    if (net_sent > 0 || net_received > 0) {
+        json_buffer_append_str(&buf, ",\"net\":{");
+        char net_sent_str[64], net_recv_str[64];
+        snprintf(net_sent_str, sizeof(net_sent_str), "%ld", net_sent);
+        snprintf(net_recv_str, sizeof(net_recv_str), "%ld", net_received);
+        json_buffer_append_str(&buf, "\"bytes_sent\":");
+        json_buffer_append_str(&buf, net_sent_str);
+        json_buffer_append_str(&buf, ",\"bytes_received\":");
+        json_buffer_append_str(&buf, net_recv_str);
+        json_buffer_append_str(&buf, "}");
+    } else {
+        json_buffer_append_str(&buf, ",\"net\":{}");
+    }
+    
+    // SQL queries
+    json_buffer_append_str(&buf, ",\"sql\":");
+    if (has_sql) {
+        smart_string temp_buf = {0};
+        serialize_zval_json(&temp_buf, call->sql_queries);
+        smart_string_0(&temp_buf);
+        if (temp_buf.c && temp_buf.len > 0) {
+            json_buffer_append(&buf, temp_buf.c, temp_buf.len);
+        } else {
+            json_buffer_append_str(&buf, "[]");
+        }
+        smart_string_free(&temp_buf);
+    } else {
+        json_buffer_append_str(&buf, "[]");
+    }
+    
+    // HTTP requests
+    json_buffer_append_str(&buf, ",\"http\":");
+    if (has_http) {
+        smart_string temp_buf = {0};
+        serialize_zval_json(&temp_buf, call->http_requests);
+        smart_string_0(&temp_buf);
+        if (temp_buf.c && temp_buf.len > 0) {
+            json_buffer_append(&buf, temp_buf.c, temp_buf.len);
+        } else {
+            json_buffer_append_str(&buf, "[]");
+        }
+        smart_string_free(&temp_buf);
+    } else {
+        json_buffer_append_str(&buf, "[]");
+    }
+    
+    // Cache operations
+    json_buffer_append_str(&buf, ",\"cache\":");
+    if (has_cache) {
+        smart_string temp_buf = {0};
+        serialize_zval_json(&temp_buf, call->cache_operations);
+        smart_string_0(&temp_buf);
+        if (temp_buf.c && temp_buf.len > 0) {
+            json_buffer_append(&buf, temp_buf.c, temp_buf.len);
+        } else {
+            json_buffer_append_str(&buf, "[]");
+        }
+        smart_string_free(&temp_buf);
+    } else {
+        json_buffer_append_str(&buf, "[]");
+    }
+    
+    // Redis operations
+    json_buffer_append_str(&buf, ",\"redis\":");
+    if (has_redis) {
+        smart_string temp_buf = {0};
+        serialize_zval_json(&temp_buf, call->redis_operations);
+        smart_string_0(&temp_buf);
+        if (temp_buf.c && temp_buf.len > 0) {
+            json_buffer_append(&buf, temp_buf.c, temp_buf.len);
+        } else {
+            json_buffer_append_str(&buf, "[]");
+        }
+        smart_string_free(&temp_buf);
+    } else {
+        json_buffer_append_str(&buf, "[]");
+    }
+    
+    // No stack field (already expanded into separate spans)
+    // No dumps (only root span has dumps)
+    
+    json_buffer_append_str(&buf, "}\n");
+    
+    free(span_name);
+    
     return buf.data;
 }
 

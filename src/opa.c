@@ -3057,6 +3057,46 @@ PHP_RINIT_FUNCTION(opa) {
 }
 */
 
+// Helper function to find parent span_id for a call node (span expansion)
+// Returns root_span_id if no significant parent found, or parent's call_id if parent is significant
+static char* find_parent_span_id_for_call(call_node_t *call, call_node_t *all_calls, const char *root_span_id) {
+    if (!call || !call->parent_id || strlen(call->parent_id) == 0) {
+        return (char*)root_span_id; // Root-level call, parent is root span
+    }
+    
+    // Find parent call node
+    call_node_t *parent_call = all_calls;
+    while (parent_call) {
+        if (parent_call->call_id && strcmp(parent_call->call_id, call->parent_id) == 0) {
+            // Found parent call - check if it's significant
+            int has_sql = (parent_call->sql_queries && Z_TYPE_P(parent_call->sql_queries) == IS_ARRAY && 
+                           zend_hash_num_elements(Z_ARRVAL_P(parent_call->sql_queries)) > 0);
+            int has_http = (parent_call->http_requests && Z_TYPE_P(parent_call->http_requests) == IS_ARRAY && 
+                            zend_hash_num_elements(Z_ARRVAL_P(parent_call->http_requests)) > 0);
+            int has_cache = (parent_call->cache_operations && Z_TYPE_P(parent_call->cache_operations) == IS_ARRAY && 
+                             zend_hash_num_elements(Z_ARRVAL_P(parent_call->cache_operations)) > 0);
+            int has_redis = (parent_call->redis_operations && Z_TYPE_P(parent_call->redis_operations) == IS_ARRAY && 
+                             zend_hash_num_elements(Z_ARRVAL_P(parent_call->redis_operations)) > 0);
+            
+            double end_time = parent_call->end_time > 0.0 ? parent_call->end_time : parent_call->start_time + 0.001;
+            double duration_ms = (end_time - parent_call->start_time) * 1000.0;
+            if (duration_ms < 0.0) duration_ms = 0.0;
+            
+            // If parent is significant, use its call_id as span_id
+            if (has_sql || has_http || has_cache || has_redis || duration_ms > 10.0) {
+                return parent_call->call_id; // Parent will be sent as span, use its call_id
+            } else {
+                // Parent is not significant, traverse up
+                return find_parent_span_id_for_call(parent_call, all_calls, root_span_id);
+            }
+        }
+        parent_call = parent_call->next;
+    }
+    
+    // Parent call not found, use root span
+    return (char*)root_span_id;
+}
+
 PHP_RSHUTDOWN_FUNCTION(opa) {
     // Skip logging in CLI mode
     int is_cli = (sapi_module.name && strcmp(sapi_module.name, "cli") == 0);
@@ -3213,6 +3253,65 @@ PHP_RSHUTDOWN_FUNCTION(opa) {
         }
     } else if (json_str) {
         free(json_str); // Free if not sent
+    }
+    
+    // Send child spans as separate messages (if expand_spans is enabled)
+    // All sending happens here in RSHUTDOWN after fastcgi_finish_request()
+    if (OPA_G(expand_spans) && root_span_span_id && root_span_trace_id && global_collector && 
+        global_collector->magic == OPA_COLLECTOR_MAGIC && global_collector->calls) {
+        
+        debug_log("[RSHUTDOWN] expand_spans enabled, sending child spans from call stack");
+        
+        // Iterate through all calls and send significant ones as child spans
+        call_node_t *call = global_collector->calls;
+        int child_spans_sent = 0;
+        long root_start_ts = root_span_start_ts;
+        
+        while (call) {
+            if (call->magic == OPA_CALL_NODE_MAGIC && call->start_time > 0.0) {
+                // Check if this call is significant
+                int has_sql = (call->sql_queries && Z_TYPE_P(call->sql_queries) == IS_ARRAY && 
+                               zend_hash_num_elements(Z_ARRVAL_P(call->sql_queries)) > 0);
+                int has_http = (call->http_requests && Z_TYPE_P(call->http_requests) == IS_ARRAY && 
+                                zend_hash_num_elements(Z_ARRVAL_P(call->http_requests)) > 0);
+                int has_cache = (call->cache_operations && Z_TYPE_P(call->cache_operations) == IS_ARRAY && 
+                                 zend_hash_num_elements(Z_ARRVAL_P(call->cache_operations)) > 0);
+                int has_redis = (call->redis_operations && Z_TYPE_P(call->redis_operations) == IS_ARRAY && 
+                                 zend_hash_num_elements(Z_ARRVAL_P(call->redis_operations)) > 0);
+                
+                double end_time = call->end_time > 0.0 ? call->end_time : call->start_time + 0.001;
+                double duration_ms = (end_time - call->start_time) * 1000.0;
+                if (duration_ms < 0.0) duration_ms = 0.0;
+                
+                if (has_sql || has_http || has_cache || has_redis || duration_ms > 10.0) {
+                    // Significant call - send as child span
+                    char *parent_span_id = find_parent_span_id_for_call(call, global_collector->calls, root_span_span_id);
+                    
+                    char *child_json = produce_child_span_json_from_call_node(
+                        call, root_span_trace_id, parent_span_id, root_start_ts
+                    );
+                    
+                    if (child_json) {
+                        debug_log("[RSHUTDOWN] Sending child span: call_id=%s, parent_span_id=%s", 
+                            call->call_id ? call->call_id : "NULL", parent_span_id);
+                        
+                        // Convert to emalloc'd for send_message_direct
+                        char *msg_copy = estrdup(child_json);
+                        if (msg_copy) {
+                            free(child_json); // Free malloc'd version
+                            send_message_direct(msg_copy, 1);
+                            child_spans_sent++;
+                        } else {
+                            free(child_json);
+                            log_error("Failed to allocate memory for child span message", "estrdup failed", "");
+                        }
+                    }
+                }
+            }
+            call = call->next;
+        }
+        
+        debug_log("[RSHUTDOWN] Sent %d child spans (expand_spans mode)", child_spans_sent);
     }
     
     // Free collector () - this will free all calls

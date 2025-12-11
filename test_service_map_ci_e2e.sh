@@ -441,7 +441,8 @@ verify_service_dependencies_in_clickhouse() {
                         # Check that password is masked if present
                         if [[ "$db_dsn_value" =~ password= ]] && [[ ! "$db_dsn_value" =~ password=\*\*\* ]]; then
                             # Check if it's an actual password (not just "password=" with no value)
-                            if [[ "$db_dsn_value" =~ password=[^;*]+[^;*] ]]; then
+                            # Use grep to check for unmasked password
+                            if echo "$db_dsn_value" | grep -qE "password=[^;*]{1,}"; then
                                 test_result 1 "SQL db_dsn password masking" "DSN may contain unmasked password"
                             else
                                 test_result 0 "SQL db_dsn value" "db_dsn: $db_dsn_value"

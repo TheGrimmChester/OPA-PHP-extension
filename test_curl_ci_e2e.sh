@@ -47,7 +47,7 @@ cleanup() {
     cd "${PHP_EXTENSION_DIR}" || true
     
     # Stop mock server container
-    docker compose -f docker-compose.test.yml down > /dev/null 2>&1 || true
+    docker-compose -f docker-compose.test.yml down > /dev/null 2>&1 || true
     
     return $exit_code
 }
@@ -104,8 +104,8 @@ start_mock_server() {
     
     log_info "Starting mock HTTP server as Docker service..."
     
-    # Start mock server using docker compose
-    docker compose -f docker-compose.test.yml up -d mock-http-server 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
+    # Start mock server using docker-compose
+    docker-compose -f docker-compose.test.yml up -d mock-http-server 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
     
     # Wait for server to be ready (check from host)
     local max_attempts=20
@@ -122,7 +122,7 @@ start_mock_server() {
     
     log_error "Mock server failed to start"
     if [[ "$VERBOSE" -eq 1 ]]; then
-        docker compose -f docker-compose.test.yml logs mock-http-server 2>&1 | tail -20
+        docker-compose -f docker-compose.test.yml logs mock-http-server 2>&1 | tail -20
     fi
     return 1
 }
@@ -254,7 +254,7 @@ EOF
     
     log_info "Using mock server URL for container: $MOCK_SERVER_URL"
     
-    MOCK_SERVER_URL="$MOCK_SERVER_URL" docker compose -f docker-compose.test.yml run --rm \
+    MOCK_SERVER_URL="$MOCK_SERVER_URL" docker-compose -f docker-compose.test.yml run --rm \
         -e MOCK_SERVER_URL="$MOCK_SERVER_URL" \
         php php -d opa.socket_path=opa-agent:9090 \
             -d opa.enabled=1 \
@@ -310,7 +310,7 @@ query_clickhouse() {
         return 0
     else
         # Fallback: try docker-compose (for local testing)
-        result=$(docker compose exec -T clickhouse clickhouse-client --query "$query" 2>&1)
+        result=$(docker-compose exec -T clickhouse clickhouse-client --query "$query" 2>&1)
         local exit_code=$?
         if [[ $exit_code -ne 0 ]]; then
             if [[ "$VERBOSE" -eq 1 ]] && [[ "$query" =~ "SELECT" ]]; then

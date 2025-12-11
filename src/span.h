@@ -18,5 +18,11 @@ char* produce_span_json_from_values(
     const char *cli_args_json, const char *http_request_json, const char *http_response_json
 ); // Returns char* (malloc'd), caller must free
 
+// Produce child span JSON from call node - safe after fastcgi_finish_request()
+// Returns NULL if call node is not significant (no SQL/HTTP/cache/Redis and duration <= 10ms)
+char* produce_child_span_json_from_call_node(
+    call_node_t *call, const char *trace_id, const char *parent_span_id, long root_start_ts
+); // Returns char* (malloc'd), caller must free, or NULL if not significant
+
 #endif /* SPAN_H */
 
