@@ -1,0 +1,27 @@
+-include opa.dep
+opa.lo: /usr/src/opa/opa.c
+	$(LIBTOOL) --tag=CC --mode=compile $(CC) -I. -I/usr/src/opa $(COMMON_FLAGS) $(CFLAGS_CLEAN) $(EXTRA_CFLAGS)  -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DCOMPILE_DL_OPA=1 -DZEND_COMPILE_DL_EXT=1 -c /usr/src/opa/opa.c -o opa.lo  -MMD -MF opa.dep -MT opa.lo
+-include span.dep
+span.lo: /usr/src/opa/span.c
+	$(LIBTOOL) --tag=CC --mode=compile $(CC) -I. -I/usr/src/opa $(COMMON_FLAGS) $(CFLAGS_CLEAN) $(EXTRA_CFLAGS)  -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DCOMPILE_DL_OPA=1 -DZEND_COMPILE_DL_EXT=1 -c /usr/src/opa/span.c -o span.lo  -MMD -MF span.dep -MT span.lo
+-include call_node.dep
+call_node.lo: /usr/src/opa/call_node.c
+	$(LIBTOOL) --tag=CC --mode=compile $(CC) -I. -I/usr/src/opa $(COMMON_FLAGS) $(CFLAGS_CLEAN) $(EXTRA_CFLAGS)  -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DCOMPILE_DL_OPA=1 -DZEND_COMPILE_DL_EXT=1 -c /usr/src/opa/call_node.c -o call_node.lo  -MMD -MF call_node.dep -MT call_node.lo
+-include transport.dep
+transport.lo: /usr/src/opa/transport.c
+	$(LIBTOOL) --tag=CC --mode=compile $(CC) -I. -I/usr/src/opa $(COMMON_FLAGS) $(CFLAGS_CLEAN) $(EXTRA_CFLAGS)  -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DCOMPILE_DL_OPA=1 -DZEND_COMPILE_DL_EXT=1 -c /usr/src/opa/transport.c -o transport.lo  -MMD -MF transport.dep -MT transport.lo
+-include serialize.dep
+serialize.lo: /usr/src/opa/serialize.c
+	$(LIBTOOL) --tag=CC --mode=compile $(CC) -I. -I/usr/src/opa $(COMMON_FLAGS) $(CFLAGS_CLEAN) $(EXTRA_CFLAGS)  -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DCOMPILE_DL_OPA=1 -DZEND_COMPILE_DL_EXT=1 -c /usr/src/opa/serialize.c -o serialize.lo  -MMD -MF serialize.dep -MT serialize.lo
+-include opa_api.dep
+opa_api.lo: /usr/src/opa/opa_api.c
+	$(LIBTOOL) --tag=CC --mode=compile $(CC) -I. -I/usr/src/opa $(COMMON_FLAGS) $(CFLAGS_CLEAN) $(EXTRA_CFLAGS)  -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DCOMPILE_DL_OPA=1 -DZEND_COMPILE_DL_EXT=1 -c /usr/src/opa/opa_api.c -o opa_api.lo  -MMD -MF opa_api.dep -MT opa_api.lo
+-include error_tracking.dep
+error_tracking.lo: /usr/src/opa/error_tracking.c
+	$(LIBTOOL) --tag=CC --mode=compile $(CC) -I. -I/usr/src/opa $(COMMON_FLAGS) $(CFLAGS_CLEAN) $(EXTRA_CFLAGS)  -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DCOMPILE_DL_OPA=1 -DZEND_COMPILE_DL_EXT=1 -c /usr/src/opa/error_tracking.c -o error_tracking.lo  -MMD -MF error_tracking.dep -MT error_tracking.lo
+$(phplibdir)/opa.la: ./opa.la
+	$(LIBTOOL) --tag=CC --mode=install cp ./opa.la $(phplibdir)
+
+./opa.la: $(shared_objects_opa) $(OPA_SHARED_DEPENDENCIES)
+	$(LIBTOOL) --tag=CC --mode=link $(CC) -shared $(COMMON_FLAGS) $(CFLAGS_CLEAN) $(EXTRA_CFLAGS) $(LDFLAGS)  -o $@ -export-dynamic -avoid-version -prefer-pic -module -rpath $(phplibdir) $(EXTRA_LDFLAGS) $(shared_objects_opa) $(OPA_SHARED_LIBADD)
+

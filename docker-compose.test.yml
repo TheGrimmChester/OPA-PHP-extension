@@ -37,27 +37,6 @@ services:
       retries: 10
     command: --default-authentication-plugin=mysql_native_password
 
-  redis-test:
-    image: redis:7-alpine
-    container_name: opa-redis-test
-    ports:
-      - "6380:6379"
-    networks:
-      - opa_network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 2s
-      timeout: 1s
-      retries: 5
-
-  php:
-    image: php-extension-test
-    networks:
-      - opa_network
-    volumes:
-      - ./tests:/var/www/html/tests:ro
-    working_dir: /var/www/html
-
 networks:
   opa_network:
     external: true
