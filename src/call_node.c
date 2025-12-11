@@ -1,8 +1,8 @@
 #include "call_node.h"
 
 // Records a SQL query execution in the current function call's context
-// Tracks query text, duration, type, and affected rows for performance analysis
-void record_sql_query(const char *sql, double duration, zval *params, const char *query_type, int rows_affected) {
+// Tracks query text, duration, type, affected rows, database hostname, database system, and DSN for performance analysis
+void record_sql_query(const char *sql, double duration, zval *params, const char *query_type, int rows_affected, const char *db_host, const char *db_system, const char *db_dsn) {
     if (!OPA_G(enabled) || !profiling_active) return;
     
     extern opa_collector_t *global_collector;
@@ -83,7 +83,22 @@ void record_sql_query(const char *sql, double duration, zval *params, const char
             }
         }
         
-        add_assoc_string(&query_data, "db_system", "mysql");
+        // Add database system (mysql, postgresql, etc.) - use provided value or default to "mysql"
+        if (db_system && strlen(db_system) > 0) {
+            add_assoc_string(&query_data, "db_system", (char *)db_system);
+        } else {
+            add_assoc_string(&query_data, "db_system", "mysql");
+        }
+        
+        // Add database hostname if available
+        if (db_host && strlen(db_host) > 0) {
+            add_assoc_string(&query_data, "db_host", (char *)db_host);
+        }
+        
+        // Add database DSN (without password) if available
+        if (db_dsn && strlen(db_dsn) > 0) {
+            add_assoc_string(&query_data, "db_dsn", (char *)db_dsn);
+        }
         
         add_next_index_zval(current_call->sql_queries, &query_data);
         // query_data is copied by add_next_index_zval

@@ -1452,7 +1452,10 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         // This is a limitation - we'll record 0 for now
         
         // Record SQL query using the current call from collector
-        record_sql_query(sql, query_duration, NULL, query_type, rows_affected);
+        // Note: In execute_ex context, we don't have easy access to the connection object
+        // to extract hostname, db_system, or db_dsn, so we pass NULL. The dedicated hooks (mysqli_query, PDO::query, 
+        // PDOStatement::execute) will capture the hostname, db_system, and db_dsn properly.
+        record_sql_query(sql, query_duration, NULL, query_type, rows_affected, NULL, NULL, NULL);
         debug_log("[execute_ex] Recorded SQL query: %s, duration=%.6f", sql, query_duration);
         efree(sql);
     } else if (pdo_method && sql) {
@@ -2123,10 +2126,72 @@ PHP_FUNCTION(opaphp_mysqli_query) {
                    ZSTR_VAL(query), elapsed, rows_affected);
         }
         
+        // Extract database hostname, system, and DSN from mysqli connection
+        const char *db_host = NULL;
+        char *db_host_allocated = NULL; // Track if we allocated it
+        const char *db_system = "mysql"; // MySQLi is always MySQL/MariaDB
+        char *db_dsn = NULL;
+        if (link && Z_TYPE_P(link) == IS_OBJECT) {
+            // Try multiple methods to get hostname
+            zval hostname_zv;
+            zval *hostname_prop = zend_read_property(Z_OBJCE_P(link), Z_OBJ_P(link), "hostname", sizeof("hostname") - 1, 1, &hostname_zv);
+            if (hostname_prop && Z_TYPE_P(hostname_prop) == IS_STRING && Z_STRLEN_P(hostname_prop) > 0) {
+                db_host = Z_STRVAL_P(hostname_prop);
+            } else {
+                // Try to parse from host_info: "mysql-test via TCP/IP" or "localhost via TCP/IP"
+                zval host_info_zv;
+                zval *host_info_prop = zend_read_property(Z_OBJCE_P(link), Z_OBJ_P(link), "host_info", sizeof("host_info") - 1, 1, &host_info_zv);
+                if (host_info_prop && Z_TYPE_P(host_info_prop) == IS_STRING && Z_STRLEN_P(host_info_prop) > 0) {
+                    const char *host_info = Z_STRVAL_P(host_info_prop);
+                    // Parse "hostname via TCP/IP" or "hostname via Unix socket"
+                    const char *via_pos = strstr(host_info, " via ");
+                    if (via_pos) {
+                        size_t host_len = via_pos - host_info;
+                        db_host_allocated = estrndup(host_info, host_len);
+                        db_host = db_host_allocated;
+                    }
+                }
+            }
+            
+            // Build DSN string (without password) if we have hostname
+            if (db_host) {
+                zval port_zv;
+                zval *port_prop = zend_read_property(Z_OBJCE_P(link), Z_OBJ_P(link), "port", sizeof("port") - 1, 1, &port_zv);
+                int port = 3306; // default
+                if (port_prop && Z_TYPE_P(port_prop) == IS_LONG) {
+                    port = Z_LVAL_P(port_prop);
+                }
+                
+                zval db_zv;
+                zval *db_prop = zend_read_property(Z_OBJCE_P(link), Z_OBJ_P(link), "db", sizeof("db") - 1, 1, &db_zv);
+                const char *db_name = "";
+                if (db_prop && Z_TYPE_P(db_prop) == IS_STRING && Z_STRLEN_P(db_prop) > 0) {
+                    db_name = Z_STRVAL_P(db_prop);
+                }
+                
+                // Build DSN: mysql:host=hostname;port=3306;dbname=dbname
+                if (db_name && strlen(db_name) > 0) {
+                    db_dsn = emalloc(256);
+                    snprintf(db_dsn, 256, "mysql:host=%s;port=%d;dbname=%s", db_host, port, db_name);
+                } else {
+                    db_dsn = emalloc(128);
+                    snprintf(db_dsn, 128, "mysql:host=%s;port=%d", db_host, port);
+                }
+            }
+        }
+        
         // Send SQL query data to agent via record_sql_query
         // Duration is in milliseconds, convert to seconds for record_sql_query
         double duration_seconds = elapsed / 1000.0;
-        record_sql_query(ZSTR_VAL(query), duration_seconds, NULL, "mysqli_query", rows_affected);
+        record_sql_query(ZSTR_VAL(query), duration_seconds, NULL, "mysqli_query", rows_affected, db_host, db_system, db_dsn);
+        
+        // Free allocated strings
+        if (db_dsn) {
+            efree(db_dsn);
+        }
+        if (db_host_allocated) {
+            efree(db_host_allocated);
+        }
     }
 }
 
@@ -2194,9 +2259,77 @@ PHP_METHOD(PDO, query) {
                    ZSTR_VAL(sql), elapsed, row_count);
         }
         
+        // Extract database hostname, system, and DSN from PDO connection
+        char *db_host = NULL;
+        char *db_system = NULL;
+        char *db_dsn = NULL;
+        if (getThis() && Z_TYPE_P(getThis()) == IS_OBJECT) {
+            // PDO::query is called on PDO object, so getThis() is the PDO connection itself
+            zval *dsn_prop = zend_read_property(Z_OBJCE_P(getThis()), Z_OBJ_P(getThis()), "dsn", sizeof("dsn") - 1, 1, NULL);
+            if (dsn_prop && Z_TYPE_P(dsn_prop) == IS_STRING) {
+                // Parse DSN: "mysql:host=localhost;dbname=test" or "postgresql:host=localhost;dbname=test"
+                const char *dsn = Z_STRVAL_P(dsn_prop);
+                
+                // Store full DSN but remove password if present
+                const char *password_pos = strstr(dsn, "password=");
+                if (password_pos) {
+                    // Find the end of password value (next semicolon or end of string)
+                    const char *pwd_start = password_pos + 9; // Skip "password="
+                    const char *pwd_end = strchr(pwd_start, ';');
+                    if (!pwd_end) {
+                        pwd_end = dsn + strlen(dsn);
+                    }
+                    
+                    // Build DSN without password
+                    size_t before_pwd = password_pos - dsn;
+                    size_t after_pwd = strlen(pwd_end);
+                    db_dsn = emalloc(before_pwd + 12 + after_pwd + 1); // "password=***" + null terminator
+                    memcpy(db_dsn, dsn, before_pwd);
+                    memcpy(db_dsn + before_pwd, "password=***", 12);
+                    memcpy(db_dsn + before_pwd + 12, pwd_end, after_pwd);
+                    db_dsn[before_pwd + 12 + after_pwd] = '\0';
+                } else {
+                    // No password in DSN, use as-is
+                    db_dsn = estrdup(dsn);
+                }
+                
+                // Extract database system (part before the colon)
+                const char *colon = strchr(dsn, ':');
+                if (colon) {
+                    size_t system_len = colon - dsn;
+                    db_system = estrndup(dsn, system_len);
+                }
+                
+                // Extract hostname: "host=localhost;dbname=test"
+                const char *host_start = strstr(dsn, "host=");
+                if (host_start) {
+                    host_start += 5; // Skip "host="
+                    const char *host_end = strchr(host_start, ';');
+                    if (host_end) {
+                        size_t host_len = host_end - host_start;
+                        db_host = estrndup(host_start, host_len);
+                    } else {
+                        // No semicolon after host, use rest of string
+                        db_host = estrdup(host_start);
+                    }
+                }
+            }
+        }
+        
         // Send SQL query data to agent via record_sql_query
         double duration_seconds = elapsed / 1000.0;
-        record_sql_query(ZSTR_VAL(sql), duration_seconds, NULL, "PDO::query", row_count);
+        record_sql_query(ZSTR_VAL(sql), duration_seconds, NULL, "PDO::query", row_count, db_host, db_system, db_dsn);
+        
+        // Free the allocated strings
+        if (db_host) {
+            efree(db_host);
+        }
+        if (db_system) {
+            efree(db_system);
+        }
+        if (db_dsn) {
+            efree(db_dsn);
+        }
     }
 }
 
@@ -2262,9 +2395,81 @@ PHP_METHOD(PDOStatement, execute) {
                    sql, elapsed, row_count);
         }
         
+        // Extract database hostname, system, and DSN from PDO connection
+        char *db_host = NULL;
+        char *db_system = NULL;
+        char *db_dsn = NULL;
+        if (getThis() && Z_TYPE_P(getThis()) == IS_OBJECT) {
+            // PDOStatement has a reference to the PDO connection via 'dbh' property
+            zval *dbh_prop = zend_read_property(Z_OBJCE_P(getThis()), Z_OBJ_P(getThis()), "dbh", sizeof("dbh") - 1, 1, NULL);
+            if (dbh_prop && Z_TYPE_P(dbh_prop) == IS_OBJECT) {
+                // Try to read the DSN from the PDO connection
+                zval *dsn_prop = zend_read_property(Z_OBJCE_P(dbh_prop), Z_OBJ_P(dbh_prop), "dsn", sizeof("dsn") - 1, 1, NULL);
+                if (dsn_prop && Z_TYPE_P(dsn_prop) == IS_STRING) {
+                    // Parse DSN: "mysql:host=localhost;dbname=test" or "postgresql:host=localhost;dbname=test"
+                    const char *dsn = Z_STRVAL_P(dsn_prop);
+                    
+                    // Store full DSN but remove password if present
+                    const char *password_pos = strstr(dsn, "password=");
+                    if (password_pos) {
+                        // Find the end of password value (next semicolon or end of string)
+                        const char *pwd_start = password_pos + 9; // Skip "password="
+                        const char *pwd_end = strchr(pwd_start, ';');
+                        if (!pwd_end) {
+                            pwd_end = dsn + strlen(dsn);
+                        }
+                        
+                        // Build DSN without password
+                        size_t before_pwd = password_pos - dsn;
+                        size_t after_pwd = strlen(pwd_end);
+                        db_dsn = emalloc(before_pwd + 12 + after_pwd + 1); // "password=***" + null terminator
+                        memcpy(db_dsn, dsn, before_pwd);
+                        memcpy(db_dsn + before_pwd, "password=***", 12);
+                        memcpy(db_dsn + before_pwd + 12, pwd_end, after_pwd);
+                        db_dsn[before_pwd + 12 + after_pwd] = '\0';
+                    } else {
+                        // No password in DSN, use as-is
+                        db_dsn = estrdup(dsn);
+                    }
+                    
+                    // Extract database system (part before the colon)
+                    const char *colon = strchr(dsn, ':');
+                    if (colon) {
+                        size_t system_len = colon - dsn;
+                        db_system = estrndup(dsn, system_len);
+                    }
+                    
+                    // Extract hostname: "host=localhost;dbname=test"
+                    const char *host_start = strstr(dsn, "host=");
+                    if (host_start) {
+                        host_start += 5; // Skip "host="
+                        const char *host_end = strchr(host_start, ';');
+                        if (host_end) {
+                            size_t host_len = host_end - host_start;
+                            db_host = estrndup(host_start, host_len);
+                        } else {
+                            // No semicolon after host, use rest of string
+                            db_host = estrdup(host_start);
+                        }
+                    }
+                }
+            }
+        }
+        
         // Send SQL query data to agent via record_sql_query
         double duration_seconds = elapsed / 1000.0;
-        record_sql_query(sql, duration_seconds, NULL, "PDOStatement::execute", row_count);
+        record_sql_query(sql, duration_seconds, NULL, "PDOStatement::execute", row_count, db_host, db_system, db_dsn);
+        
+        // Free the allocated strings
+        if (db_host) {
+            efree(db_host);
+        }
+        if (db_system) {
+            efree(db_system);
+        }
+        if (db_dsn) {
+            efree(db_dsn);
+        }
     }
 }
 
@@ -2872,7 +3077,9 @@ PHP_RSHUTDOWN_FUNCTION(opa) {
         debug_log("[RSHUTDOWN] About to produce span JSON, collector=%p", global_collector);
         // Data already in malloc'd memory - safe to use directly
         long end_ts = get_timestamp_ms(); // Finalize end_ts
-        int status = 1; // Finalize status
+        // Status is calculated by agent based on HTTP response codes and error indicators
+        // Extension only provides data (HTTP response, dumps, etc.) - agent does the calculation
+        int status = root_span_status; // Use existing status (defaults to -1, meaning "not set")
         
         // Serialize root span dumps to JSON (before fastcgi_finish_request, so zvals are safe)
         char *dumps_json = NULL;

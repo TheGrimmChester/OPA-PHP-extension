@@ -189,6 +189,7 @@ void record_redis_operation(const char *command, const char *key, int hit, doubl
 void opa_init_error_tracking(void);
 void opa_cleanup_error_tracking(void);
 void send_log_to_agent(const char *level, const char *message, const char *file, int line);
+void send_error_to_agent(int error_type, const char *error_message, const char *file, int line, zval *stack_trace, int *exception_code);
 
 // Collector functions
 opa_collector_t* opa_collector_init(void);

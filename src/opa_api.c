@@ -548,13 +548,15 @@ PHP_FUNCTION(opa_track_error) {
     ZEND_PARSE_PARAMETERS_END();
     
     // Call the error tracking function from error_tracking.c
-    extern void send_error_to_agent(int error_type, const char *error_message, const char *file, int line, zval *stack_trace);
+    extern void send_error_to_agent(int error_type, const char *error_message, const char *file, int line, zval *stack_trace, int *exception_code);
     
+    int exception_code = 0; // Regular errors don't have exception codes
     send_error_to_agent(
         E_ERROR, // Default to E_ERROR for userland errors
         error_message ? ZSTR_VAL(error_message) : NULL,
         file ? ZSTR_VAL(file) : NULL,
         (int)line,
-        stack_trace
+        stack_trace,
+        &exception_code
     );
 }

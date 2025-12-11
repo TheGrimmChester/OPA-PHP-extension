@@ -267,8 +267,16 @@ EOF
     local php_exit_code=$?
     rm -f "$test_script"
     
-    # Give agent time to process
-    sleep 2
+    # Give agent time to process and store traces
+    log_info "Waiting 5 seconds for agent to process and store traces..."
+    sleep 5
+    
+    # Check agent health and connection status
+    if [[ "$VERBOSE" -eq 1 ]] || [[ "$CI_MODE" -eq 1 ]]; then
+        local agent_status
+        agent_status=$(curl -sf "${API_URL}/api/health" 2>/dev/null || echo "unavailable")
+        log_info "Agent health status: $agent_status"
+    fi
     
     return $php_exit_code
 }
@@ -278,16 +286,40 @@ EOF
 query_clickhouse() {
     local query="$1"
     local clickhouse_container
+    local result
     
     # Try to find ClickHouse container (GitHub Actions service)
     clickhouse_container=$(docker ps --filter "ancestor=clickhouse/clickhouse-server:23.3" --format "{{.ID}}" | head -1)
     
+    if [[ -z "$clickhouse_container" ]]; then
+        # Also try by name pattern (GitHub Actions service containers have specific naming)
+        clickhouse_container=$(docker ps --filter "name=clickhouse" --format "{{.ID}}" | head -1)
+    fi
+    
     if [[ -n "$clickhouse_container" ]]; then
         # Use docker exec on the service container
-        docker exec "$clickhouse_container" clickhouse-client --query "$query" 2>&1
+        result=$(docker exec "$clickhouse_container" clickhouse-client --query "$query" 2>&1)
+        local exit_code=$?
+        if [[ $exit_code -ne 0 ]]; then
+            if [[ "$VERBOSE" -eq 1 ]] && [[ "$query" =~ "SELECT" ]]; then
+                log_warn "ClickHouse query failed (exit $exit_code): $result"
+            fi
+            return $exit_code
+        fi
+        echo "$result"
+        return 0
     else
         # Fallback: try docker-compose (for local testing)
-        docker compose exec -T clickhouse clickhouse-client --query "$query" 2>&1 || echo ""
+        result=$(docker compose exec -T clickhouse clickhouse-client --query "$query" 2>&1)
+        local exit_code=$?
+        if [[ $exit_code -ne 0 ]]; then
+            if [[ "$VERBOSE" -eq 1 ]] && [[ "$query" =~ "SELECT" ]]; then
+                log_warn "ClickHouse query failed via docker-compose (exit $exit_code): $result"
+            fi
+            return $exit_code
+        fi
+        echo "$result"
+        return 0
     fi
 }
 
@@ -297,22 +329,63 @@ wait_for_trace() {
     
     log_info "Waiting for trace to be stored..."
     
-    local max_attempts=20
+    # First, verify ClickHouse is accessible
+    local clickhouse_test
+    clickhouse_test=$(query_clickhouse "SELECT 1" 2>&1)
+    if [[ $? -ne 0 ]] || [[ "$clickhouse_test" =~ "not running" ]] || [[ "$clickhouse_test" =~ "error" ]]; then
+        log_error "ClickHouse is not accessible: $clickhouse_test"
+        return 1
+    fi
+    
+    # Check if table exists
+    local table_check
+    table_check=$(query_clickhouse "EXISTS opa.spans_min" 2>&1)
+    if [[ $? -ne 0 ]] || [[ "$table_check" =~ "0" ]]; then
+        log_warn "Table opa.spans_min may not exist. Checking for any spans table..."
+        local any_table
+        any_table=$(query_clickhouse "SHOW TABLES FROM opa" 2>&1)
+        if [[ "$VERBOSE" -eq 1 ]] || [[ "$CI_MODE" -eq 1 ]]; then
+            log_info "Available tables in opa database: $any_table"
+        fi
+    fi
+    
+    local max_attempts=30
     local attempt=0
     
     while [[ $attempt -lt $max_attempts ]]; do
         local trace_id=""
         local query_result
-        query_result=$(query_clickhouse "SELECT trace_id FROM opa.spans_min WHERE service = 'curl-ci-test' ORDER BY start_ts DESC LIMIT 1")
+        query_result=$(query_clickhouse "SELECT trace_id FROM opa.spans_min WHERE service = 'curl-ci-test' ORDER BY start_ts DESC LIMIT 1" 2>&1)
+        local query_exit=$?
         
-        if [[ $? -eq 0 ]] && [[ -n "$query_result" ]] && [[ ! "$query_result" =~ "not running" ]]; then
+        if [[ "$VERBOSE" -eq 1 ]] && [[ $attempt -eq 0 ]]; then
+            log_info "Query result (service filter): $query_result"
+        fi
+        
+        if [[ $query_exit -eq 0 ]] && [[ -n "$query_result" ]] && [[ ! "$query_result" =~ "not running" ]] && [[ ! "$query_result" =~ "error" ]] && [[ ! "$query_result" =~ "Exception" ]]; then
             trace_id=$(echo "$query_result" | tr -d '\n\r ' | head -1)
         fi
         
         if [[ -z "${trace_id:-}" ]] || [[ "${trace_id:-}" == "" ]] || [[ "${trace_id:-}" == "null" ]]; then
-            query_result=$(query_clickhouse "SELECT trace_id FROM opa.spans_min WHERE start_ts > now() - INTERVAL 2 MINUTE ORDER BY start_ts DESC LIMIT 1")
-            if [[ $? -eq 0 ]] && [[ -n "$query_result" ]] && [[ ! "$query_result" =~ "not running" ]]; then
+            # Try without service filter
+            query_result=$(query_clickhouse "SELECT trace_id FROM opa.spans_min WHERE start_ts > now() - INTERVAL 2 MINUTE ORDER BY start_ts DESC LIMIT 1" 2>&1)
+            query_exit=$?
+            
+            if [[ "$VERBOSE" -eq 1 ]] && [[ $attempt -eq 0 ]]; then
+                log_info "Query result (time filter): $query_result"
+            fi
+            
+            if [[ $query_exit -eq 0 ]] && [[ -n "$query_result" ]] && [[ ! "$query_result" =~ "not running" ]] && [[ ! "$query_result" =~ "error" ]] && [[ ! "$query_result" =~ "Exception" ]]; then
                 trace_id=$(echo "$query_result" | tr -d '\n\r ' | head -1)
+            fi
+        fi
+        
+        # Also try checking total span count for debugging
+        if [[ -z "${trace_id:-}" ]] && [[ $attempt -eq 5 ]]; then
+            local span_count
+            span_count=$(query_clickhouse "SELECT count() FROM opa.spans_min WHERE start_ts > now() - INTERVAL 2 MINUTE" 2>&1)
+            if [[ "$VERBOSE" -eq 1 ]] || [[ "$CI_MODE" -eq 1 ]]; then
+                log_info "Total spans in last 2 minutes: $span_count"
             fi
         fi
         
@@ -328,11 +401,18 @@ wait_for_trace() {
         ((attempt++)) || true
         if [[ "$VERBOSE" -eq 1 ]]; then
             echo -n "."
+        elif [[ "$CI_MODE" -eq 1 ]] && [[ $((attempt % 5)) -eq 0 ]]; then
+            echo -n "."
         fi
     done
     
-    if [[ "$VERBOSE" -eq 1 ]]; then
+    if [[ "$VERBOSE" -eq 1 ]] || [[ "$CI_MODE" -eq 1 ]]; then
         echo ""
+        log_error "Failed to find trace after $max_attempts attempts"
+        log_info "Checking for any recent traces..."
+        local recent_traces
+        recent_traces=$(query_clickhouse "SELECT trace_id, service, start_ts FROM opa.spans_min WHERE start_ts > now() - INTERVAL 5 MINUTE ORDER BY start_ts DESC LIMIT 5" 2>&1)
+        log_info "Recent traces: $recent_traces"
     fi
     return 1
 }
@@ -483,6 +563,20 @@ main() {
     
     echo ""
     log_info "Waiting for trace to be stored..."
+    
+    # First, check if agent has received traces via API
+    if [[ "$VERBOSE" -eq 1 ]] || [[ "$CI_MODE" -eq 1 ]]; then
+        log_info "Checking agent for recent traces..."
+        local agent_traces
+        agent_traces=$(curl -sf "${API_URL}/api/traces?limit=5" 2>/dev/null || echo "")
+        if [[ -n "$agent_traces" ]]; then
+            local trace_count
+            trace_count=$(echo "$agent_traces" | jq 'length' 2>/dev/null || echo "0")
+            log_info "Agent has $trace_count trace(s) available via API"
+        else
+            log_warn "Could not fetch traces from agent API"
+        fi
+    fi
     
     # Wait for trace
     local trace_id

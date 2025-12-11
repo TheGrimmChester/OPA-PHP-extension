@@ -2,6 +2,9 @@
 #include "serialize.h"
 #include "transport.h"
 
+// External reference to global collector
+extern opa_collector_t *global_collector;
+
 // Store original error and exception handlers
 static zend_error_handling_t original_error_handling;
 static zend_fcall_info_cache *original_exception_handler = NULL;
@@ -127,10 +130,289 @@ static char* serialize_stack_trace(zval *trace) {
     return empty_array;
 }
 
+// Structure to hold error context
+typedef struct {
+    char *http_request_json;  // HTTP request from root span (malloc'd)
+    char *tags_json;          // Tags from root span (malloc'd)
+    char *sql_queries_json;   // Aggregated SQL queries (malloc'd)
+    char *http_requests_json; // Aggregated HTTP requests (malloc'd)
+    char *environment;        // Environment name (malloc'd)
+    char *release;            // Release version (malloc'd)
+    char *user_context_json;  // User context (malloc'd)
+} error_context_t;
+
+// Free error context structure
+static void free_error_context(error_context_t *ctx) {
+    if (!ctx) return;
+    if (ctx->http_request_json) free(ctx->http_request_json);
+    if (ctx->tags_json) free(ctx->tags_json);
+    if (ctx->sql_queries_json) free(ctx->sql_queries_json);
+    if (ctx->http_requests_json) free(ctx->http_requests_json);
+    if (ctx->environment) free(ctx->environment);
+    if (ctx->release) free(ctx->release);
+    if (ctx->user_context_json) free(ctx->user_context_json);
+}
+
+// Aggregate SQL queries from call stack (similar to span.c)
+static char* aggregate_sql_queries_for_error(void) {
+    if (!global_collector || global_collector->magic != OPA_COLLECTOR_MAGIC) {
+        return strdup("[]");
+    }
+    
+    smart_string json = {0};
+    smart_string_appends(&json, "[");
+    int first = 1;
+    
+    call_node_t *call = global_collector->calls;
+    while (call) {
+        if (call->magic == OPA_CALL_NODE_MAGIC && 
+            call->sql_queries && 
+            Z_TYPE_P(call->sql_queries) == IS_ARRAY &&
+            zend_hash_num_elements(Z_ARRVAL_P(call->sql_queries)) > 0) {
+            
+            HashTable *ht = Z_ARRVAL_P(call->sql_queries);
+            zval *val;
+            ZEND_HASH_FOREACH_VAL(ht, val) {
+                if (!first) {
+                    smart_string_appends(&json, ",");
+                }
+                serialize_zval_json(&json, val);
+                first = 0;
+            } ZEND_HASH_FOREACH_END();
+        }
+        call = call->next;
+    }
+    
+    smart_string_appends(&json, "]");
+    smart_string_0(&json);
+    
+    // Convert to malloc'd string
+    char *result = NULL;
+    if (json.c && json.len > 0) {
+        result = malloc(json.len + 1);
+        if (result) {
+            memcpy(result, json.c, json.len);
+            result[json.len] = '\0';
+        }
+    } else {
+        result = strdup("[]");
+    }
+    smart_string_free(&json);
+    
+    return result;
+}
+
+// Aggregate HTTP requests from call stack
+static char* aggregate_http_requests_for_error(void) {
+    if (!global_collector || global_collector->magic != OPA_COLLECTOR_MAGIC) {
+        return strdup("[]");
+    }
+    
+    smart_string json = {0};
+    smart_string_appends(&json, "[");
+    int first = 1;
+    
+    call_node_t *call = global_collector->calls;
+    while (call) {
+        if (call->magic == OPA_CALL_NODE_MAGIC && 
+            call->http_requests && 
+            Z_TYPE_P(call->http_requests) == IS_ARRAY &&
+            zend_hash_num_elements(Z_ARRVAL_P(call->http_requests)) > 0) {
+            
+            HashTable *ht = Z_ARRVAL_P(call->http_requests);
+            zval *val;
+            ZEND_HASH_FOREACH_VAL(ht, val) {
+                if (!first) {
+                    smart_string_appends(&json, ",");
+                }
+                serialize_zval_json(&json, val);
+                first = 0;
+            } ZEND_HASH_FOREACH_END();
+        }
+        call = call->next;
+    }
+    
+    smart_string_appends(&json, "]");
+    smart_string_0(&json);
+    
+    // Convert to malloc'd string
+    char *result = NULL;
+    if (json.c && json.len > 0) {
+        result = malloc(json.len + 1);
+        if (result) {
+            memcpy(result, json.c, json.len);
+            result[json.len] = '\0';
+        }
+    } else {
+        result = strdup("[]");
+    }
+    smart_string_free(&json);
+    
+    return result;
+}
+
+// Try to get user context from $_SESSION or common frameworks
+static char* collect_user_context(void) {
+    smart_string json = {0};
+    smart_string_appends(&json, "{");
+    int first = 1;
+    
+    // Try to access $_SESSION
+    zend_string *session_name = zend_string_init("_SESSION", sizeof("_SESSION")-1, 0);
+    zend_is_auto_global(session_name);
+    zend_string_release(session_name);
+    
+    // Access $_SESSION from symbol table (PHP 8.4 compatible)
+    zval *session = NULL;
+    zend_string *session_str = zend_string_init("_SESSION", sizeof("_SESSION")-1, 0);
+    session = zend_hash_find(&EG(symbol_table), session_str);
+    zend_string_release(session_str);
+    if (session && Z_TYPE_P(session) == IS_ARRAY) {
+        // Try common user fields
+        zval *user_id = zend_hash_str_find(Z_ARRVAL_P(session), "user_id", sizeof("user_id")-1);
+        if (!user_id) {
+            user_id = zend_hash_str_find(Z_ARRVAL_P(session), "userId", sizeof("userId")-1);
+        }
+        if (!user_id) {
+            user_id = zend_hash_str_find(Z_ARRVAL_P(session), "id", sizeof("id")-1);
+        }
+        
+        if (user_id && (Z_TYPE_P(user_id) == IS_STRING || Z_TYPE_P(user_id) == IS_LONG)) {
+            if (!first) smart_string_appends(&json, ",");
+            smart_string_appends(&json, "\"user_id\":");
+            if (Z_TYPE_P(user_id) == IS_STRING) {
+                smart_string_appends(&json, "\"");
+                json_escape_string(&json, Z_STRVAL_P(user_id), Z_STRLEN_P(user_id));
+                smart_string_appends(&json, "\"");
+            } else {
+                char id_str[64];
+                snprintf(id_str, sizeof(id_str), "%ld", Z_LVAL_P(user_id));
+                smart_string_appends(&json, id_str);
+            }
+            first = 0;
+        }
+        
+        // Try username
+        zval *username = zend_hash_str_find(Z_ARRVAL_P(session), "username", sizeof("username")-1);
+        if (!username) {
+            username = zend_hash_str_find(Z_ARRVAL_P(session), "userName", sizeof("userName")-1);
+        }
+        if (!username) {
+            username = zend_hash_str_find(Z_ARRVAL_P(session), "name", sizeof("name")-1);
+        }
+        
+        if (username && Z_TYPE_P(username) == IS_STRING) {
+            if (!first) smart_string_appends(&json, ",");
+            smart_string_appends(&json, "\"username\":\"");
+            json_escape_string(&json, Z_STRVAL_P(username), Z_STRLEN_P(username));
+            smart_string_appends(&json, "\"");
+            first = 0;
+        }
+        
+        // Try session_id from session array
+        zval *session_id_zv = zend_hash_str_find(Z_ARRVAL_P(session), "session_id", sizeof("session_id")-1);
+        if (!session_id_zv) {
+            session_id_zv = zend_hash_str_find(Z_ARRVAL_P(session), "PHPSESSID", sizeof("PHPSESSID")-1);
+        }
+        if (session_id_zv && Z_TYPE_P(session_id_zv) == IS_STRING && Z_STRLEN_P(session_id_zv) > 0) {
+            if (!first) smart_string_appends(&json, ",");
+            smart_string_appends(&json, "\"session_id\":\"");
+            json_escape_string(&json, Z_STRVAL_P(session_id_zv), Z_STRLEN_P(session_id_zv));
+            smart_string_appends(&json, "\"");
+            first = 0;
+        }
+    }
+    
+    smart_string_appends(&json, "}");
+    smart_string_0(&json);
+    
+    // Convert to malloc'd string
+    char *result = NULL;
+    if (json.c && json.len > 0) {
+        result = malloc(json.len + 1);
+        if (result) {
+            memcpy(result, json.c, json.len);
+            result[json.len] = '\0';
+        }
+    } else {
+        result = strdup("{}");
+    }
+    smart_string_free(&json);
+    
+    return result;
+}
+
+// Collect comprehensive error context
+static error_context_t* collect_error_context(void) {
+    error_context_t *ctx = calloc(1, sizeof(error_context_t));
+    if (!ctx) return NULL;
+    
+    // Get HTTP request from root span (already serialized JSON)
+    pthread_mutex_lock(&root_span_data_mutex);
+    if (root_span_http_request_json) {
+        ctx->http_request_json = strdup(root_span_http_request_json);
+    } else {
+        ctx->http_request_json = strdup("{}");
+    }
+    pthread_mutex_unlock(&root_span_data_mutex);
+    
+    // Get tags from root span (need to serialize if available)
+    // For now, set empty - tags are stored in span context which may not be accessible here
+    ctx->tags_json = strdup("{}");
+    
+    // Aggregate SQL queries from call stack
+    ctx->sql_queries_json = aggregate_sql_queries_for_error();
+    
+    // Aggregate HTTP requests from call stack
+    ctx->http_requests_json = aggregate_http_requests_for_error();
+    
+    // Get environment from INI or env var
+    const char *env = getenv("APP_ENV");
+    if (!env) env = getenv("ENVIRONMENT");
+    if (!env) env = getenv("SYMFONY_ENV");
+    if (!env) {
+        // Try to get from INI (would need to add INI setting)
+        env = "production"; // Default
+    }
+    ctx->environment = strdup(env);
+    
+    // Get release from env var
+    const char *release = getenv("APP_VERSION");
+    if (!release) release = getenv("RELEASE");
+    if (!release) release = getenv("VERSION");
+    if (!release) release = getenv("SYMFONY_VERSION");
+    if (!release) {
+        release = ""; // Default empty
+    }
+    ctx->release = strdup(release);
+    
+    // Try to collect user context
+    ctx->user_context_json = collect_user_context();
+    
+    return ctx;
+}
+
 // Send error to agent (exported for use from opa_api.c)
-void send_error_to_agent(int error_type, const char *error_message, const char *file, int line, zval *stack_trace) {
+// exception_code: NULL for regular errors, pointer to int for exceptions
+void send_error_to_agent(int error_type, const char *error_message, const char *file, int line, zval *stack_trace, int *exception_code) {
     if (!OPA_G(enabled)) {
         return;
+    }
+    
+    // Collect error context
+    error_context_t *ctx = collect_error_context();
+    if (!ctx) {
+        // If context collection fails, continue with basic error info
+        ctx = calloc(1, sizeof(error_context_t));
+        if (ctx) {
+            ctx->http_request_json = strdup("{}");
+            ctx->tags_json = strdup("{}");
+            ctx->sql_queries_json = strdup("[]");
+            ctx->http_requests_json = strdup("[]");
+            ctx->environment = strdup("production");
+            ctx->release = strdup("");
+            ctx->user_context_json = strdup("{}");
+        }
     }
     
     // Get current trace/span IDs
@@ -203,6 +485,52 @@ void send_error_to_agent(int error_type, const char *error_message, const char *
         efree(stack_trace_json);
     }
     
+    // Add exception code if provided
+    if (exception_code && *exception_code != 0) {
+        char code_str[32];
+        snprintf(code_str, sizeof(code_str), "%d", *exception_code);
+        smart_string_appends(&json, ",\"exception_code\":");
+        smart_string_appends(&json, code_str);
+    }
+    
+    // Add context fields
+    if (ctx && ctx->http_request_json) {
+        smart_string_appends(&json, ",\"http_request\":");
+        smart_string_appends(&json, ctx->http_request_json);
+    }
+    
+    if (ctx && ctx->tags_json) {
+        smart_string_appends(&json, ",\"tags\":");
+        smart_string_appends(&json, ctx->tags_json);
+    }
+    
+    if (ctx && ctx->sql_queries_json) {
+        smart_string_appends(&json, ",\"sql_queries\":");
+        smart_string_appends(&json, ctx->sql_queries_json);
+    }
+    
+    if (ctx && ctx->http_requests_json) {
+        smart_string_appends(&json, ",\"http_requests\":");
+        smart_string_appends(&json, ctx->http_requests_json);
+    }
+    
+    if (ctx && ctx->environment) {
+        smart_string_appends(&json, ",\"environment\":\"");
+        json_escape_string(&json, ctx->environment, strlen(ctx->environment));
+        smart_string_appends(&json, "\"");
+    }
+    
+    if (ctx && ctx->release) {
+        smart_string_appends(&json, ",\"release\":\"");
+        json_escape_string(&json, ctx->release, strlen(ctx->release));
+        smart_string_appends(&json, "\"");
+    }
+    
+    if (ctx && ctx->user_context_json) {
+        smart_string_appends(&json, ",\"user_context\":");
+        smart_string_appends(&json, ctx->user_context_json);
+    }
+    
     // Add metadata
     smart_string_appends(&json, ",\"organization_id\":\"");
     if (OPA_G(organization_id)) {
@@ -233,6 +561,12 @@ void send_error_to_agent(int error_type, const char *error_message, const char *
     
     smart_string_appends(&json, "}");
     smart_string_0(&json);
+    
+    // Free context
+    if (ctx) {
+        free_error_context(ctx);
+        free(ctx);
+    }
     
     if (json.c && json.len > 0) {
         char *msg = emalloc(json.len + 1);
@@ -296,11 +630,21 @@ static void opa_track_error_via_shutdown(void) {
             ZVAL_UNDEF(&trace);
             zend_call_method_with_0_params(Z_OBJ_P(error), Z_OBJCE_P(error), NULL, "gettrace", &trace);
             
-            send_error_to_agent(error_type, error_message, file, line, &trace);
+            // Get exception code
+            zval code_zv;
+            ZVAL_UNDEF(&code_zv);
+            zend_call_method_with_0_params(Z_OBJ_P(error), Z_OBJCE_P(error), NULL, "getcode", &code_zv);
+            int exception_code = 0;
+            if (Z_TYPE(code_zv) == IS_LONG) {
+                exception_code = (int)Z_LVAL(code_zv);
+            }
+            
+            send_error_to_agent(error_type, error_message, file, line, &trace, &exception_code);
             
             if (Z_TYPE(message_zv) != IS_UNDEF) zval_ptr_dtor(&message_zv);
             if (Z_TYPE(file_zv) != IS_UNDEF) zval_ptr_dtor(&file_zv);
             if (Z_TYPE(line_zv) != IS_UNDEF) zval_ptr_dtor(&line_zv);
+            if (Z_TYPE(code_zv) != IS_UNDEF) zval_ptr_dtor(&code_zv);
             if (Z_TYPE(trace) != IS_UNDEF) zval_ptr_dtor(&trace);
         }
     }
@@ -360,7 +704,13 @@ static void opa_exception_handler(zval *exception) {
     ZVAL_UNDEF(&trace_array);
     zend_call_method_with_0_params(Z_OBJ_P(exception), Z_OBJCE_P(exception), NULL, "gettrace", &trace_array);
     
-    send_error_to_agent(E_ERROR, error_message, file, line, &trace_array);
+    // Extract exception code
+    int exception_code = 0;
+    if (Z_TYPE(code_zv) == IS_LONG) {
+        exception_code = (int)Z_LVAL(code_zv);
+    }
+    
+    send_error_to_agent(E_ERROR, error_message, file, line, &trace_array, &exception_code);
     
     // Cleanup
     if (Z_TYPE(message_zv) != IS_UNDEF) zval_ptr_dtor(&message_zv);
