@@ -47,10 +47,10 @@ The easiest way to use the extension is via Docker:
 
 ```bash
 # Build the Docker image
-docker-compose build
+docker-compose -f docker/compose/docker-compose.yaml build
 
 # Or build with a specific PHP version
-docker build --build-arg PHP_VERSION=8.4 -t my-php-app .
+docker build --build-arg PHP_VERSION=8.4 -f docker/Dockerfile -t my-php-app .
 ```
 
 ### Manual Build
@@ -76,6 +76,9 @@ phpize
 ./configure --enable-opa
 make
 sudo make install
+
+# Or use the build script
+./scripts/build.sh [PHP_VERSION]
 ```
 
 3. **Enable the extension**:
@@ -360,16 +363,16 @@ The extension includes comprehensive end-to-end tests:
 
 ```bash
 # SQL profiling tests
-./test_sql_ci_e2e.sh
+./tests/e2e/sql/test_sql_ci_e2e.sh
 
 # cURL profiling tests
-./test_curl_ci_e2e.sh
+./tests/e2e/curl/test_curl_ci_e2e.sh
 
 # Error tracking tests
-./test_errors_e2e.sh
+./tests/e2e/errors/test_errors_e2e.sh
 
 # All tests
-./test_errors_all.sh
+./tests/e2e/errors/test_errors_all.sh
 ```
 
 ### Test Requirements
@@ -379,7 +382,7 @@ The extension includes comprehensive end-to-end tests:
 - Running OpenProfilingAgent and ClickHouse services
 - MySQL 8.0+ (for SQL tests)
 
-See [README_TESTS.md](README_TESTS.md) for detailed testing documentation.
+See [docs/tests/README.md](docs/tests/README.md) for detailed testing documentation.
 
 ## Development
 
@@ -489,9 +492,9 @@ php -r "echo 'OK';"
 
 ## Related Documentation
 
-- [RUNTIME_CONFIGURATION.md](RUNTIME_CONFIGURATION.md) - Detailed configuration guide
-- [DEBUGGING.md](DEBUGGING.md) - Debugging and core dump analysis
-- [README_TESTS.md](README_TESTS.md) - Testing documentation
+- [docs/RUNTIME_CONFIGURATION.md](docs/RUNTIME_CONFIGURATION.md) - Detailed configuration guide
+- [docs/DEBUGGING.md](docs/DEBUGGING.md) - Debugging and core dump analysis
+- [docs/tests/README.md](docs/tests/README.md) - Testing documentation
 
 ## License
 

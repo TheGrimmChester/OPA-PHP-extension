@@ -1,0 +1,137 @@
+# Debug Dockerfile with gdb and core dump debugging tools
+FROM php:8.4-fpm
+
+# Install build dependencies and debugging tools
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    gdb \
+    gdb-multiarch \
+    valgrind \
+    strace \
+    ltrace \
+    libcurl4-openssl-dev \
+    libzip-dev \
+    libicu-dev \
+    libonig-dev \
+    libxml2-dev \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install PHP development tools
+RUN docker-php-ext-install -j$(nproc) \
+    pdo_mysql \
+    mysqli \
+    zip \
+    intl \
+    opcache
+
+# Enable core dumps
+RUN echo "kernel.core_pattern=/var/log/core-dumps/core.%e.%p.%t" >> /etc/sysctl.conf && \
+    echo "* soft core unlimited" >> /etc/security/limits.conf && \
+    echo "* hard core unlimited" >> /etc/security/limits.conf && \
+    mkdir -p /var/log/core-dumps && \
+    chmod 777 /var/log/core-dumps
+
+# Set working directory
+WORKDIR /usr/src/opa
+
+# Copy extension source
+COPY . /usr/src/opa/
+
+# Build the extension with debug symbols
+RUN phpize && \
+    ./configure --enable-opa CFLAGS="-g -O0" && \
+    make CFLAGS="-g -O0" && \
+    EXT_DIR=$(php-config --extension-dir) && \
+    cp modules/opa.so $EXT_DIR/opa.so
+
+# Create gdb init script for PHP debugging
+RUN echo "set pagination off\n\
+set print pretty on\n\
+set print elements 0\n\
+set print null-stop on\n\
+define zval_print\n\
+  printf \"zval at %p:\\n\", \$arg0\n\
+  printf \"  type: %d\\n\", ((\$arg0)->u1).v.type\n\
+  printf \"  value: %p\\n\", ((\$arg0)->u1).v.value\n\
+end\n\
+define execute_data_print\n\
+  printf \"execute_data at %p:\\n\", \$arg0\n\
+  printf \"  func: %p\\n\", ((\$arg0)->func)\n\
+  if ((\$arg0)->func)\n\
+    printf \"  func->type: %d\\n\", ((\$arg0)->func->type)\n\
+    if ((\$arg0)->func->common.function_name)\n\
+      printf \"  func->common.function_name: %s\\n\", ((\$arg0)->func->common.function_name)->val\n\
+    end\n\
+  end\n\
+end\n" > /root/.gdbinit
+
+# Create helper script for debugging core dumps
+RUN echo '#!/bin/bash\n\
+# Debug core dump helper script\n\
+# Usage: debug_core.sh [core_file] [php_binary]\n\
+\n\
+CORE_FILE=${1:-/var/log/core-dumps/core.*}\n\
+PHP_BINARY=${2:-/usr/local/bin/php}\n\
+\n\
+if [ ! -f "$CORE_FILE" ] && [ -d /var/log/core-dumps ]; then\n\
+    CORE_FILE=$(ls -t /var/log/core-dumps/core.* 2>/dev/null | head -1)\n\
+fi\n\
+\n\
+if [ ! -f "$CORE_FILE" ]; then\n\
+    echo "No core dump found. Looking for core dumps in /var/log/core-dumps/..."\n\
+    ls -lah /var/log/core-dumps/ 2>/dev/null || echo "No core dumps directory found"\n\
+    exit 1\n\
+fi\n\
+\n\
+echo "=== Core Dump Analysis ==="\n\
+echo "Core file: $CORE_FILE"\n\
+echo "PHP binary: $PHP_BINARY"\n\
+echo ""\n\
+\n\
+echo "=== Backtrace ==="\n\
+gdb -batch -ex "file $PHP_BINARY" -ex "core-file $CORE_FILE" -ex "bt" -ex "info registers" -ex "quit" 2>&1\n\
+\n\
+echo ""\n\
+echo "=== Thread Info ==="\n\
+gdb -batch -ex "file $PHP_BINARY" -ex "core-file $CORE_FILE" -ex "info threads" -ex "thread apply all bt" -ex "quit" 2>&1\n\
+\n\
+echo ""\n\
+echo "=== Memory Map ==="\n\
+gdb -batch -ex "file $PHP_BINARY" -ex "core-file $CORE_FILE" -ex "info proc mappings" -ex "quit" 2>&1 | head -50\n\
+' > /usr/local/bin/debug_core.sh && chmod +x /usr/local/bin/debug_core.sh
+
+# Create helper script for interactive debugging
+RUN echo '#!/bin/bash\n\
+# Interactive gdb debugging helper\n\
+# Usage: debug_interactive.sh [php_script]\n\
+\n\
+PHP_SCRIPT=${1:-/app/tests/e2e/curl/curl_profiling_test.php}\n\
+PHP_BINARY=/usr/local/bin/php\n\
+\n\
+echo "=== Starting interactive gdb session ==="\n\
+echo "PHP script: $PHP_SCRIPT"\n\
+echo "PHP binary: $PHP_BINARY"\n\
+echo ""\n\
+echo "Useful gdb commands:"\n\
+echo "  bt              - Show backtrace"\n\
+echo "  frame N         - Switch to frame N"\n\
+echo "  print var       - Print variable"\n\
+echo "  info locals     - Show local variables"\n\
+echo "  info args       - Show function arguments"\n\
+echo "  execute_data_print <ptr> - Print execute_data structure"\n\
+echo "  zval_print <ptr> - Print zval structure"\n\
+echo "  break opa_execute_ex - Set breakpoint in opa_execute_ex"\n\
+echo "  break is_curl_call - Set breakpoint in is_curl_call"\n\
+echo ""\n\
+\n\
+gdb -ex "file $PHP_BINARY" -ex "run $PHP_SCRIPT" --args $PHP_BINARY $PHP_SCRIPT\n\
+' > /usr/local/bin/debug_interactive.sh && chmod +x /usr/local/bin/debug_interactive.sh
+
+# Set environment variables for debugging
+ENV PHP_OPCACHE_ENABLE=0
+ENV PHP_OPCACHE_VALIDATE_TIMESTAMPS=1
+
+WORKDIR /var/www/html
+

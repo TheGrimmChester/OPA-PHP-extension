@@ -6,20 +6,20 @@ on:
     paths:
       - '**/*.c'
       - '**/*.h'
-      - 'Dockerfile*'
-      - 'docker-compose*.yml'
-      - 'test_errors*.sh'
-      - 'tests/test_errors*.php'
+      - 'docker/Dockerfile*'
+      - 'docker/compose/*.yml'
+      - 'tests/e2e/errors/*.sh'
+      - 'tests/e2e/errors/*.php'
       - '.github/workflows/test-errors-e2e.yml'
   pull_request:
     branches: [ main, develop ]
     paths:
       - '**/*.c'
       - '**/*.h'
-      - 'Dockerfile*'
-      - 'docker-compose*.yml'
-      - 'test_errors*.sh'
-      - 'tests/test_errors*.php'
+      - 'docker/Dockerfile*'
+      - 'docker/compose/*.yml'
+      - 'tests/e2e/errors/*.sh'
+      - 'tests/e2e/errors/*.php'
       - '.github/workflows/test-errors-e2e.yml'
   workflow_dispatch:
 
@@ -128,7 +128,7 @@ jobs:
             echo "Published images not found, building from agent repository"
             git clone --depth 1 https://github.com/TheGrimmChester/OPA-Agent.git agent-repo || exit 1
             cd agent-repo
-            if [ ! -f Dockerfile ]; then
+            if [ ! -f docker/Dockerfile ]; then
               echo "ERROR: Dockerfile not found in agent repository"
               exit 1
             fi
@@ -292,7 +292,7 @@ jobs:
       - name: Build PHP extension image
         run: |
           echo "Building PHP extension for PHP ${{ matrix.php_version }}"
-          docker build --no-cache --build-arg PHP_VERSION=${{ matrix.php_version }} -t php-extension-test .
+          docker build --no-cache --build-arg PHP_VERSION=${{ matrix.php_version }} -f docker/Dockerfile -t php-extension-test .
       
       - name: Install dependencies
         run: |
@@ -341,13 +341,13 @@ jobs:
           CLICKHOUSE_HTTP_PORT: 8123
           SERVICE_NAME: error-ci-test
         run: |
-          chmod +x test_errors_ci_e2e.sh
-          ./test_errors_ci_e2e.sh --ci
+          chmod +x tests/e2e/errors/test_errors_ci_e2e.sh
+          ./tests/e2e/errors/test_errors_ci_e2e.sh --ci
       
       - name: Cleanup
         if: always()
         run: |
-          docker compose -f docker-compose.test.yml down || true
+          docker compose -f docker/compose/docker-compose.test.yml down || true
           docker stop opa-agent || true
           docker rm opa-agent || true
           docker network rm opa_network || true

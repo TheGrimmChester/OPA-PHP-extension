@@ -6,9 +6,9 @@ on:
     paths:
       - '**/*.c'
       - '**/*.h'
-      - 'Dockerfile*'
-      - 'docker-compose*.yml'
-      - 'test_curl*.sh'
+      - 'docker/Dockerfile*'
+      - 'docker/compose/*.yml'
+      - 'tests/e2e/curl/*.sh'
       - 'test_http_mock_server.py'
       - '.github/workflows/test-curl-e2e.yml'
   pull_request:
@@ -16,9 +16,9 @@ on:
     paths:
       - '**/*.c'
       - '**/*.h'
-      - 'Dockerfile*'
-      - 'docker-compose*.yml'
-      - 'test_curl*.sh'
+      - 'docker/Dockerfile*'
+      - 'docker/compose/*.yml'
+      - 'tests/e2e/curl/*.sh'
       - 'test_http_mock_server.py'
       - '.github/workflows/test-curl-e2e.yml'
   workflow_dispatch:
@@ -100,7 +100,7 @@ jobs:
       
       - name: Build PHP extension image
         run: |
-          docker build --no-cache -t php-extension-test .
+          docker build --no-cache -f docker/Dockerfile -t php-extension-test .
       
       - name: Install dependencies
         run: |
@@ -113,13 +113,13 @@ jobs:
           API_URL: http://localhost:8081
           PROJECT_ROOT: ${{ github.workspace }}/..
         run: |
-          chmod +x test_curl_ci_e2e.sh test_http_mock_server.py
-          ./test_curl_ci_e2e.sh --ci
+          chmod +x tests/e2e/curl/test_curl_ci_e2e.sh tests/e2e/helpers/test_http_mock_server.py
+          ./tests/e2e/curl/test_curl_ci_e2e.sh --ci
       
       - name: Cleanup
         if: always()
         run: |
-          docker-compose -f docker-compose.test.yml down || true
+          docker-compose -f docker/compose/docker-compose.test.yml down || true
           docker stop opa-agent || true
           docker rm opa-agent || true
           docker network rm opa_network || true
