@@ -1,0 +1,98 @@
+ARG PHP_VERSION=8.4
+FROM php:${PHP_VERSION}-fpm
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    autoconf \
+    gcc \
+    make \
+    libtool \
+    pkg-config \
+    liblz4-dev \
+    libpthread-stubs0-dev \
+    gdb \
+    default-mysql-client \
+    libmariadb-dev \
+    curl \
+    wget \
+    jq \
+    bash \
+    netcat-openbsd \
+    docker.io \
+    docker-compose \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Composer (latest version compatible with PHP 8.4)
+# Use wget to download directly, avoiding cURL interception issues
+RUN wget -q -O /tmp/composer-setup.php https://getcomposer.org/installer && \
+    php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer --quiet && \
+    rm /tmp/composer-setup.php && \
+    chmod +x /usr/local/bin/composer && \
+    composer --version || \
+    (echo "Composer installer failed, trying direct download..." && \
+     wget -q -O /usr/local/bin/composer https://getcomposer.org/download/latest-stable/composer.phar && \
+     chmod +x /usr/local/bin/composer && \
+     composer --version)
+
+# Install PHP extensions
+RUN docker-php-ext-install sockets mysqli pdo pdo_mysql
+
+# Install APCu extension
+RUN pecl install apcu && \
+    docker-php-ext-enable apcu
+
+# Install Redis extension
+RUN pecl install redis || echo "Warning: Redis extension installation failed, continuing..." && \
+    (docker-php-ext-enable redis || echo "Warning: Redis extension not available")
+
+WORKDIR /usr/src/opa
+
+# Copy extension source
+COPY config.m4 configure.ac /usr/src/opa/
+COPY src/ /usr/src/opa/src/
+
+# Build and install extension
+RUN phpize && \
+    ./configure --enable-opa && \
+    make && \
+    EXT_DIR=$(php-config --extension-dir) && \
+    cp modules/opa.so $EXT_DIR/opa.so
+
+# Configure OPA extension (DISABLED by default - extension not loaded)
+# Comment out extension loading to completely disable OPA
+RUN echo ";extension=opa.so" > /usr/local/etc/php/conf.d/opa.ini && \
+    echo "opa.enabled=0" >> /usr/local/etc/php/conf.d/opa.ini && \
+    echo "opa.socket_path=/var/run/opa.sock" >> /usr/local/etc/php/conf.d/opa.ini && \
+    echo "opa.sampling_rate=1.0" >> /usr/local/etc/php/conf.d/opa.ini && \
+    echo "opa.debug_log=0" >> /usr/local/etc/php/conf.d/opa.ini && \
+    echo "opa.expand_spans=0" >> /usr/local/etc/php/conf.d/opa.ini && \
+    echo "memory_limit=1G" >> /usr/local/etc/php/conf.d/opa.ini
+
+# Configure APCu
+RUN echo "apc.enabled=1" >> /usr/local/etc/php/conf.d/apcu.ini && \
+    echo "apc.shm_size=64M" >> /usr/local/etc/php/conf.d/apcu.ini && \
+    echo "apc.ttl=3600" >> /usr/local/etc/php/conf.d/apcu.ini
+
+# Create directories
+RUN mkdir -p /var/run && \
+    mkdir -p /app/tests && \
+    mkdir -p /var/log/php-fpm && \
+    mkdir -p /var/log/core-dumps && \
+    chmod 777 /var/log/core-dumps && \
+    chown -R www-data:www-data /var/log/core-dumps || true
+
+# Configure PHP-FPM to enable core dumps and set memory limit
+# Note: rlimit_core must be set before user/group in www.conf
+RUN sed -i '/^\[www\]/a rlimit_core = unlimited' /usr/local/etc/php-fpm.d/www.conf && \
+    echo "php_admin_value[error_log] = /var/log/php-fpm/error.log" >> /usr/local/etc/php-fpm.d/www.conf && \
+    echo "php_admin_flag[log_errors] = on" >> /usr/local/etc/php-fpm.d/www.conf && \
+    echo "catch_workers_output = yes" >> /usr/local/etc/php-fpm.d/www.conf && \
+    echo "php_admin_value[memory_limit] = -1" >> /usr/local/etc/php-fpm.d/www.conf
+
+# Set working directory
+WORKDIR /app
+
+# Default command (can be overridden)
+CMD ["bash"]
+

@@ -13,7 +13,7 @@ set -euo pipefail
 #   TEST_URL: URL to test with (default: https://aisenseapi.com/services/v1/ping)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"" && pwd)}"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
 PHP_EXTENSION_DIR="${PROJECT_ROOT}"
 
 # Configuration

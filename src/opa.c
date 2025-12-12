@@ -438,10 +438,11 @@ char* serialize_http_request_json_universal(void) {
                     query,
                     remote_zv && Z_TYPE_P(remote_zv) == IS_STRING ? Z_STRVAL_P(remote_zv) : "unknown");
                 
-                // Add request_size if > 0
-                if (request_size > 0) {
-                    pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_size\":%zu", request_size);
-                }
+                // Always add request_size (even if 0, for debugging)
+                pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_size\":%zu", request_size);
+                // Also add breakdown for debugging
+                pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_size_breakdown\":{\"body\":%zu,\"query\":%zu,\"files\":%zu,\"headers\":%zu}",
+                    body_size, query_len, file_size, header_size);
                 
                 snprintf(buf + pos, sizeof(buf) - pos, "}");
                 
@@ -473,10 +474,11 @@ char* serialize_http_request_json_universal(void) {
          "\"source\":\"SAPI\"",
         method, uri, query);
     
-    // Add request_size if > 0
-    if (request_size > 0) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_size\":%zu", request_size);
-    }
+    // Always add request_size (even if 0, for debugging)
+    pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_size\":%zu", request_size);
+    // Also add breakdown for debugging
+    pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_size_breakdown\":{\"body\":%zu,\"query\":%zu,\"files\":0,\"headers\":%zu}",
+        body_size, query_len, header_size);
     
     snprintf(buf + pos, sizeof(buf) - pos, "}");
     
@@ -648,23 +650,24 @@ char* serialize_http_request_json(zval *server) {
     // Calculate total request size
     request_size = body_size + query_size + file_size + header_size;
     
-    // Add request_size field to JSON
-    if (request_size > 0) {
-        // Check if we have enough buffer space, if not, realloc
-        size_t size_str_len = 64; // Enough for size_t as string
-        if (pos + size_str_len >= buf_size) {
-            size_t new_size = buf_size * 2 + size_str_len;
-            char *new_result = realloc(result, new_size);
-            if (new_result) {
-                result = new_result;
-                buf_size = new_size;
-            }
+    // Always add request_size field to JSON (even if 0, for debugging)
+    // Check if we have enough buffer space, if not, realloc
+    size_t size_str_len = 64; // Enough for size_t as string
+    if (pos + size_str_len >= buf_size) {
+        size_t new_size = buf_size * 2 + size_str_len;
+        char *new_result = realloc(result, new_size);
+        if (new_result) {
+            result = new_result;
+            buf_size = new_size;
         }
-        if (result && (pos + size_str_len < buf_size)) {
-            char size_str[64];
-            snprintf(size_str, sizeof(size_str), "%zu", request_size);
-            pos += snprintf(result + pos, buf_size - pos, ",\"request_size\":%s", size_str);
-        }
+    }
+    if (result && (pos + size_str_len < buf_size)) {
+        char size_str[64];
+        snprintf(size_str, sizeof(size_str), "%zu", request_size);
+        pos += snprintf(result + pos, buf_size - pos, ",\"request_size\":%s", size_str);
+        // Also add breakdown for debugging
+        pos += snprintf(result + pos, buf_size - pos, ",\"request_size_breakdown\":{\"body\":%zu,\"query\":%zu,\"files\":%zu,\"headers\":%zu}",
+            body_size, query_size, file_size, header_size);
     }
     
     snprintf(result + pos, buf_size - pos, "}");
@@ -849,14 +852,59 @@ char* serialize_http_response_json(void) {
     // Calculate total response size
     response_size = body_size + header_size;
     
-    // Add response_size field to JSON
-    if (response_size > 0) {
-        if (!first) smart_string_appends(&json, ",");
-        char size_str[64];
-        snprintf(size_str, sizeof(size_str), "%zu", response_size);
-        smart_string_appends(&json, "\"response_size\":");
-        smart_string_appends(&json, size_str);
-        first = 0;
+    // Always add response_size field to JSON (even if 0, for debugging)
+    if (!first) smart_string_appends(&json, ",");
+    char size_str[64];
+    snprintf(size_str, sizeof(size_str), "%zu", response_size);
+    smart_string_appends(&json, "\"response_size\":");
+    smart_string_appends(&json, size_str);
+    first = 0;
+    
+    // Also add breakdown for debugging
+    if (!first) smart_string_appends(&json, ",");
+    char body_size_str[64], header_size_str[64];
+    snprintf(body_size_str, sizeof(body_size_str), "%zu", body_size);
+    snprintf(header_size_str, sizeof(header_size_str), "%zu", header_size);
+    smart_string_appends(&json, "\"response_size_breakdown\":{\"body\":");
+    smart_string_appends(&json, body_size_str);
+    smart_string_appends(&json, ",\"headers\":");
+    smart_string_appends(&json, header_size_str);
+    smart_string_appends(&json, "}");
+    first = 0;
+    
+    // Optionally add response body content if ob_get_contents is available
+    // Note: This is disabled by default - can be enabled via INI setting if needed
+    // For now, we'll try to get it if output buffering is active
+    zend_function *ob_get_contents_func = zend_hash_str_find_ptr(EG(function_table), "ob_get_contents", sizeof("ob_get_contents") - 1);
+    if (ob_get_contents_func && body_size > 0 && body_size < 10240) { // Only for small responses (< 10KB)
+        zval ob_get_contents_func_zv, ob_get_contents_ret;
+        ZVAL_UNDEF(&ob_get_contents_func_zv);
+        ZVAL_UNDEF(&ob_get_contents_ret);
+        
+        ZVAL_STRING(&ob_get_contents_func_zv, "ob_get_contents");
+        
+        zend_fcall_info fci;
+        zend_fcall_info_cache fcc;
+        if (zend_fcall_info_init(&ob_get_contents_func_zv, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
+            fci.size = sizeof(fci);
+            ZVAL_UNDEF(&fci.function_name);
+            fci.object = NULL;
+            fci.param_count = 0;
+            fci.params = NULL;
+            fci.retval = &ob_get_contents_ret;
+            
+            if (zend_call_function(&fci, &fcc) == SUCCESS) {
+                if (Z_TYPE(ob_get_contents_ret) == IS_STRING && Z_STRLEN(ob_get_contents_ret) > 0) {
+                    if (!first) smart_string_appends(&json, ",");
+                    smart_string_appends(&json, "\"body\":\"");
+                    json_escape_string(&json, Z_STRVAL(ob_get_contents_ret), Z_STRLEN(ob_get_contents_ret));
+                    smart_string_appends(&json, "\"");
+                    first = 0;
+                }
+                zval_dtor(&ob_get_contents_ret);
+            }
+        }
+        zval_dtor(&ob_get_contents_func_zv);
     }
     
     smart_string_appends(&json, "}");
@@ -2107,6 +2155,18 @@ void opa_execute_ex(zend_execute_data *execute_data) {
                                 response_size = (size_t)Z_LVAL_P(size_val);
                             }
                             
+                            // Update global network byte counters with actual values from cURL
+                            if (request_size > 0) {
+                                add_bytes_sent(request_size);
+                            }
+                            if (response_size > 0) {
+                                add_bytes_received(response_size);
+                            }
+                            
+                            // Update curl_bytes_sent and curl_bytes_received with actual sizes
+                            curl_bytes_sent = request_size;
+                            curl_bytes_received = response_size;
+                            
                             // Get timing information
                             zval *dns_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "namelookup_time", sizeof("namelookup_time") - 1);
                             if (dns_val && Z_TYPE_P(dns_val) == IS_DOUBLE) {
@@ -2416,13 +2476,34 @@ static void zif_opa_curl_exec(zend_execute_data *execute_data, zval *return_valu
                     response_headers_str = estrdup(Z_STRVAL_P(header_in_val));
                 }
                 
-                // Get response size
+                // Get response size (size_download)
                 zval *size_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "size_download", sizeof("size_download") - 1);
                 if (size_val && Z_TYPE_P(size_val) == IS_DOUBLE) {
                     response_size = (size_t)Z_DVAL_P(size_val);
                 } else if (size_val && Z_TYPE_P(size_val) == IS_LONG) {
                     response_size = (size_t)Z_LVAL_P(size_val);
                 }
+                
+                // Get request size (size_upload)
+                size_t request_size_from_curl = 0;
+                zval *size_upload_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "size_upload", sizeof("size_upload") - 1);
+                if (size_upload_val && Z_TYPE_P(size_upload_val) == IS_DOUBLE) {
+                    request_size_from_curl = (size_t)Z_DVAL_P(size_upload_val);
+                } else if (size_upload_val && Z_TYPE_P(size_upload_val) == IS_LONG) {
+                    request_size_from_curl = (size_t)Z_LVAL_P(size_upload_val);
+                }
+                
+                // Update global network byte counters with actual values from cURL
+                if (request_size_from_curl > 0) {
+                    add_bytes_sent(request_size_from_curl);
+                }
+                if (response_size > 0) {
+                    add_bytes_received(response_size);
+                }
+                
+                // Use actual sizes from curl_getinfo instead of difference calculation
+                bytes_sent = request_size_from_curl;
+                bytes_received = response_size;
                 
                 // Get timing information
                 zval *dns_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "namelookup_time", sizeof("namelookup_time") - 1);

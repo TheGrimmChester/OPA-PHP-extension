@@ -14,8 +14,21 @@ set -euo pipefail
 #   CI_MODE: Set to '1' for CI mode (structured output)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"" && pwd)}"
-PHP_EXTENSION_DIR="${PROJECT_ROOT}"
+
+# Source common helpers for path detection
+if [[ -f "${SCRIPT_DIR}/helpers/common.sh" ]]; then
+    source "${SCRIPT_DIR}/helpers/common.sh"
+else
+    # Fallback if common.sh not available
+    PHP_EXTENSION_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+    if [[ -d "${PHP_EXTENSION_DIR}/../agent" ]] && [[ -d "${PHP_EXTENSION_DIR}/../clickhouse" ]]; then
+        PROJECT_ROOT="${PHP_EXTENSION_DIR}/.."
+    else
+        PROJECT_ROOT="${PHP_EXTENSION_DIR}"
+    fi
+    export PROJECT_ROOT
+    export PHP_EXTENSION_DIR
+fi
 
 # Configuration
 API_URL="${API_URL:-http://localhost:8081}"
