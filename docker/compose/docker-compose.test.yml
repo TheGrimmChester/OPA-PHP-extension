@@ -43,9 +43,9 @@ services:
       dockerfile: docker/Dockerfile
     container_name: opa_php_test
     volumes:
-      - ../../tests:/var/www/html/tests
-      - ../../tests:/app/tests
-      - ../../php-extension/tests:/app/php-extension/tests
+      - ../../tests:/var/www/html/tests:ro
+      - ../../tests:/app/tests:ro
+      - ../../php-extension/tests:/app/php-extension/tests:ro
     working_dir: /app/tests
     entrypoint: ["/usr/local/bin/docker-entrypoint-custom.sh"]
     ulimits:
@@ -54,6 +54,9 @@ services:
       opa_network:
         aliases:
           - opa-agent-php
+          - php-fpm
+    expose:
+      - "9000"
     dns:
       - 127.0.0.11  # Docker's embedded DNS server
     environment:
@@ -73,9 +76,28 @@ services:
       - OPA_DEBUG_LOG=1
       - OPA_ORGANIZATION_ID=default-org
       - OPA_PROJECT_ID=default-project
-      - OPA_SERVICE=pdo-sql-profiling-test
+      - OPA_SERVICE=http-sizes-test
       - OPA_LANGUAGE=php
       - OPA_LANGUAGE_VERSION=8.4
+    command: php-fpm
+
+  nginx:
+    image: nginx:alpine
+    container_name: opa_nginx_test
+    depends_on:
+      - php
+    volumes:
+      - ../../tests:/var/www/html/tests:ro
+      - ./nginx-test.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8090:80"
+    networks:
+      - opa_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/health"]
+      interval: 2s
+      timeout: 1s
+      retries: 5
 
 networks:
   opa_network:

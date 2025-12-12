@@ -332,6 +332,13 @@ char* serialize_http_request_json_universal(void) {
     /* FPM PRIORITY 1: PG(http_globals)[TRACK_VARS_SERVER] - NOW properly initialized */
     zval *server = &PG(http_globals)[TRACK_VARS_SERVER];
     
+    const char *method = "GET";
+    const char *uri = "/";
+    const char *query = "";
+    size_t method_len = 3;
+    size_t uri_len = 1;
+    size_t query_len = 0;
+    
     if (server && Z_TYPE_P(server) == IS_ARRAY) {
         int num_elements = (int)zend_hash_num_elements(Z_ARRVAL_P(server));
         
@@ -344,15 +351,77 @@ char* serialize_http_request_json_universal(void) {
             if (method_zv && Z_TYPE_P(method_zv) == IS_STRING &&
                 uri_zv && Z_TYPE_P(uri_zv) == IS_STRING) {
                 
-                char buf[1024];
-                snprintf(buf, sizeof(buf),
+                method = Z_STRVAL_P(method_zv);
+                method_len = Z_STRLEN_P(method_zv);
+                uri = Z_STRVAL_P(uri_zv);
+                uri_len = Z_STRLEN_P(uri_zv);
+                if (query_zv && Z_TYPE_P(query_zv) == IS_STRING) {
+                    query = Z_STRVAL_P(query_zv);
+                    query_len = Z_STRLEN_P(query_zv);
+                }
+                
+                // Calculate request size (headers + body + files)
+                size_t request_size = 0;
+                size_t body_size = (size_t)SG(request_info).content_length;
+                size_t file_size = 0;
+                size_t header_size = 0;
+                
+                // Try to get file sizes from $_FILES (may not be available in RINIT)
+                zend_string *files_name = zend_string_init("_FILES", sizeof("_FILES")-1, 0);
+                zend_is_auto_global(files_name);
+                zval *files_zv = zend_hash_find(&EG(symbol_table), files_name);
+                zend_string_release(files_name);
+                
+                if (files_zv && Z_TYPE_P(files_zv) == IS_ARRAY) {
+                    // Iterate through $_FILES array
+                    zval *file_entry;
+                    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(files_zv), file_entry) {
+                        if (Z_TYPE_P(file_entry) == IS_ARRAY) {
+                            zval *size_zv = zend_hash_str_find(Z_ARRVAL_P(file_entry), "size", sizeof("size")-1);
+                            if (size_zv) {
+                                if (Z_TYPE_P(size_zv) == IS_LONG) {
+                                    file_size += (size_t)Z_LVAL_P(size_zv);
+                                } else if (Z_TYPE_P(size_zv) == IS_DOUBLE) {
+                                    file_size += (size_t)Z_DVAL_P(size_zv);
+                                }
+                            }
+                        }
+                    } ZEND_HASH_FOREACH_END();
+                }
+                
+                // Estimate header size from $_SERVER HTTP_* entries
+                header_size += method_len + uri_len + 15; // Request line
+                
+                zend_string *key;
+                zval *value;
+                ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(server), key, value) {
+                    if (key && ZSTR_LEN(key) > 5) {
+                        const char *key_str = ZSTR_VAL(key);
+                        if (strncmp(key_str, "HTTP_", 5) == 0 && value && Z_TYPE_P(value) == IS_STRING) {
+                            size_t header_name_len = ZSTR_LEN(key) - 5;
+                            header_size += header_name_len + Z_STRLEN_P(value) + 4; // ": \r\n" = 4 bytes
+                        }
+                    }
+                } ZEND_HASH_FOREACH_END();
+                
+                request_size = body_size + query_len + file_size + header_size;
+                
+                char buf[2048];
+                int pos = snprintf(buf, sizeof(buf),
                     "{\"method\":\"%s\",\"uri\":\"%s\","
                      "\"query_string\":\"%s\",\"remote_addr\":\"%s\","
-                     "\"source\":\"PG\"}",
-                    Z_STRVAL_P(method_zv),
-                    Z_STRVAL_P(uri_zv),
-                    query_zv && Z_TYPE_P(query_zv) == IS_STRING ? Z_STRVAL_P(query_zv) : "",
+                     "\"source\":\"PG\"",
+                    method,
+                    uri,
+                    query,
                     remote_zv && Z_TYPE_P(remote_zv) == IS_STRING ? Z_STRVAL_P(remote_zv) : "unknown");
+                
+                // Add request_size if > 0
+                if (request_size > 0) {
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_size\":%zu", request_size);
+                }
+                
+                snprintf(buf + pos, sizeof(buf) - pos, "}");
                 
                 return strdup(buf);
             }
@@ -361,13 +430,34 @@ char* serialize_http_request_json_universal(void) {
     
     /* PRIORITY 2: SAPI fallback (CLI/Apache) */
     
-    char buf[512];
-    snprintf(buf, sizeof(buf),
+    method = SG(request_info).request_method ? SG(request_info).request_method : "GET";
+    uri = SG(request_info).request_uri ? SG(request_info).request_uri : "/";
+    query = SG(request_info).query_string ? SG(request_info).query_string : "";
+    method_len = strlen(method);
+    uri_len = strlen(uri);
+    query_len = strlen(query);
+    
+    // Calculate request size for SAPI fallback
+    size_t request_size = 0;
+    size_t body_size = (size_t)SG(request_info).content_length;
+    size_t header_size = method_len + uri_len + 15; // Request line
+    header_size += 100; // Estimate for common headers
+    
+    request_size = body_size + query_len + header_size;
+    
+    char buf[1024];
+    int pos = snprintf(buf, sizeof(buf),
         "{\"method\":\"%s\",\"uri\":\"%s\",\"query_string\":\"%s\","
-         "\"source\":\"SAPI\"}",
-        SG(request_info).request_method ? SG(request_info).request_method : "GET",
-        SG(request_info).request_uri ? SG(request_info).request_uri : "/",
-        SG(request_info).query_string ? SG(request_info).query_string : "");
+         "\"source\":\"SAPI\"",
+        method, uri, query);
+    
+    // Add request_size if > 0
+    if (request_size > 0) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_size\":%zu", request_size);
+    }
+    
+    snprintf(buf + pos, sizeof(buf) - pos, "}");
+    
     return strdup(buf);
 }
 
@@ -474,6 +564,87 @@ char* serialize_http_request_json(zval *server) {
         }
     }
     
+    // Calculate request size (headers + body + files)
+    size_t request_size = 0;
+    size_t body_size = (size_t)SG(request_info).content_length; // Request body size from Content-Length header
+    size_t query_size = query_len; // Query string size
+    size_t file_size = 0;
+    size_t header_size = 0;
+    
+    // Calculate file sizes from $_FILES
+    zend_string *files_name = zend_string_init("_FILES", sizeof("_FILES")-1, 0);
+    zend_is_auto_global(files_name);
+    zval *files_zv = zend_hash_find(&EG(symbol_table), files_name);
+    zend_string_release(files_name);
+    
+    if (files_zv && Z_TYPE_P(files_zv) == IS_ARRAY) {
+        // Iterate through $_FILES array
+        zval *file_entry;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(files_zv), file_entry) {
+            if (Z_TYPE_P(file_entry) == IS_ARRAY) {
+                // Each file entry has a 'size' field
+                zval *size_zv = zend_hash_str_find(Z_ARRVAL_P(file_entry), "size", sizeof("size")-1);
+                if (size_zv) {
+                    if (Z_TYPE_P(size_zv) == IS_LONG) {
+                        file_size += (size_t)Z_LVAL_P(size_zv);
+                    } else if (Z_TYPE_P(size_zv) == IS_DOUBLE) {
+                        file_size += (size_t)Z_DVAL_P(size_zv);
+                    }
+                }
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
+    
+    // Estimate header size from $_SERVER HTTP_* entries
+    if (server_zv && Z_TYPE_P(server_zv) == IS_ARRAY) {
+        // Add request line (method + URI + protocol): "GET /path HTTP/1.1\r\n"
+        header_size += method_len + uri_len + 15; // " GET  HTTP/1.1\r\n" = 15 bytes
+        
+        // Iterate through $_SERVER entries to find HTTP_* headers
+        zend_string *key;
+        zval *value;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(server_zv), key, value) {
+            if (key && ZSTR_LEN(key) > 5) {
+                const char *key_str = ZSTR_VAL(key);
+                
+                // Check if it's an HTTP header (starts with "HTTP_")
+                if (strncmp(key_str, "HTTP_", 5) == 0 && value && Z_TYPE_P(value) == IS_STRING) {
+                    // Header format: "Header-Name: value\r\n"
+                    // Approximate: key (HTTP_HEADER_NAME) + value + ": \r\n" overhead
+                    // Convert HTTP_HEADER_NAME to Header-Name format (approximate size)
+                    size_t header_name_len = ZSTR_LEN(key) - 5; // Remove "HTTP_" prefix
+                    header_size += header_name_len + Z_STRLEN_P(value) + 4; // ": \r\n" = 4 bytes
+                }
+            }
+        } ZEND_HASH_FOREACH_END();
+    } else {
+        // Fallback: estimate header size (request line + common headers)
+        header_size += method_len + uri_len + 15; // Request line
+        header_size += 100; // Estimate for common headers (Host, User-Agent, etc.)
+    }
+    
+    // Calculate total request size
+    request_size = body_size + query_size + file_size + header_size;
+    
+    // Add request_size field to JSON
+    if (request_size > 0) {
+        // Check if we have enough buffer space, if not, realloc
+        size_t size_str_len = 64; // Enough for size_t as string
+        if (pos + size_str_len >= buf_size) {
+            size_t new_size = buf_size * 2 + size_str_len;
+            char *new_result = realloc(result, new_size);
+            if (new_result) {
+                result = new_result;
+                buf_size = new_size;
+            }
+        }
+        if (result && (pos + size_str_len < buf_size)) {
+            char size_str[64];
+            snprintf(size_str, sizeof(size_str), "%zu", request_size);
+            pos += snprintf(result + pos, buf_size - pos, ",\"request_size\":%s", size_str);
+        }
+    }
+    
     snprintf(result + pos, buf_size - pos, "}");
     
     return result;
@@ -527,17 +698,20 @@ char* serialize_http_response_json(void) {
     }
     
     // Response headers from headers_list() - check if function exists
+    size_t header_size = 0;
+    size_t body_size_from_header = 0;
+    
     zend_function *headers_list_func = zend_hash_str_find_ptr(EG(function_table), "headers_list", sizeof("headers_list") - 1);
     if (headers_list_func) {
-        zval headers_list_func, headers_list_ret;
-        ZVAL_UNDEF(&headers_list_func);
+        zval headers_list_func_zv, headers_list_ret;
+        ZVAL_UNDEF(&headers_list_func_zv);
         ZVAL_UNDEF(&headers_list_ret);
         
-        ZVAL_STRING(&headers_list_func, "headers_list");
+        ZVAL_STRING(&headers_list_func_zv, "headers_list");
         
         zend_fcall_info fci;
         zend_fcall_info_cache fcc;
-        if (zend_fcall_info_init(&headers_list_func, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
+        if (zend_fcall_info_init(&headers_list_func_zv, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
             fci.size = sizeof(fci);
             ZVAL_UNDEF(&fci.function_name);
             fci.object = NULL;
@@ -557,6 +731,17 @@ char* serialize_http_response_json(void) {
                             // Parse "Header-Name: value" format
                             const char *header_str = Z_STRVAL_P(header);
                             size_t header_len = Z_STRLEN_P(header);
+                            
+                            // Calculate header size (header string + ": \r\n" overhead)
+                            header_size += header_len + 4; // ": \r\n" = 4 bytes
+                            
+                            // Check for Content-Length header
+                            if (strncasecmp(header_str, "Content-Length:", 15) == 0) {
+                                const char *value_start = header_str + 15;
+                                while (*value_start == ' ' || *value_start == '\t') value_start++;
+                                body_size_from_header = (size_t)strtoul(value_start, NULL, 10);
+                            }
+                            
                             const char *colon = memchr(header_str, ':', header_len);
                             
                             if (colon) {
@@ -592,7 +777,64 @@ char* serialize_http_response_json(void) {
                 zval_dtor(&headers_list_ret);
             }
         }
-        zval_dtor(&headers_list_func);
+        zval_dtor(&headers_list_func_zv);
+    }
+    
+    // Calculate response size (body + headers)
+    size_t response_size = 0;
+    size_t body_size = 0;
+    
+    // Get response body size using ob_get_length()
+    zend_function *ob_get_length_func = zend_hash_str_find_ptr(EG(function_table), "ob_get_length", sizeof("ob_get_length") - 1);
+    if (ob_get_length_func) {
+        zval ob_get_length_func_zv, ob_get_length_ret;
+        ZVAL_UNDEF(&ob_get_length_func_zv);
+        ZVAL_UNDEF(&ob_get_length_ret);
+        
+        ZVAL_STRING(&ob_get_length_func_zv, "ob_get_length");
+        
+        zend_fcall_info fci;
+        zend_fcall_info_cache fcc;
+        if (zend_fcall_info_init(&ob_get_length_func_zv, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
+            fci.size = sizeof(fci);
+            ZVAL_UNDEF(&fci.function_name);
+            fci.object = NULL;
+            fci.param_count = 0;
+            fci.params = NULL;
+            fci.retval = &ob_get_length_ret;
+            
+            if (zend_call_function(&fci, &fcc) == SUCCESS) {
+                if (Z_TYPE(ob_get_length_ret) == IS_LONG) {
+                    body_size = (size_t)Z_LVAL(ob_get_length_ret);
+                } else if (Z_TYPE(ob_get_length_ret) == IS_FALSE) {
+                    // No output buffer active - will use Content-Length from headers if available
+                    body_size = 0;
+                }
+                zval_dtor(&ob_get_length_ret);
+            }
+        }
+        zval_dtor(&ob_get_length_func_zv);
+    }
+    
+    // If no output buffer, use Content-Length from headers (already extracted above)
+    if (body_size == 0) {
+        body_size = body_size_from_header;
+    }
+    
+    // Add status line size (e.g., "HTTP/1.1 200 OK\r\n") - approximately 15 bytes
+    header_size += 15;
+    
+    // Calculate total response size
+    response_size = body_size + header_size;
+    
+    // Add response_size field to JSON
+    if (response_size > 0) {
+        if (!first) smart_string_appends(&json, ",");
+        char size_str[64];
+        snprintf(size_str, sizeof(size_str), "%zu", response_size);
+        smart_string_appends(&json, "\"response_size\":");
+        smart_string_appends(&json, size_str);
+        first = 0;
     }
     
     smart_string_appends(&json, "}");
