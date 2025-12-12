@@ -2538,8 +2538,6 @@ static void opa_observer_pdo_fcall_begin(zend_execute_data *execute_data) {
     if (class_name && (strcmp(class_name, "PDO") == 0 || strcmp(class_name, "PDOStatement") == 0)) {
         if (method_name && (strcmp(method_name, "query") == 0 || strcmp(method_name, "exec") == 0 || 
                            strcmp(method_name, "prepare") == 0 || strcmp(method_name, "execute") == 0)) {
-            fprintf(stderr, "[OPA Observer] PDO %s::%s BEGIN intercepted\n", class_name, method_name);
-            fflush(stderr);
             debug_log("[observer] PDO method observed: %s::%s", class_name, method_name);
         }
     }
@@ -2634,8 +2632,6 @@ static void opa_observer_pdo_fcall_end(zend_execute_data *execute_data, zval *re
                 // Note: db_host, db_system, db_dsn are NULL for now - can be extracted from PDO connection if needed
                 if (global_collector && global_collector->magic == OPA_COLLECTOR_MAGIC && global_collector->active) {
                     record_sql_query(sql, duration, NULL, query_type_str, rows_affected, NULL, NULL, NULL);
-                    fprintf(stderr, "[OPA Observer] SQL recorded via record_sql_query\n");
-                    fflush(stderr);
                 }
                 
                 efree(sql);
@@ -2907,8 +2903,6 @@ PHP_RINIT_FUNCTION(opa) {
     if (!curl_ce && EG(class_table)) {
         curl_ce = zend_hash_str_find_ptr(EG(class_table), "CurlHandle", sizeof("CurlHandle")-1);
         if (curl_ce) {
-            fprintf(stderr, "[OPA RINIT] CurlHandle class found\n");
-            fflush(stderr);
         }
     }
 
@@ -2921,8 +2915,6 @@ PHP_RINIT_FUNCTION(opa) {
     if (!curl_share_ce && EG(class_table)) {
         curl_share_ce = zend_hash_str_find_ptr(EG(class_table), "CurlShareHandle", sizeof("CurlShareHandle")-1);
         if (curl_share_ce) {
-            fprintf(stderr, "[OPA RINIT] CurlShareHandle class found\n");
-            fflush(stderr);
         }
     }
     
