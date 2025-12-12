@@ -2313,10 +2313,6 @@ PHP_FUNCTION(opaphp_mysqli_query) {
     
     // Log SQL query with timing
     if (query) {
-        if (OPA_G(debug_log_enabled)) {
-            php_printf("[OPA SQL Profiling] MySQLi Query: %s | Time: %.3fms | Rows: %ld\n", 
-                   ZSTR_VAL(query), elapsed, rows_affected);
-        }
         
         // Send SQL query data to agent via record_sql_query
         // Duration is in milliseconds, convert to seconds for record_sql_query
@@ -2396,10 +2392,6 @@ static void zif_opa_pdo_query(zend_execute_data *execute_data, zval *return_valu
     
     // Log SQL query
     if (sql) {
-        if (OPA_G(debug_log_enabled)) {
-            php_printf("[OPA SQL Profiling] PDO Query: %s | Time: %.3fms | Rows: %ld\n", 
-                   ZSTR_VAL(sql), elapsed, row_count);
-        }
         
         // Send SQL query data to agent via record_sql_query
         double duration_seconds = elapsed / 1000.0;
