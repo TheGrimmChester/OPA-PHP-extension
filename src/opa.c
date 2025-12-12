@@ -1634,9 +1634,6 @@ void opa_execute_ex(zend_execute_data *execute_data) {
             }
             pthread_mutex_unlock(&global_collector->global_sql_mutex);
         } else {
-            php_printf("[OPA execute_ex] ERROR: Cannot record SQL - collector=%p, active=%d, magic=0x%08X\n", 
-                global_collector, global_collector ? global_collector->active : 0, 
-                global_collector ? global_collector->magic : 0);
         }
         
         // Also try to record via record_sql_query (for call node tracking)
@@ -1654,8 +1651,6 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         }
         efree(sql);
     } else if (pdo_method) {
-        php_printf("[OPA execute_ex] PDO method detected but no SQL captured: pdo_method=%d, sql=%p, function_name=%s\n", 
-            pdo_method, sql, function_name ? function_name : "NULL");
         debug_log("[execute_ex] PDO method detected but no SQL captured: pdo_method=%d, sql=%p, function_name=%s", 
             pdo_method, sql, function_name ? function_name : "NULL");
     }
@@ -2344,7 +2339,6 @@ static void zif_opa_pdo_query(zend_execute_data *execute_data, zval *return_valu
     // Determine which method was called by checking the function
     if (execute_data && execute_data->func && execute_data->func->common.function_name) {
         method_name = ZSTR_VAL(execute_data->func->common.function_name);
-        php_printf("[OPA zif_opa_pdo_query] Method: %s\n", method_name);
     }
     
     // Parse parameters (query/exec/prepare take at least 1 parameter: SQL string)
@@ -2352,7 +2346,6 @@ static void zif_opa_pdo_query(zend_execute_data *execute_data, zval *return_valu
         Z_PARAM_STR(sql)
     ZEND_PARSE_PARAMETERS_END();
     
-    php_printf("[OPA zif_opa_pdo_query] SQL captured: %s\n", sql ? ZSTR_VAL(sql) : "NULL");
     debug_log("[PDO method] SQL: %s", sql ? ZSTR_VAL(sql) : "NULL");
     
     // Call original handler based on which method was called
@@ -2413,8 +2406,6 @@ static void zif_opa_pdo_query(zend_execute_data *execute_data, zval *return_valu
         char query_type_str[64];
         snprintf(query_type_str, sizeof(query_type_str), "PDO::%s", method_name);
         
-        php_printf("[OPA zif_opa_pdo_query] Recording SQL: %s, duration=%.3fs, rows=%ld, type=%s\n", 
-            ZSTR_VAL(sql), duration_seconds, row_count, query_type_str);
         debug_log("[PDO %s] Recording SQL query: %s, duration=%.3fs, rows=%ld", 
             method_name, ZSTR_VAL(sql), duration_seconds, row_count);
         
@@ -2423,14 +2414,12 @@ static void zif_opa_pdo_query(zend_execute_data *execute_data, zval *return_valu
             global_collector = opa_collector_init();
             if (global_collector) {
                 opa_collector_start(global_collector);
-                php_printf("[OPA zif_opa_pdo_query] Collector initialized on-the-fly\n");
             }
         }
         
         // Note: db_host, db_system, db_dsn extraction removed for simplicity
         // Can be added back if needed by reading from PDO connection object
         record_sql_query(ZSTR_VAL(sql), duration_seconds, NULL, query_type_str, row_count, NULL, NULL, NULL);
-        php_printf("[OPA zif_opa_pdo_query] SQL query recorded via record_sql_query\n");
         debug_log("[PDO %s] SQL query recorded", method_name);
     }
 }
@@ -2717,7 +2706,6 @@ PHP_MINIT_FUNCTION(opa) {
         // Replace with our handler
         orig_mysqli_query_func->internal_function.handler = zif_opaphp_mysqli_query;
         if (OPA_G(debug_log_enabled)) {
-            php_printf("[OPA] MySQLi query hook registered\n");
         }
     }
     
