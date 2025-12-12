@@ -86,16 +86,32 @@ void (*original_zend_execute_ex)(zend_execute_data *execute_data) = NULL;
 // this flag ensures we bypass the hook logic and call original directly
 static __thread int in_opa_execute_ex = 0;
 
+// Re-entrancy guard for observer callbacks
+static __thread int in_opa_observer = 0;
+
 // Stack sampling (disabled for now - can be re-enabled later if needed)
 // static timer_t sampling_timer;
 // static int sampling_enabled = 0;
 
 // Helper: Generate unique ID
+// CRITICAL: This function must NOT call any PHP functions that could trigger observers
+// Use manual hex conversion to avoid any PHP function interception (sprintf/snprintf)
 char* generate_id() {
     char *id = emalloc(17);
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    snprintf(id, 17, "%016lx", (unsigned long)(tv.tv_sec * 1000000 + tv.tv_usec) ^ (unsigned long)pthread_self());
+    // Manual hex conversion to avoid triggering PHP function observers
+    // Format: 16 hex digits + null terminator
+    unsigned long value = (unsigned long)(tv.tv_sec * 1000000 + tv.tv_usec) ^ (unsigned long)pthread_self();
+    
+    // Manual hex conversion - no PHP functions called
+    static const char hex_chars[] = "0123456789abcdef";
+    int i;
+    for (i = 15; i >= 0; i--) {
+        id[i] = hex_chars[value & 0xf];
+        value >>= 4;
+    }
+    id[16] = '\0'; // Ensure null termination
     return id;
 }
 
@@ -2826,6 +2842,12 @@ static pthread_mutex_t observer_data_mutex = PTHREAD_MUTEX_INITIALIZER;
 // This is the proper way to intercept function calls in PHP 8.0+ (like xdebug)
 // Signature: void (*)(zend_execute_data *)
 static void opa_observer_fcall_begin(zend_execute_data *execute_data) {
+    // Re-entrancy guard: if we're already inside observer, bypass to prevent infinite recursion
+    // This is critical when observer callbacks trigger PHP functions (like snprintf, curl_getinfo, etc.)
+    if (in_opa_observer) {
+        return;
+    }
+    
     // Fast-path: if not actively profiling, return immediately
     if (!profiling_active) {
         return;
@@ -2836,6 +2858,9 @@ static void opa_observer_fcall_begin(zend_execute_data *execute_data) {
         !global_collector->active || global_collector->magic != OPA_COLLECTOR_MAGIC) {
         return;
     }
+    
+    // Set re-entrancy guard immediately after safety checks
+    in_opa_observer = 1;
     
     zend_function *func = execute_data->func;
     
@@ -2860,10 +2885,12 @@ static void opa_observer_fcall_begin(zend_execute_data *execute_data) {
     } else if (func->type == ZEND_INTERNAL_FUNCTION) {
         // Skip internal functions if not collecting them
         if (!OPA_G(collect_internal_functions)) {
+            in_opa_observer = 0;
             return;
         }
         function_type = class_name ? 2 : 1;
     } else {
+        in_opa_observer = 0;
         return; // Unknown function type
     }
     
@@ -2897,8 +2924,13 @@ static void opa_observer_fcall_begin(zend_execute_data *execute_data) {
     data->start_bytes_received = get_bytes_received();
     
     // Track function entry
+    // SKIP profiling curl_getinfo and curl_error to prevent segfaults
+    // These functions trigger recursion issues when called from within observer callbacks
     char *call_id = NULL;
-    if (function_name || class_name) {
+    if (function_name && (strcmp(function_name, "curl_getinfo") == 0 || strcmp(function_name, "curl_error") == 0)) {
+        // Skip profiling these functions to prevent segfaults
+        call_id = NULL;
+    } else if (function_name || class_name) {
         call_id = opa_enter_function(function_name, class_name, file, line, function_type);
         if (call_id) {
             data->call_id = estrdup(call_id);
@@ -2963,10 +2995,19 @@ static void opa_observer_fcall_begin(zend_execute_data *execute_data) {
     ZVAL_PTR(&data_zv, data);
     zend_hash_index_update(observer_data_table, (zend_ulong)execute_data, &data_zv);
     pthread_mutex_unlock(&observer_data_mutex);
+    
+    // Reset re-entrancy guard before returning
+    in_opa_observer = 0;
 }
 
 // Signature: void (*)(zend_execute_data *, zval *)
 static void opa_observer_fcall_end(zend_execute_data *execute_data, zval *return_value) {
+    // Re-entrancy guard: if we're already inside observer, bypass to prevent infinite recursion
+    // This is critical when observer callbacks trigger PHP functions (like curl_getinfo, etc.)
+    if (in_opa_observer) {
+        return;
+    }
+    
     // Fast-path: if not actively profiling, return immediately
     if (!profiling_active) {
         return;
@@ -2977,6 +3018,9 @@ static void opa_observer_fcall_end(zend_execute_data *execute_data, zval *return
         !global_collector->active || global_collector->magic != OPA_COLLECTOR_MAGIC) {
         return;
     }
+    
+    // Set re-entrancy guard immediately after safety checks
+    in_opa_observer = 1;
     
     // Retrieve observer data from hash table
     pthread_mutex_lock(&observer_data_mutex);
@@ -2990,6 +3034,8 @@ static void opa_observer_fcall_end(zend_execute_data *execute_data, zval *return
     pthread_mutex_unlock(&observer_data_mutex);
     
     if (!data) {
+        // Reset re-entrancy guard before returning
+        in_opa_observer = 0;
         return; // No data stored, skip processing
     }
     
@@ -3025,6 +3071,10 @@ static void opa_observer_fcall_end(zend_execute_data *execute_data, zval *return
         char *error = NULL;
         
         if (data->curl_handle && Z_TYPE_P(data->curl_handle) == IS_OBJECT) {
+            // TEMPORARILY DISABLED: curl_getinfo call causes segfault due to observer recursion
+            // The re-entrancy guard should prevent this, but there's still an issue
+            // TODO: Fix the re-entrancy guard or use a different approach to get curl info
+            /*
             // Get curl_getinfo data
             zval curl_getinfo_func, curl_getinfo_args[1], curl_getinfo_ret;
             ZVAL_UNDEF(&curl_getinfo_func);
@@ -3041,6 +3091,10 @@ static void opa_observer_fcall_end(zend_execute_data *execute_data, zval *return
                 fci.param_count = 1;
                 fci.params = curl_getinfo_args;
                 fci.retval = &curl_getinfo_ret;
+                
+                // Temporarily disable observer to prevent recursion
+                int old_guard = in_opa_observer;
+                in_opa_observer = 1;
                 
                 if (zend_call_function(&fci, &fcc) == SUCCESS) {
                     if (Z_TYPE(curl_getinfo_ret) == IS_ARRAY) {
@@ -3090,6 +3144,13 @@ static void opa_observer_fcall_end(zend_execute_data *execute_data, zval *return
                 zval_dtor(&curl_error_func);
                 zval_dtor(&curl_error_args[0]);
             }
+            */
+            
+            // For now, use default values since curl_getinfo/curl_error are disabled
+            curl_url = NULL;
+            curl_method = NULL;
+            status_code = 0;
+            error = NULL;
         }
         
         // Record HTTP request
@@ -3142,6 +3203,9 @@ static void opa_observer_fcall_end(zend_execute_data *execute_data, zval *return
     pthread_mutex_unlock(&observer_data_mutex);
     
     efree(data);
+    
+    // Reset re-entrancy guard before returning
+    in_opa_observer = 0;
 }
 
 // Observer initialization function for all function calls
