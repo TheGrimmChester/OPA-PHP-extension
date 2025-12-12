@@ -2572,8 +2572,6 @@ static void opa_observer_pdo_fcall_end(zend_execute_data *execute_data, zval *re
     if (class_name && (strcmp(class_name, "PDO") == 0 || strcmp(class_name, "PDOStatement") == 0)) {
         if (method_name && (strcmp(method_name, "query") == 0 || strcmp(method_name, "exec") == 0 || 
                            strcmp(method_name, "prepare") == 0 || strcmp(method_name, "execute") == 0)) {
-            fprintf(stderr, "[OPA Observer] PDO %s::%s END intercepted\n", class_name, method_name);
-            fflush(stderr);
             
             // Calculate duration (approximate - we don't have precise start time from begin callback)
             // For more accurate timing, we'd need to store start time in begin callback
@@ -2588,7 +2586,9 @@ static void opa_observer_pdo_fcall_end(zend_execute_data *execute_data, zval *re
                     }
                 }
             } else if (strcmp(method_name, "execute") == 0 && strcmp(class_name, "PDOStatement") == 0) {
-                if (Z_TYPE(execute_data->This) == IS_OBJECT) {
+                // For PDOStatement::execute, get SQL from the statement object
+                // Access execute_data->This safely (it's available in observer callbacks)
+                if (execute_data && Z_TYPE(execute_data->This) == IS_OBJECT) {
                     zval *query_string_prop = zend_read_property(Z_OBJCE(execute_data->This), Z_OBJ(execute_data->This), "queryString", sizeof("queryString") - 1, 1, NULL);
                     if (query_string_prop && Z_TYPE_P(query_string_prop) == IS_STRING) {
                         sql = estrdup(Z_STRVAL_P(query_string_prop));
@@ -2599,48 +2599,44 @@ static void opa_observer_pdo_fcall_end(zend_execute_data *execute_data, zval *re
             if (sql) {
                 long rows_affected = -1;
                 
-                // Try to get row count from return value
-                if (return_value) {
-                    if (Z_TYPE_P(return_value) == IS_OBJECT) {
-                        zend_class_entry *ce = Z_OBJCE_P(return_value);
-                        if (ce && ce->name && strcmp(ZSTR_VAL(ce->name), "PDOStatement") == 0) {
-                            zval row_count_zv;
-                            zval method_name_zv;
-                            zval this_zv;
-                            ZVAL_OBJ(&this_zv, Z_OBJ_P(return_value));
-                            ZVAL_STRING(&method_name_zv, "rowCount");
-                            if (call_user_function(EG(function_table), &this_zv, &method_name_zv, &row_count_zv, 0, NULL) == SUCCESS) {
-                                if (Z_TYPE(row_count_zv) == IS_LONG) {
-                                    rows_affected = Z_LVAL(row_count_zv);
-                                }
-                                zval_ptr_dtor(&row_count_zv);
-                            }
-                            zval_ptr_dtor(&method_name_zv);
-                        }
-                    } else if (Z_TYPE_P(return_value) == IS_LONG && strcmp(method_name, "exec") == 0) {
-                        // exec() returns number of affected rows directly
-                        rows_affected = Z_LVAL_P(return_value);
-                    }
+                // Get row count safely - only for exec() which returns integer directly
+                if (return_value && Z_TYPE_P(return_value) == IS_LONG && strcmp(method_name, "exec") == 0) {
+                    rows_affected = Z_LVAL_P(return_value);
                 }
+                // For query() and prepare(), we can't safely get row count from observer callback
+                // without risking heap corruption, so leave it as -1
                 
                 // Record SQL query using record_sql_query
                 char query_type_str[64];
                 snprintf(query_type_str, sizeof(query_type_str), "PDO::%s", method_name);
                 
-                fprintf(stderr, "[OPA Observer] Recording SQL: %s, duration=%.6fs, rows=%ld\n", sql, duration, rows_affected);
-                fflush(stderr);
                 
-                // Ensure collector is initialized
-                if (!global_collector) {
-                    global_collector = opa_collector_init();
-                    if (global_collector) {
+                // Ensure collector is initialized and active (should already be done in RINIT)
+                if (!global_collector || global_collector->magic != OPA_COLLECTOR_MAGIC || !global_collector->active) {
+                    if (!global_collector) {
+                        global_collector = opa_collector_init();
+                    }
+                    if (global_collector && global_collector->magic == OPA_COLLECTOR_MAGIC) {
                         opa_collector_start(global_collector);
+                        // Initialize global SQL queries array
+                        pthread_mutex_lock(&global_collector->global_sql_mutex);
+                        if (!global_collector->global_sql_queries) {
+                            global_collector->global_sql_queries = ecalloc(1, sizeof(zval));
+                            if (global_collector->global_sql_queries) {
+                                array_init(global_collector->global_sql_queries);
+                            }
+                        }
+                        pthread_mutex_unlock(&global_collector->global_sql_mutex);
                     }
                 }
                 
                 // Use record_sql_query for consistent SQL recording
                 // Note: db_host, db_system, db_dsn are NULL for now - can be extracted from PDO connection if needed
-                record_sql_query(sql, duration, NULL, query_type_str, rows_affected, NULL, NULL, NULL);
+                if (global_collector && global_collector->magic == OPA_COLLECTOR_MAGIC && global_collector->active) {
+                    record_sql_query(sql, duration, NULL, query_type_str, rows_affected, NULL, NULL, NULL);
+                    fprintf(stderr, "[OPA Observer] SQL recorded via record_sql_query\n");
+                    fflush(stderr);
+                }
                 
                 efree(sql);
             }
@@ -2715,14 +2711,14 @@ PHP_MINIT_FUNCTION(opa) {
         // The function signature must match: zend_observer_fcall (*)(zend_execute_data *)
         zend_observer_fcall_register(opa_observer_pdo_init);
         pdo_observer_registered = 1;
-        fprintf(stderr, "[OPA MINIT] Zend Observer for PDO registered\n");
-        fflush(stderr);
         
-        // Initialize hash table for storing call start times
-        if (!pdo_call_times) {
-            pdo_call_times = emalloc(sizeof(HashTable));
-            zend_hash_init(pdo_call_times, 8, NULL, zval_ptr_dtor, 0);
-        }
+        // NOTE: pdo_call_times hash table is initialized but never actually used
+        // It was intended for storing call start times but the implementation was never completed
+        // Keeping it for now but it's safe to skip initialization
+        // if (!pdo_call_times) {
+        //     pdo_call_times = emalloc(sizeof(HashTable));
+        //     zend_hash_init(pdo_call_times, 8, NULL, NULL, 0);
+        // }
     }
     
     // Register SQL profiling hooks (lazy registration - try in RINIT as well)
@@ -2792,7 +2788,10 @@ static int null_span_dtor(zval *zv) {
 // Module shutdown - restores original zend_execute_ex hook and cleans up resources
 PHP_MSHUTDOWN_FUNCTION(opa) {
     // Cleanup PDO call times hash table
+    // NOTE: pdo_call_times is never actually used (initialization was commented out)
+    // But if it was somehow initialized, clean it up safely
     if (pdo_call_times) {
+        // Since it uses NULL destructor, it's safe to destroy
         zend_hash_destroy(pdo_call_times);
         efree(pdo_call_times);
         pdo_call_times = NULL;
@@ -2856,8 +2855,6 @@ PHP_MSHUTDOWN_FUNCTION(opa) {
 }
 
 PHP_RINIT_FUNCTION(opa) {
-    php_printf("[OPA RINIT] RINIT called!\n");
-    
     // RINIT: Reset per-request state AND register hooks (PDO classes available by RINIT time)
     // Following user guidance: Move PDO hook registration to RINIT where classes are available
     
@@ -2872,23 +2869,38 @@ PHP_RINIT_FUNCTION(opa) {
     
     // PDO hooks are now registered via Zend Observer API in MINIT
     // No need to do handler replacement here - Observer API handles it
-    fprintf(stderr, "[OPA RINIT] Called sapi=%s\n", sapi_module.name ? sapi_module.name : "unknown");
-    fflush(stderr);
+    
+    // Pre-resolve agent address in RINIT (before observer callbacks) to avoid DNS calls from unsafe contexts
+    pre_resolve_agent_address();
+    
+    // Initialize and start collector EARLY in RINIT (before any PDO calls)
+    // This ensures the collector is ready when observer callbacks try to record SQL
+    if (!global_collector) {
+        global_collector = opa_collector_init();
+    }
+    if (global_collector && global_collector->magic == OPA_COLLECTOR_MAGIC) {
+        opa_collector_start(global_collector);
+        
+        // Initialize global SQL queries array
+        pthread_mutex_lock(&global_collector->global_sql_mutex);
+        if (global_collector->global_sql_queries) {
+            zval_ptr_dtor(global_collector->global_sql_queries);
+            efree(global_collector->global_sql_queries);
+        }
+        global_collector->global_sql_queries = ecalloc(1, sizeof(zval));
+        if (global_collector->global_sql_queries) {
+            array_init(global_collector->global_sql_queries);
+            fprintf(stderr, "[OPA RINIT] Initialized global_sql_queries array\n");
+            fflush(stderr);
+        }
+        pthread_mutex_unlock(&global_collector->global_sql_mutex);
+    }
     
     // Verify PDO class is available (for debugging)
     zend_class_entry *pdo_ce = NULL;
     if (CG(class_table)) {
         pdo_ce = zend_hash_str_find_ptr(CG(class_table), "PDO", sizeof("PDO")-1);
-        if (pdo_ce) {
-            fprintf(stderr, "[OPA RINIT] PDO class found in CG(class_table)\n");
-            fflush(stderr);
-        } else {
-            fprintf(stderr, "[OPA RINIT] PDO class NOT found in CG(class_table)\n");
-            fflush(stderr);
-        }
-    } else {
-        fprintf(stderr, "[OPA RINIT] CG(class_table) is NULL\n");
-        fflush(stderr);
+        // PDO class check - not needed for Observer API but kept for reference
     }
     
     // Look up curl class entries at RINIT time when class_table is available
@@ -2903,8 +2915,6 @@ PHP_RINIT_FUNCTION(opa) {
     if (!curl_multi_ce && EG(class_table)) {
         curl_multi_ce = zend_hash_str_find_ptr(EG(class_table), "CurlMultiHandle", sizeof("CurlMultiHandle")-1);
         if (curl_multi_ce) {
-            fprintf(stderr, "[OPA RINIT] CurlMultiHandle class found\n");
-            fflush(stderr);
         }
     }
 
@@ -3048,13 +3058,12 @@ PHP_RINIT_FUNCTION(opa) {
     
     // Initialize and start collector for function call tracking
     // This is required for capturing SQL, HTTP, cache, and Redis operations
+    // MUST be done in RINIT (not RSHUTDOWN) so it's ready when observer callbacks execute
     if (!global_collector) {
         global_collector = opa_collector_init();
-        php_printf("[OPA RSHUTDOWN] Collector initialized\n");
     }
-    if (global_collector) {
+    if (global_collector && global_collector->magic == OPA_COLLECTOR_MAGIC) {
         opa_collector_start(global_collector);
-        php_printf("[OPA RSHUTDOWN] Collector started\n");
         
         // Initialize global SQL queries array
         pthread_mutex_lock(&global_collector->global_sql_mutex);
@@ -3065,7 +3074,8 @@ PHP_RINIT_FUNCTION(opa) {
         global_collector->global_sql_queries = ecalloc(1, sizeof(zval));
         if (global_collector->global_sql_queries) {
             array_init(global_collector->global_sql_queries);
-            php_printf("[OPA RSHUTDOWN] Initialized global_sql_queries array\n");
+            fprintf(stderr, "[OPA RINIT] Initialized global_sql_queries array\n");
+            fflush(stderr);
         }
         pthread_mutex_unlock(&global_collector->global_sql_mutex);
     }
@@ -3459,16 +3469,16 @@ PHP_RSHUTDOWN_FUNCTION(opa) {
     // Now send profiling data in background (client connection is already closed)
     // Use pre-encoded JSON string in regular C memory - safe after fastcgi_finish_request()
     if (json_str && json_len > 0) {
+        // During RSHUTDOWN, PHP's memory manager is still active, so emalloc/efree is safe
         // Convert malloc'd string to emalloc'd for send_message_direct
         // (send_message_direct expects emalloc'd and will efree it)
         char *msg_copy = estrdup(json_str);
         if (msg_copy) {
-        free(json_str); // Free malloc'd version
-        send_message_direct(msg_copy, 1);
+            free(json_str); // Free malloc'd version
+            send_message_direct(msg_copy, 1);
         } else {
-            char fields[128];
-            snprintf(fields, sizeof(fields), "{\"message_size\":%zu}", strlen(json_str));
-            log_error("Failed to allocate memory for span message", "estrdup failed", fields);
+            // NOTE: Do NOT call log_error() here during shutdown - it could cause issues
+            // Just free the malloc'd string and continue
             free(json_str);
         }
     } else if (json_str) {

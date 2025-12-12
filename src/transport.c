@@ -1,5 +1,121 @@
 #include "transport.h"
 
+// Cached agent address to avoid repeated DNS lookups (thread-safe with mutex)
+static struct sockaddr_in cached_agent_addr = {0};
+static char *cached_agent_host = NULL;
+static int cached_agent_port = 0;
+static pthread_mutex_t agent_addr_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int agent_addr_cached = 0;
+
+// Pre-resolve agent address in RINIT (before observer callbacks) to avoid DNS calls from unsafe contexts
+void pre_resolve_agent_address(void) {
+    fprintf(stderr, "[OPA Pre-resolve] Starting pre-resolution\n");
+    fflush(stderr);
+    
+    if (!OPA_G(enabled) || !OPA_G(socket_path)) {
+        fprintf(stderr, "[OPA Pre-resolve] Early return: enabled=%d, socket_path=%p\n", OPA_G(enabled), OPA_G(socket_path));
+        fflush(stderr);
+        return;
+    }
+    
+    const char *sock_path = OPA_G(socket_path);
+    int is_unix_socket = (sock_path[0] == '/');
+    
+    fprintf(stderr, "[OPA Pre-resolve] socket_path=%s, is_unix=%d\n", sock_path, is_unix_socket);
+    fflush(stderr);
+    
+    if (is_unix_socket) {
+        // Unix socket - no DNS resolution needed
+        fprintf(stderr, "[OPA Pre-resolve] Unix socket, skipping DNS\n");
+        fflush(stderr);
+        return;
+    }
+    
+    // Parse host:port
+    char *path_copy = estrdup(sock_path);
+    char *colon = strchr(path_copy, ':');
+    if (!colon) {
+        efree(path_copy);
+        return;
+    }
+    
+    *colon = '\0';
+    char *host = path_copy;
+    char *port_str = colon + 1;
+    int port = atoi(port_str);
+    
+    if (port <= 0 || port > 65535) {
+        efree(path_copy);
+        return;
+    }
+    
+    // Check if already cached
+    pthread_mutex_lock(&agent_addr_cache_mutex);
+    if (agent_addr_cached && cached_agent_host && 
+        strcmp(cached_agent_host, host) == 0 && cached_agent_port == port) {
+        pthread_mutex_unlock(&agent_addr_cache_mutex);
+        efree(path_copy);
+        return; // Already cached
+    }
+    pthread_mutex_unlock(&agent_addr_cache_mutex);
+    
+    // Try to parse as IP address first
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    
+    if (inet_aton(host, &addr.sin_addr) == 0) {
+        // Not an IP address, resolve hostname using getaddrinfo (safe in RINIT context)
+        struct addrinfo hints, *result, *rp;
+        memset(&hints, 0, sizeof(struct addrinfo));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        
+        char port_str_buf[16];
+        snprintf(port_str_buf, sizeof(port_str_buf), "%d", port);
+        
+        int gai_result = getaddrinfo(host, port_str_buf, &hints, &result);
+        if (gai_result == 0) {
+            // Use first result
+            for (rp = result; rp != NULL; rp = rp->ai_next) {
+                if (rp->ai_family == AF_INET) {
+                    struct sockaddr_in *sin = (struct sockaddr_in *)rp->ai_addr;
+                    memcpy(&addr.sin_addr, &sin->sin_addr, sizeof(addr.sin_addr));
+                    break;
+                }
+            }
+            freeaddrinfo(result);
+            
+            if (rp != NULL) {
+                // Cache the resolved address
+                pthread_mutex_lock(&agent_addr_cache_mutex);
+                if (cached_agent_host) {
+                    efree(cached_agent_host);
+                }
+                cached_agent_host = estrdup(host);
+                cached_agent_port = port;
+                memcpy(&cached_agent_addr.sin_addr, &addr.sin_addr, sizeof(cached_agent_addr.sin_addr));
+                agent_addr_cached = 1;
+                pthread_mutex_unlock(&agent_addr_cache_mutex);
+            }
+        }
+    } else {
+        // IP address parsed successfully, cache it
+        pthread_mutex_lock(&agent_addr_cache_mutex);
+        if (cached_agent_host) {
+            efree(cached_agent_host);
+        }
+        cached_agent_host = estrdup(host);
+        cached_agent_port = port;
+        memcpy(&cached_agent_addr.sin_addr, &addr.sin_addr, sizeof(cached_agent_addr.sin_addr));
+        agent_addr_cached = 1;
+        pthread_mutex_unlock(&agent_addr_cache_mutex);
+    }
+    
+    efree(path_copy);
+}
+
 // Finish request to client BEFORE sending data
 // This ensures the client receives the response immediately
 void opa_finish_request(void) {
@@ -125,37 +241,68 @@ void send_message_direct(char *msg, int compress) {
                 addr.sin_port = htons(port);
                 
                 // Parse host address
-                if (inet_aton(host, &addr.sin_addr) == 0) {
-                    // If inet_aton fails, try to resolve hostname using getaddrinfo (modern, works with Docker DNS)
-                    struct addrinfo hints, *result, *rp;
-                    memset(&hints, 0, sizeof(struct addrinfo));
-                    hints.ai_family = AF_INET;
-                    hints.ai_socktype = SOCK_STREAM;
-                    
-                    char port_str_buf[16];
-                    snprintf(port_str_buf, sizeof(port_str_buf), "%d", port);
-                    
-                    int gai_result = getaddrinfo(host, port_str_buf, &hints, &result);
-                    if (gai_result == 0) {
-                        // Use first result
-                        for (rp = result; rp != NULL; rp = rp->ai_next) {
-                            if (rp->ai_family == AF_INET) {
-                                struct sockaddr_in *sin = (struct sockaddr_in *)rp->ai_addr;
-                                memcpy(&addr.sin_addr, &sin->sin_addr, sizeof(addr.sin_addr));
-                                break;
-                            }
-                        }
-                        freeaddrinfo(result);
-                        if (rp == NULL) {
-                            debug_log("[SEND] getaddrinfo returned no IPv4 address for host: %s", host);
+                // First check cache to avoid repeated DNS lookups (which can crash in observer callbacks)
+                int use_cached = 0;
+                pthread_mutex_lock(&agent_addr_cache_mutex);
+                if (agent_addr_cached && cached_agent_host && 
+                    strcmp(cached_agent_host, host) == 0 && cached_agent_port == port) {
+                    // Use cached address
+                    memcpy(&addr.sin_addr, &cached_agent_addr.sin_addr, sizeof(addr.sin_addr));
+                    use_cached = 1;
+                }
+                pthread_mutex_unlock(&agent_addr_cache_mutex);
+                
+                if (!use_cached) {
+                    // Try to parse as IP address first
+                    if (inet_aton(host, &addr.sin_addr) == 0) {
+                        // If inet_aton fails, check if we have a cached address (pre-resolved in RINIT)
+                        // If no cache, fail gracefully instead of calling getaddrinfo from unsafe context
+                        pthread_mutex_lock(&agent_addr_cache_mutex);
+                        int cache_available = agent_addr_cached && cached_agent_host;
+                        pthread_mutex_unlock(&agent_addr_cache_mutex);
+                        
+                        if (!cache_available) {
+                            // No cache available - this might be called from unsafe context
+                            // Fail gracefully instead of calling getaddrinfo
+                            debug_log("[SEND] Cannot resolve host (no cache, unsafe context): %s", host);
                             close(sock);
-                            sock = -1;
+                            efree(path_copy);
+                            if (msg) efree(msg);
+                            return;
                         }
+                        
+                        // Cache exists - use it (should be for same host/port if pre-resolved correctly)
+                        pthread_mutex_lock(&agent_addr_cache_mutex);
+                        if (cached_agent_host) {
+                            memcpy(&addr.sin_addr, &cached_agent_addr.sin_addr, sizeof(addr.sin_addr));
+                        } else {
+                            pthread_mutex_unlock(&agent_addr_cache_mutex);
+                            debug_log("[SEND] Cache corrupted - cannot resolve host: %s", host);
+                            close(sock);
+                            efree(path_copy);
+                            if (msg) efree(msg);
+                            return;
+                        }
+                        pthread_mutex_unlock(&agent_addr_cache_mutex);
                     } else {
-                        debug_log("[SEND] Failed to resolve host: %s (getaddrinfo error: %s)", host, gai_strerror(gai_result));
-                        close(sock);
-                        sock = -1;
+                        // IP address parsed successfully, cache it
+                        pthread_mutex_lock(&agent_addr_cache_mutex);
+                        if (cached_agent_host) {
+                            efree(cached_agent_host);
+                        }
+                        cached_agent_host = estrdup(host);
+                        cached_agent_port = port;
+                        memcpy(&cached_agent_addr.sin_addr, &addr.sin_addr, sizeof(cached_agent_addr.sin_addr));
+                        agent_addr_cached = 1;
+                        pthread_mutex_unlock(&agent_addr_cache_mutex);
                     }
+                }
+                
+                // Check if address resolution succeeded
+                if (addr.sin_addr.s_addr == 0) {
+                    debug_log("[SEND] Failed to resolve host address: %s", host);
+                    close(sock);
+                    sock = -1;
                 }
                 
                 if (sock >= 0) {
@@ -173,13 +320,7 @@ void send_message_direct(char *msg, int compress) {
     
     if (sock >= 0 && conn_result == 0) {
         debug_log("[SEND] Connected to %s, sending %zu bytes", is_unix_socket ? "Unix socket" : "TCP", final_len);
-        char fields[256];
-        if (is_unix_socket) {
-            snprintf(fields, sizeof(fields), "{\"socket_path\":\"%s\",\"bytes\":%zu}", sock_path, final_len);
-        } else {
-            snprintf(fields, sizeof(fields), "{\"tcp_address\":\"%s\",\"bytes\":%zu}", sock_path, final_len);
-        }
-        log_info("Connected to agent", fields);
+        // NOTE: Do NOT call log_info() here - it would cause infinite recursion since log_info calls send_message_direct
         size_t sent = 0;
         while (sent < final_len) {
             ssize_t w = write(sock, final_msg + sent, final_len - sent);
@@ -195,7 +336,8 @@ void send_message_direct(char *msg, int compress) {
                     snprintf(fields, sizeof(fields), "{\"bytes_written\":%zd,\"bytes_sent\":%zu,\"bytes_total\":%zu,\"errno\":%d,\"transport\":\"tcp\"}", 
                             w, sent, final_len, errno);
                 }
-                log_error("Failed to write to agent", error_msg, fields);
+                // NOTE: Do NOT call log_error() here - it would cause infinite recursion since log_error calls send_message_direct
+                debug_log("[SEND] Error: %s", error_msg);
                 break;
             }
             sent += w;
@@ -214,7 +356,8 @@ void send_message_direct(char *msg, int compress) {
                 snprintf(fields, sizeof(fields), "{\"tcp_address\":\"%s\",\"errno\":%d,\"errno_str\":\"%s\",\"transport\":\"tcp\"}", 
                         sock_path, errno, strerror(errno));
             }
-            log_error("Failed to connect to agent", error_msg, fields);
+            // NOTE: Do NOT call log_error() here - it would cause infinite recursion since log_error calls send_message_direct
+            debug_log("[SEND] Error: %s", error_msg);
             close(sock);
         } else {
             debug_log("[SEND] Failed to create socket for %s: %s", is_unix_socket ? "Unix socket" : "TCP", sock_path);
@@ -225,6 +368,14 @@ void send_message_direct(char *msg, int compress) {
         close(sock);
     }
     
-    efree(final_msg);
+    // Free the message
+    // NOTE: During shutdown (RSHUTDOWN/MSHUTDOWN), PHP's memory manager may be shutting down
+    // In that case, efree() can cause heap corruption. However, since we're using emalloc/efree
+    // consistently, and the message was allocated with emalloc, we should use efree.
+    // If heap corruption occurs, it's likely due to other issues (like accessing destroyed zvals).
+    // For now, we'll free it - if issues persist, we may need to track shutdown state.
+    if (final_msg) {
+        efree(final_msg);
+    }
 }
 

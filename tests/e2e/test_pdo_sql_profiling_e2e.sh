@@ -13,7 +13,8 @@ set -euo pipefail
 #   MYSQL_PORT: MySQL port (default: 3306)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"" && pwd)}"
+# PROJECT_ROOT should point to php-extension directory (where docker-compose files are)
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 PHP_EXTENSION_DIR="${PROJECT_ROOT}"
 
 # Configuration
@@ -190,9 +191,9 @@ run_php_test() {
             -d opa.enabled=1 \
             -d opa.sampling_rate=1.0 \
             -d opa.collect_internal_functions=1 \
-            -d opa.debug_log=0 \
+            -d opa.debug_log=1 \
             -d opa.service=pdo-sql-profiling-test \
-            /var/www/html/tests/e2e/pdo_sql_profiling_e2e/pdo_sql_profiling_e2e.php 2>&1 | grep -v "^Container" || true
+            /app/tests/e2e/sql/test_pdo_sql_profiling_e2e.php 2>&1 | grep -v "^Container" || true
     
     local php_exit_code=$?
     

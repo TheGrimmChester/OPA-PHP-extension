@@ -39,10 +39,12 @@ services:
     entrypoint: ["/usr/local/bin/docker-entrypoint-custom.sh"]
     command: /app/tests/e2e/helpers/run_sql_test.sh
     networks:
-      - opa_network
+      opa_network:
+        aliases:
+          - opa-agent
     dns:
       - 127.0.0.11  # Docker's embedded DNS server
-      - 8.8.8.8     # Fallback DNS
+    # Remove extra_hosts - let Docker DNS handle opa-agent resolution via network alias
     environment:
       - MYSQL_HOST=mysql
       - MYSQL_PORT=3306
@@ -87,4 +89,5 @@ volumes:
 networks:
   opa_network:
     external: true
+    name: opa_network
 

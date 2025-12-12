@@ -37,7 +37,48 @@ services:
       retries: 10
     command: --default-authentication-plugin=mysql_native_password
 
+  php:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    container_name: opa_php_test
+    volumes:
+      - ../../tests:/var/www/html/tests
+      - ../../tests:/app/tests
+      - ../../php-extension/tests:/app/php-extension/tests
+    working_dir: /app/tests
+    entrypoint: ["/usr/local/bin/docker-entrypoint-custom.sh"]
+    ulimits:
+      core: -1
+    networks:
+      opa_network:
+        aliases:
+          - opa-agent-php
+    dns:
+      - 127.0.0.11  # Docker's embedded DNS server
+    environment:
+      - MYSQL_HOST=mysql-test
+      - MYSQL_PORT=3306
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-test_db}
+      - MYSQL_USER=${MYSQL_USER:-test_user}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-test_password}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-root_password}
+      - OPA_ENABLED=1
+      - OPA_SOCKET_PATH=opa-agent:9090
+      - OPA_SAMPLING_RATE=1.0
+      - OPA_FULL_CAPTURE_THRESHOLD_MS=0
+      - OPA_STACK_DEPTH=50
+      - OPA_BUFFER_SIZE=131072
+      - OPA_COLLECT_INTERNAL_FUNCTIONS=1
+      - OPA_DEBUG_LOG=1
+      - OPA_ORGANIZATION_ID=default-org
+      - OPA_PROJECT_ID=default-project
+      - OPA_SERVICE=pdo-sql-profiling-test
+      - OPA_LANGUAGE=php
+      - OPA_LANGUAGE_VERSION=8.4
+
 networks:
   opa_network:
     external: true
+    name: opa_network
 
