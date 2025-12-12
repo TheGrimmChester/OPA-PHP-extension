@@ -366,17 +366,72 @@ char* serialize_http_request_json_universal(void) {
         
         if (num_elements > 0) {
             zval *method_zv = zend_hash_str_find(Z_ARRVAL_P(server), "REQUEST_METHOD", sizeof("REQUEST_METHOD")-1);
-            zval *uri_zv = zend_hash_str_find(Z_ARRVAL_P(server), "REQUEST_URI", sizeof("REQUEST_URI")-1);
             zval *query_zv = zend_hash_str_find(Z_ARRVAL_P(server), "QUERY_STRING", sizeof("QUERY_STRING")-1);
             zval *remote_zv = zend_hash_str_find(Z_ARRVAL_P(server), "REMOTE_ADDR", sizeof("REMOTE_ADDR")-1);
             
-            if (method_zv && Z_TYPE_P(method_zv) == IS_STRING &&
-                uri_zv && Z_TYPE_P(uri_zv) == IS_STRING) {
+            // For Symfony and frameworks with front controllers, prefer PATH_INFO over REQUEST_URI
+            // Store both: uri (cleaned route) and request_uri (original full path)
+            zval *path_info_zv = zend_hash_str_find(Z_ARRVAL_P(server), "PATH_INFO", sizeof("PATH_INFO")-1);
+            zval *uri_zv = zend_hash_str_find(Z_ARRVAL_P(server), "REQUEST_URI", sizeof("REQUEST_URI")-1);
+            const char *request_uri_original = NULL;
+            size_t request_uri_original_len = 0;
+            
+            // Capture original REQUEST_URI (without query string) for storage
+            if (uri_zv && Z_TYPE_P(uri_zv) == IS_STRING && Z_STRLEN_P(uri_zv) > 0) {
+                const char *raw_uri = Z_STRVAL_P(uri_zv);
+                char *query_start = strchr(raw_uri, '?');
+                request_uri_original_len = query_start ? (query_start - raw_uri) : Z_STRLEN_P(uri_zv);
+                // Store original REQUEST_URI (we'll include it in JSON)
+                static char request_uri_buf[2048];
+                if (request_uri_original_len < sizeof(request_uri_buf) - 1) {
+                    memcpy(request_uri_buf, raw_uri, request_uri_original_len);
+                    request_uri_buf[request_uri_original_len] = '\0';
+                    request_uri_original = request_uri_buf;
+                } else {
+                    request_uri_original = raw_uri;
+                }
+            }
+            
+            if (path_info_zv && Z_TYPE_P(path_info_zv) == IS_STRING && Z_STRLEN_P(path_info_zv) > 0) {
+                // Use PATH_INFO (actual route without front controller)
+                uri = Z_STRVAL_P(path_info_zv);
+                uri_len = Z_STRLEN_P(path_info_zv);
+                debug_log("[serialize_http_request_json_universal] Using PATH_INFO: %s (original REQUEST_URI: %s)", uri, request_uri_original ? request_uri_original : "N/A");
+            } else if (uri_zv && Z_TYPE_P(uri_zv) == IS_STRING && Z_STRLEN_P(uri_zv) > 0) {
+                // Fallback to REQUEST_URI, but clean it
+                const char *raw_uri = Z_STRVAL_P(uri_zv);
+                // Remove query string
+                char *query_start = strchr(raw_uri, '?');
+                size_t raw_uri_len = query_start ? (query_start - raw_uri) : Z_STRLEN_P(uri_zv);
                 
+                // Remove /index.php prefix if present
+                if (raw_uri_len >= 10 && strncmp(raw_uri, "/index.php", 10) == 0) {
+                    if (raw_uri_len == 10) {
+                        uri = "/";
+                        uri_len = 1;
+                    } else {
+                        uri = raw_uri + 10; // Skip /index.php
+                        uri_len = raw_uri_len - 10;
+                    }
+                    debug_log("[serialize_http_request_json_universal] Cleaned REQUEST_URI (removed /index.php): %s (original: %s)", uri, request_uri_original ? request_uri_original : "N/A");
+                } else {
+                    // No /index.php prefix, use as-is but remove query string
+                    static char cleaned_uri[2048];
+                    if (raw_uri_len < sizeof(cleaned_uri) - 1) {
+                        memcpy(cleaned_uri, raw_uri, raw_uri_len);
+                        cleaned_uri[raw_uri_len] = '\0';
+                        uri = cleaned_uri;
+                        uri_len = raw_uri_len;
+                    } else {
+                        uri = raw_uri;
+                        uri_len = raw_uri_len;
+                    }
+                }
+            }
+            
+            if (method_zv && Z_TYPE_P(method_zv) == IS_STRING && uri) {
                 method = Z_STRVAL_P(method_zv);
                 method_len = Z_STRLEN_P(method_zv);
-                uri = Z_STRVAL_P(uri_zv);
-                uri_len = Z_STRLEN_P(uri_zv);
                 if (query_zv && Z_TYPE_P(query_zv) == IS_STRING) {
                     query = Z_STRVAL_P(query_zv);
                     query_len = Z_STRLEN_P(query_zv);
@@ -428,7 +483,7 @@ char* serialize_http_request_json_universal(void) {
                 
                 request_size = body_size + query_len + file_size + header_size;
                 
-                char buf[2048];
+                char buf[3072]; // Increased buffer size for request_uri field
                 int pos = snprintf(buf, sizeof(buf),
                     "{\"method\":\"%s\",\"uri\":\"%s\","
                      "\"query_string\":\"%s\",\"remote_addr\":\"%s\","
@@ -437,6 +492,11 @@ char* serialize_http_request_json_universal(void) {
                     uri,
                     query,
                     remote_zv && Z_TYPE_P(remote_zv) == IS_STRING ? Z_STRVAL_P(remote_zv) : "unknown");
+                
+                // Add original request_uri if available (for ClickHouse storage)
+                if (request_uri_original && strlen(request_uri_original) > 0) {
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_uri\":\"%s\"", request_uri_original);
+                }
                 
                 // Always add request_size (even if 0, for debugging)
                 pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_size\":%zu", request_size);
@@ -468,11 +528,27 @@ char* serialize_http_request_json_universal(void) {
     
     request_size = body_size + query_len + header_size;
     
-    char buf[1024];
+    char buf[2048]; // Increased buffer size for request_uri field
     int pos = snprintf(buf, sizeof(buf),
         "{\"method\":\"%s\",\"uri\":\"%s\",\"query_string\":\"%s\","
          "\"source\":\"SAPI\"",
         method, uri, query);
+    
+    // Add original request_uri if available (for ClickHouse storage)
+    // For SAPI fallback, REQUEST_URI from SG(request_info) is the original
+    if (SG(request_info).request_uri && strlen(SG(request_info).request_uri) > 0) {
+        const char *raw_uri = SG(request_info).request_uri;
+        char *query_start = strchr(raw_uri, '?');
+        size_t uri_len = query_start ? (query_start - raw_uri) : strlen(raw_uri);
+        static char request_uri_buf[2048];
+        if (uri_len < sizeof(request_uri_buf) - 1) {
+            memcpy(request_uri_buf, raw_uri, uri_len);
+            request_uri_buf[uri_len] = '\0';
+            pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_uri\":\"%s\"", request_uri_buf);
+        } else {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_uri\":\"%.2047s\"", raw_uri);
+        }
+    }
     
     // Always add request_size (even if 0, for debugging)
     pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_size\":%zu", request_size);
@@ -516,6 +592,7 @@ char* serialize_http_request_json(zval *server) {
     const char *method = SG(request_info).request_method ? SG(request_info).request_method : "GET";
     const char *uri = SG(request_info).request_uri ? SG(request_info).request_uri : "/";
     const char *query = SG(request_info).query_string ? SG(request_info).query_string : "";
+    const char *request_uri_original = NULL;
     
     debug_log("[serialize_http_request_json] Starting with method=%s, uri=%s, query=%s", method, uri, query);
     
@@ -534,6 +611,54 @@ char* serialize_http_request_json(zval *server) {
     }
     
     if (server_zv && Z_TYPE_P(server_zv) == IS_ARRAY) {
+        // For Symfony and frameworks with front controllers, prefer PATH_INFO over REQUEST_URI
+        // Store both: uri (cleaned route) and request_uri (original full path)
+        zval *path_info_zv = zend_hash_str_find(Z_ARRVAL_P(server_zv), "PATH_INFO", sizeof("PATH_INFO")-1);
+        zval *request_uri_zv = zend_hash_str_find(Z_ARRVAL_P(server_zv), "REQUEST_URI", sizeof("REQUEST_URI")-1);
+        
+        // Capture original REQUEST_URI (without query string) for storage
+        if (request_uri_zv && Z_TYPE_P(request_uri_zv) == IS_STRING && Z_STRLEN_P(request_uri_zv) > 0) {
+            const char *raw_uri = Z_STRVAL_P(request_uri_zv);
+            char *query_start = strchr(raw_uri, '?');
+            size_t request_uri_len = query_start ? (query_start - raw_uri) : Z_STRLEN_P(request_uri_zv);
+            // Store original REQUEST_URI (we'll include it in JSON)
+            static char request_uri_buf[2048];
+            if (request_uri_len < sizeof(request_uri_buf) - 1) {
+                memcpy(request_uri_buf, raw_uri, request_uri_len);
+                request_uri_buf[request_uri_len] = '\0';
+                request_uri_original = request_uri_buf;
+            } else {
+                request_uri_original = raw_uri;
+            }
+        }
+        
+        // Prefer PATH_INFO for cleaned route
+        if (path_info_zv && Z_TYPE_P(path_info_zv) == IS_STRING && Z_STRLEN_P(path_info_zv) > 0) {
+            uri = Z_STRVAL_P(path_info_zv);
+            debug_log("[serialize_http_request_json] Using PATH_INFO: %s (original REQUEST_URI: %s)", uri, request_uri_original ? request_uri_original : "N/A");
+        } else if (request_uri_zv && Z_TYPE_P(request_uri_zv) == IS_STRING && Z_STRLEN_P(request_uri_zv) > 0) {
+            // Fallback: try to clean REQUEST_URI by removing /index.php prefix
+            const char *raw_uri = Z_STRVAL_P(request_uri_zv);
+            char *query_start = strchr(raw_uri, '?');
+            size_t uri_len = query_start ? (query_start - raw_uri) : Z_STRLEN_P(request_uri_zv);
+            // Remove /index.php prefix if present
+            if (uri_len >= 10 && strncmp(raw_uri, "/index.php", 10) == 0) {
+                if (uri_len == 10) {
+                    uri = "/";
+                } else {
+                    // Create cleaned URI (skip /index.php)
+                    static char cleaned_uri[2048];
+                    size_t cleaned_len = uri_len - 10;
+                    if (cleaned_len < sizeof(cleaned_uri)) {
+                        memcpy(cleaned_uri, raw_uri + 10, cleaned_len);
+                        cleaned_uri[cleaned_len] = '\0';
+                        uri = cleaned_uri;
+                    }
+                }
+                debug_log("[serialize_http_request_json] Cleaned REQUEST_URI (removed /index.php): %s (original: %s)", uri, request_uri_original ? request_uri_original : "N/A");
+            }
+        }
+        
         zval *zv = zend_hash_str_find(Z_ARRVAL_P(server_zv), "REQUEST_SCHEME", sizeof("REQUEST_SCHEME")-1);
         if (zv && Z_TYPE_P(zv) == IS_STRING && Z_STRLEN_P(zv) > 0) {
             scheme = Z_STRVAL_P(zv);
@@ -554,11 +679,12 @@ char* serialize_http_request_json(zval *server) {
         }
     }
     
-    // Allocate buffer (estimate: 400 + lengths)
+    // Allocate buffer (estimate: 400 + lengths + request_uri)
     size_t method_len = strlen(method);
     size_t uri_len = strlen(uri);
     size_t query_len = strlen(query);
-    size_t buf_size = 400 + method_len + uri_len + query_len + (host_len ? host_len : 0);
+    size_t request_uri_len = request_uri_original ? strlen(request_uri_original) : 0;
+    size_t buf_size = 400 + method_len + uri_len + query_len + (host_len ? host_len : 0) + request_uri_len + 50;
     char *result = malloc(buf_size);
     if (!result) {
         return strdup("{\"scheme\":\"http\",\"method\":\"GET\",\"uri\":\"/\"}");
@@ -568,6 +694,11 @@ char* serialize_http_request_json(zval *server) {
     int pos = snprintf(result, buf_size, 
         "{\"scheme\":\"%s\",\"method\":\"%s\",\"uri\":\"%s\"", 
         scheme, method, uri);
+    
+    // Add original request_uri if available (for ClickHouse storage)
+    if (request_uri_original && strlen(request_uri_original) > 0) {
+        pos += snprintf(result + pos, buf_size - pos, ",\"request_uri\":\"%s\"", request_uri_original);
+    }
     
     if (host && host_len > 0 && host_len < 200) {
         pos += snprintf(result + pos, buf_size - pos, ",\"host\":\"%.*s\"", (int)host_len, host);
@@ -3896,15 +4027,55 @@ PHP_RINIT_FUNCTION(opa) {
                 const char *uri = SG(request_info).request_uri ? SG(request_info).request_uri : "/";
                 
                 // Also try PG(http_globals) for method/URI if SG doesn't have them
+                // For Symfony and other frameworks with front controllers, prefer PATH_INFO over REQUEST_URI
                 zval *server = &PG(http_globals)[TRACK_VARS_SERVER];
                 if (server && Z_TYPE_P(server) == IS_ARRAY) {
                     zval *method_zv = zend_hash_str_find(Z_ARRVAL_P(server), "REQUEST_METHOD", sizeof("REQUEST_METHOD")-1);
-                    zval *uri_zv = zend_hash_str_find(Z_ARRVAL_P(server), "REQUEST_URI", sizeof("REQUEST_URI")-1);
                     if (method_zv && Z_TYPE_P(method_zv) == IS_STRING) {
                         method = Z_STRVAL_P(method_zv);
                     }
-                    if (uri_zv && Z_TYPE_P(uri_zv) == IS_STRING) {
-                        uri = Z_STRVAL_P(uri_zv);
+                    
+                    // Prefer PATH_INFO for Symfony/frameworks (actual route without front controller)
+                    // Fallback to REQUEST_URI if PATH_INFO not available
+                    zval *path_info_zv = zend_hash_str_find(Z_ARRVAL_P(server), "PATH_INFO", sizeof("PATH_INFO")-1);
+                    if (path_info_zv && Z_TYPE_P(path_info_zv) == IS_STRING && Z_STRLEN_P(path_info_zv) > 0) {
+                        uri = Z_STRVAL_P(path_info_zv);
+                        debug_log("[RINIT] Using PATH_INFO for URI: %s", uri);
+                    } else {
+                        zval *uri_zv = zend_hash_str_find(Z_ARRVAL_P(server), "REQUEST_URI", sizeof("REQUEST_URI")-1);
+                        if (uri_zv && Z_TYPE_P(uri_zv) == IS_STRING) {
+                            uri = Z_STRVAL_P(uri_zv);
+                            // Remove query string from REQUEST_URI if present
+                            char *query_start = strchr(uri, '?');
+                            if (query_start) {
+                                size_t uri_len = query_start - uri;
+                                char *clean_uri = malloc(uri_len + 1);
+                                if (clean_uri) {
+                                    memcpy(clean_uri, uri, uri_len);
+                                    clean_uri[uri_len] = '\0';
+                                    // Try to remove /index.php prefix if present
+                                    if (strncmp(clean_uri, "/index.php", 10) == 0) {
+                                        if (clean_uri[10] == '\0') {
+                                            uri = "/";
+                                        } else {
+                                            uri = clean_uri + 10;
+                                        }
+                                    } else {
+                                        uri = clean_uri;
+                                    }
+                                }
+                            } else {
+                                // Remove /index.php prefix if present
+                                if (strncmp(uri, "/index.php", 10) == 0) {
+                                    if (uri[10] == '\0') {
+                                        uri = "/";
+                                    } else {
+                                        uri = uri + 10;
+                                    }
+                                }
+                            }
+                            debug_log("[RINIT] Using REQUEST_URI (cleaned): %s", uri);
+                        }
                     }
                 }
                 
