@@ -342,6 +342,172 @@ char* serialize_cli_args_json(zval *argv) {
 char* serialize_http_request_json_universal(void);
 char* safe_serialize_request(void);
 
+// Helper: Calculate JSON-escaped length (worst case: every char becomes 6 chars for \\uXXXX)
+static size_t json_escaped_length(const char *str, size_t len) {
+    size_t escaped_len = 0;
+    const char *p = str;
+    const char *end = str + len;
+    while (p < end) {
+        unsigned char c = *p++;
+        switch (c) {
+            case '"': case '\\': case '\b': case '\f': case '\n': case '\r': case '\t':
+                escaped_len += 2; // Escaped as \x
+                break;
+            default:
+                if (c < 0x20) {
+                    escaped_len += 6; // Escaped as \uXXXX
+                } else {
+                    escaped_len += 1;
+                }
+                break;
+        }
+    }
+    return escaped_len;
+}
+
+// Helper: Escape JSON string and write to buffer
+static size_t json_escape_and_write(char *dest, size_t dest_size, const char *str, size_t len) {
+    size_t pos = 0;
+    const char *p = str;
+    const char *end = str + len;
+    while (p < end && pos < dest_size - 1) {
+        unsigned char c = *p++;
+        switch (c) {
+            case '"':
+                if (pos + 2 < dest_size) {
+                    dest[pos++] = '\\';
+                    dest[pos++] = '"';
+                }
+                break;
+            case '\\':
+                if (pos + 2 < dest_size) {
+                    dest[pos++] = '\\';
+                    dest[pos++] = '\\';
+                }
+                break;
+            case '\b':
+                if (pos + 2 < dest_size) {
+                    dest[pos++] = '\\';
+                    dest[pos++] = 'b';
+                }
+                break;
+            case '\f':
+                if (pos + 2 < dest_size) {
+                    dest[pos++] = '\\';
+                    dest[pos++] = 'f';
+                }
+                break;
+            case '\n':
+                if (pos + 2 < dest_size) {
+                    dest[pos++] = '\\';
+                    dest[pos++] = 'n';
+                }
+                break;
+            case '\r':
+                if (pos + 2 < dest_size) {
+                    dest[pos++] = '\\';
+                    dest[pos++] = 'r';
+                }
+                break;
+            case '\t':
+                if (pos + 2 < dest_size) {
+                    dest[pos++] = '\\';
+                    dest[pos++] = 't';
+                }
+                break;
+            default:
+                if (c < 0x20) {
+                    if (pos + 6 < dest_size) {
+                        snprintf(dest + pos, dest_size - pos, "\\u%04x", c);
+                        pos += 6;
+                    }
+                } else {
+                    dest[pos++] = c;
+                }
+                break;
+        }
+    }
+    dest[pos] = '\0';
+    return pos;
+}
+
+// Helper: Add server field to JSON buffer with proper escaping and reallocation
+// Returns new position in buffer, updates *result and *buf_size if reallocation occurs
+static int add_server_field_json(char **result, size_t *buf_size, int pos, 
+                                 zval *server_zv, const char *server_key, size_t server_key_len,
+                                 const char *json_key, size_t max_len, int field_type) {
+    // field_type: 0 = string, 1 = integer, 2 = boolean (presence)
+    if (!server_zv || Z_TYPE_P(server_zv) != IS_ARRAY) {
+        return pos;
+    }
+    
+    zval *zv = zend_hash_str_find(Z_ARRVAL_P(server_zv), server_key, server_key_len);
+    if (!zv) {
+        return pos;
+    }
+    
+    // Calculate required space for this field
+    size_t required_space = 0;
+    char temp_buf[128];
+    
+    if (field_type == 0) { // String field
+        if (Z_TYPE_P(zv) != IS_STRING || Z_STRLEN_P(zv) == 0 || Z_STRLEN_P(zv) > max_len) {
+            return pos;
+        }
+        // Calculate: ,"key":"escaped_value"
+        size_t escaped_len = json_escaped_length(Z_STRVAL_P(zv), Z_STRLEN_P(zv));
+        required_space = 3 + strlen(json_key) + 2 + escaped_len; // ,"key":"value"
+    } else if (field_type == 1) { // Integer field
+        if (Z_TYPE_P(zv) == IS_LONG) {
+            snprintf(temp_buf, sizeof(temp_buf), "%ld", Z_LVAL_P(zv));
+            required_space = 3 + strlen(json_key) + 1 + strlen(temp_buf); // ,"key":value
+        } else if (Z_TYPE_P(zv) == IS_STRING && Z_STRLEN_P(zv) > 0 && Z_STRLEN_P(zv) < max_len) {
+            // Try to parse as integer
+            long port_val = strtol(Z_STRVAL_P(zv), NULL, 10);
+            if (port_val > 0 && port_val < 65536) {
+                snprintf(temp_buf, sizeof(temp_buf), "%ld", port_val);
+                required_space = 3 + strlen(json_key) + 1 + strlen(temp_buf);
+            } else {
+                return pos;
+            }
+        } else {
+            return pos;
+        }
+    } else if (field_type == 2) { // Boolean presence
+        if (Z_TYPE_P(zv) == IS_STRING && Z_STRLEN_P(zv) > 0) {
+            required_space = 3 + strlen(json_key) + 1 + 4; // ,"key":true
+        } else {
+            return pos;
+        }
+    }
+    
+    // Reallocate buffer if needed
+    if (pos + required_space >= *buf_size) {
+        size_t new_size = (*buf_size) * 2 + required_space + 100;
+        char *new_result = realloc(*result, new_size);
+        if (!new_result) {
+            return pos; // Reallocation failed, skip this field
+        }
+        *result = new_result;
+        *buf_size = new_size;
+    }
+    
+    // Add field to JSON
+    if (field_type == 0) { // String
+        pos += snprintf(*result + pos, *buf_size - pos, ",\"%s\":\"", json_key);
+        size_t escaped_written = json_escape_and_write(*result + pos, *buf_size - pos, 
+                                                       Z_STRVAL_P(zv), Z_STRLEN_P(zv));
+        pos += escaped_written;
+        pos += snprintf(*result + pos, *buf_size - pos, "\"");
+    } else if (field_type == 1) { // Integer
+        pos += snprintf(*result + pos, *buf_size - pos, ",\"%s\":%s", json_key, temp_buf);
+    } else if (field_type == 2) { // Boolean presence
+        pos += snprintf(*result + pos, *buf_size - pos, ",\"%s\":true", json_key);
+    }
+    
+    return pos;
+}
+
 // FPM-Optimized Universal Serializer - PG(http_globals) FIRST, then SG(request_info) fallback
 // FPM pattern: SG(request_info) NULL → PG(http_globals) populated
 // CRITICAL: Must call zend_is_auto_global() to initialize $_SERVER before accessing PG(http_globals)
@@ -483,8 +649,14 @@ char* serialize_http_request_json_universal(void) {
                 
                 request_size = body_size + query_len + file_size + header_size;
                 
-                char buf[3072]; // Increased buffer size for request_uri field
-                int pos = snprintf(buf, sizeof(buf),
+                // Allocate dynamic buffer with initial size to accommodate extended fields
+                size_t buf_size = 6000; // Increased initial buffer size for extended fields
+                char *buf = malloc(buf_size);
+                if (!buf) {
+                    return strdup("{\"method\":\"GET\",\"uri\":\"/\"}");
+                }
+                
+                int pos = snprintf(buf, buf_size,
                     "{\"method\":\"%s\",\"uri\":\"%s\","
                      "\"query_string\":\"%s\",\"remote_addr\":\"%s\","
                      "\"source\":\"PG\"",
@@ -495,18 +667,81 @@ char* serialize_http_request_json_universal(void) {
                 
                 // Add original request_uri if available (for ClickHouse storage)
                 if (request_uri_original && strlen(request_uri_original) > 0) {
-                    pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_uri\":\"%s\"", request_uri_original);
+                    if (pos + 1000 < buf_size) {
+                        pos += snprintf(buf + pos, buf_size - pos, ",\"request_uri\":\"%s\"", request_uri_original);
+                    }
+                }
+                
+                // Add extended fields from $_SERVER
+                pos = add_server_field_json(&buf, &buf_size, pos, server, "HTTP_USER_AGENT", sizeof("HTTP_USER_AGENT")-1, "user_agent", 500, 0);
+                pos = add_server_field_json(&buf, &buf_size, pos, server, "HTTP_REFERER", sizeof("HTTP_REFERER")-1, "referer", 1000, 0);
+                pos = add_server_field_json(&buf, &buf_size, pos, server, "HTTP_ACCEPT_LANGUAGE", sizeof("HTTP_ACCEPT_LANGUAGE")-1, "accept_language", 200, 0);
+                pos = add_server_field_json(&buf, &buf_size, pos, server, "HTTP_CONTENT_TYPE", sizeof("HTTP_CONTENT_TYPE")-1, "content_type", 200, 0);
+                pos = add_server_field_json(&buf, &buf_size, pos, server, "HTTP_ACCEPT", sizeof("HTTP_ACCEPT")-1, "accept", 500, 0);
+                pos = add_server_field_json(&buf, &buf_size, pos, server, "HTTP_ACCEPT_ENCODING", sizeof("HTTP_ACCEPT_ENCODING")-1, "accept_encoding", 200, 0);
+                pos = add_server_field_json(&buf, &buf_size, pos, server, "SERVER_PORT", sizeof("SERVER_PORT")-1, "port", 10, 1);
+                pos = add_server_field_json(&buf, &buf_size, pos, server, "HTTP_X_REQUEST_ID", sizeof("HTTP_X_REQUEST_ID")-1, "request_id", 100, 0);
+                pos = add_server_field_json(&buf, &buf_size, pos, server, "HTTP_X_TRACE_ID", sizeof("HTTP_X_TRACE_ID")-1, "trace_id", 100, 0);
+                pos = add_server_field_json(&buf, &buf_size, pos, server, "HTTP_ORIGIN", sizeof("HTTP_ORIGIN")-1, "origin", 500, 0);
+                pos = add_server_field_json(&buf, &buf_size, pos, server, "HTTP_CONNECTION", sizeof("HTTP_CONNECTION")-1, "connection", 50, 0);
+                
+                // Handle HTTP_COOKIE - size only for security
+                zval *cookie_zv = zend_hash_str_find(Z_ARRVAL_P(server), "HTTP_COOKIE", sizeof("HTTP_COOKIE")-1);
+                if (cookie_zv && Z_TYPE_P(cookie_zv) == IS_STRING && Z_STRLEN_P(cookie_zv) > 0) {
+                    size_t cookie_size = Z_STRLEN_P(cookie_zv);
+                    size_t required_space = 20; // ,"cookie_size":1234
+                    if (pos + required_space >= buf_size) {
+                        size_t new_size = buf_size * 2 + required_space;
+                        char *new_buf = realloc(buf, new_size);
+                        if (new_buf) {
+                            buf = new_buf;
+                            buf_size = new_size;
+                        }
+                    }
+                    if (pos + required_space < buf_size) {
+                        pos += snprintf(buf + pos, buf_size - pos, ",\"cookie_size\":%zu", cookie_size);
+                    }
+                }
+                
+                // Handle HTTP_AUTHORIZATION - presence only for security
+                zval *auth_zv = zend_hash_str_find(Z_ARRVAL_P(server), "HTTP_AUTHORIZATION", sizeof("HTTP_AUTHORIZATION")-1);
+                if (auth_zv && Z_TYPE_P(auth_zv) == IS_STRING && Z_STRLEN_P(auth_zv) > 0) {
+                    size_t required_space = 30; // ,"authorization_present":true
+                    if (pos + required_space >= buf_size) {
+                        size_t new_size = buf_size * 2 + required_space;
+                        char *new_buf = realloc(buf, new_size);
+                        if (new_buf) {
+                            buf = new_buf;
+                            buf_size = new_size;
+                        }
+                    }
+                    if (pos + required_space < buf_size) {
+                        pos += snprintf(buf + pos, buf_size - pos, ",\"authorization_present\":true");
+                    }
                 }
                 
                 // Always add request_size (even if 0, for debugging)
-                pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_size\":%zu", request_size);
-                // Also add breakdown for debugging
-                pos += snprintf(buf + pos, sizeof(buf) - pos, ",\"request_size_breakdown\":{\"body\":%zu,\"query\":%zu,\"files\":%zu,\"headers\":%zu}",
-                    body_size, query_len, file_size, header_size);
+                size_t size_str_len = 200; // Enough for size and breakdown
+                if (pos + size_str_len >= buf_size) {
+                    size_t new_size = buf_size * 2 + size_str_len;
+                    char *new_buf = realloc(buf, new_size);
+                    if (new_buf) {
+                        buf = new_buf;
+                        buf_size = new_size;
+                    }
+                }
+                if (pos + size_str_len < buf_size) {
+                    pos += snprintf(buf + pos, buf_size - pos, ",\"request_size\":%zu", request_size);
+                    // Also add breakdown for debugging
+                    pos += snprintf(buf + pos, buf_size - pos, ",\"request_size_breakdown\":{\"body\":%zu,\"query\":%zu,\"files\":%zu,\"headers\":%zu}",
+                        body_size, query_len, file_size, header_size);
+                }
                 
-                snprintf(buf + pos, sizeof(buf) - pos, "}");
+                if (pos < buf_size) {
+                    snprintf(buf + pos, buf_size - pos, "}");
+                }
                 
-                return strdup(buf);
+                return buf;
             }
         }
     }
@@ -679,12 +914,12 @@ char* serialize_http_request_json(zval *server) {
         }
     }
     
-    // Allocate buffer (estimate: 400 + lengths + request_uri)
+    // Allocate buffer (estimate: increased for extended fields)
     size_t method_len = strlen(method);
     size_t uri_len = strlen(uri);
     size_t query_len = strlen(query);
     size_t request_uri_len = request_uri_original ? strlen(request_uri_original) : 0;
-    size_t buf_size = 400 + method_len + uri_len + query_len + (host_len ? host_len : 0) + request_uri_len + 50;
+    size_t buf_size = 6000 + method_len + uri_len + query_len + (host_len ? host_len : 0) + request_uri_len;
     char *result = malloc(buf_size);
     if (!result) {
         return strdup("{\"scheme\":\"http\",\"method\":\"GET\",\"uri\":\"/\"}");
@@ -697,15 +932,21 @@ char* serialize_http_request_json(zval *server) {
     
     // Add original request_uri if available (for ClickHouse storage)
     if (request_uri_original && strlen(request_uri_original) > 0) {
-        pos += snprintf(result + pos, buf_size - pos, ",\"request_uri\":\"%s\"", request_uri_original);
+        if (pos + request_uri_len + 50 < buf_size) {
+            pos += snprintf(result + pos, buf_size - pos, ",\"request_uri\":\"%s\"", request_uri_original);
+        }
     }
     
     if (host && host_len > 0 && host_len < 200) {
-        pos += snprintf(result + pos, buf_size - pos, ",\"host\":\"%.*s\"", (int)host_len, host);
+        if (pos + host_len + 50 < buf_size) {
+            pos += snprintf(result + pos, buf_size - pos, ",\"host\":\"%.*s\"", (int)host_len, host);
+        }
     }
     
     if (query && *query != '\0' && query_len < 500) {
-        pos += snprintf(result + pos, buf_size - pos, ",\"query_string\":\"%s\"", query);
+        if (pos + query_len + 50 < buf_size) {
+            pos += snprintf(result + pos, buf_size - pos, ",\"query_string\":\"%s\"", query);
+        }
     }
     
     // Try to get IP from $_SERVER if available
@@ -715,7 +956,59 @@ char* serialize_http_request_json(zval *server) {
             zv = zend_hash_str_find(Z_ARRVAL_P(server_zv), "HTTP_X_FORWARDED_FOR", sizeof("HTTP_X_FORWARDED_FOR")-1);
         }
         if (zv && Z_TYPE_P(zv) == IS_STRING && Z_STRLEN_P(zv) > 0 && Z_STRLEN_P(zv) < 50) {
-            pos += snprintf(result + pos, buf_size - pos, ",\"ip\":\"%.*s\"", (int)Z_STRLEN_P(zv), Z_STRVAL_P(zv));
+            if (pos + 100 < buf_size) {
+                pos += snprintf(result + pos, buf_size - pos, ",\"ip\":\"%.*s\"", (int)Z_STRLEN_P(zv), Z_STRVAL_P(zv));
+            }
+        }
+    }
+    
+    // Add extended fields from $_SERVER
+    pos = add_server_field_json(&result, &buf_size, pos, server_zv, "HTTP_USER_AGENT", sizeof("HTTP_USER_AGENT")-1, "user_agent", 500, 0);
+    pos = add_server_field_json(&result, &buf_size, pos, server_zv, "HTTP_REFERER", sizeof("HTTP_REFERER")-1, "referer", 1000, 0);
+    pos = add_server_field_json(&result, &buf_size, pos, server_zv, "HTTP_ACCEPT_LANGUAGE", sizeof("HTTP_ACCEPT_LANGUAGE")-1, "accept_language", 200, 0);
+    pos = add_server_field_json(&result, &buf_size, pos, server_zv, "HTTP_CONTENT_TYPE", sizeof("HTTP_CONTENT_TYPE")-1, "content_type", 200, 0);
+    pos = add_server_field_json(&result, &buf_size, pos, server_zv, "HTTP_ACCEPT", sizeof("HTTP_ACCEPT")-1, "accept", 500, 0);
+    pos = add_server_field_json(&result, &buf_size, pos, server_zv, "HTTP_ACCEPT_ENCODING", sizeof("HTTP_ACCEPT_ENCODING")-1, "accept_encoding", 200, 0);
+    pos = add_server_field_json(&result, &buf_size, pos, server_zv, "SERVER_PORT", sizeof("SERVER_PORT")-1, "port", 10, 1);
+    pos = add_server_field_json(&result, &buf_size, pos, server_zv, "HTTP_X_REQUEST_ID", sizeof("HTTP_X_REQUEST_ID")-1, "request_id", 100, 0);
+    pos = add_server_field_json(&result, &buf_size, pos, server_zv, "HTTP_X_TRACE_ID", sizeof("HTTP_X_TRACE_ID")-1, "trace_id", 100, 0);
+    pos = add_server_field_json(&result, &buf_size, pos, server_zv, "HTTP_ORIGIN", sizeof("HTTP_ORIGIN")-1, "origin", 500, 0);
+    pos = add_server_field_json(&result, &buf_size, pos, server_zv, "HTTP_CONNECTION", sizeof("HTTP_CONNECTION")-1, "connection", 50, 0);
+    
+    // Handle HTTP_COOKIE - size only for security
+    if (server_zv && Z_TYPE_P(server_zv) == IS_ARRAY) {
+        zval *cookie_zv = zend_hash_str_find(Z_ARRVAL_P(server_zv), "HTTP_COOKIE", sizeof("HTTP_COOKIE")-1);
+        if (cookie_zv && Z_TYPE_P(cookie_zv) == IS_STRING && Z_STRLEN_P(cookie_zv) > 0) {
+            size_t cookie_size = Z_STRLEN_P(cookie_zv);
+            size_t required_space = 20; // ,"cookie_size":1234
+            if (pos + required_space >= buf_size) {
+                size_t new_size = buf_size * 2 + required_space;
+                char *new_result = realloc(result, new_size);
+                if (new_result) {
+                    result = new_result;
+                    buf_size = new_size;
+                }
+            }
+            if (pos + required_space < buf_size) {
+                pos += snprintf(result + pos, buf_size - pos, ",\"cookie_size\":%zu", cookie_size);
+            }
+        }
+        
+        // Handle HTTP_AUTHORIZATION - presence only for security
+        zval *auth_zv = zend_hash_str_find(Z_ARRVAL_P(server_zv), "HTTP_AUTHORIZATION", sizeof("HTTP_AUTHORIZATION")-1);
+        if (auth_zv && Z_TYPE_P(auth_zv) == IS_STRING && Z_STRLEN_P(auth_zv) > 0) {
+            size_t required_space = 30; // ,"authorization_present":true
+            if (pos + required_space >= buf_size) {
+                size_t new_size = buf_size * 2 + required_space;
+                char *new_result = realloc(result, new_size);
+                if (new_result) {
+                    result = new_result;
+                    buf_size = new_size;
+                }
+            }
+            if (pos + required_space < buf_size) {
+                pos += snprintf(result + pos, buf_size - pos, ",\"authorization_present\":true");
+            }
         }
     }
     
@@ -783,7 +1076,7 @@ char* serialize_http_request_json(zval *server) {
     
     // Always add request_size field to JSON (even if 0, for debugging)
     // Check if we have enough buffer space, if not, realloc
-    size_t size_str_len = 64; // Enough for size_t as string
+    size_t size_str_len = 200; // Enough for size and breakdown
     if (pos + size_str_len >= buf_size) {
         size_t new_size = buf_size * 2 + size_str_len;
         char *new_result = realloc(result, new_size);
@@ -793,15 +1086,15 @@ char* serialize_http_request_json(zval *server) {
         }
     }
     if (result && (pos + size_str_len < buf_size)) {
-        char size_str[64];
-        snprintf(size_str, sizeof(size_str), "%zu", request_size);
-        pos += snprintf(result + pos, buf_size - pos, ",\"request_size\":%s", size_str);
+        pos += snprintf(result + pos, buf_size - pos, ",\"request_size\":%zu", request_size);
         // Also add breakdown for debugging
         pos += snprintf(result + pos, buf_size - pos, ",\"request_size_breakdown\":{\"body\":%zu,\"query\":%zu,\"files\":%zu,\"headers\":%zu}",
             body_size, query_size, file_size, header_size);
     }
     
-    snprintf(result + pos, buf_size - pos, "}");
+    if (pos < buf_size) {
+        snprintf(result + pos, buf_size - pos, "}");
+    }
     
     return result;
 }
