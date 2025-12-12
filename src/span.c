@@ -718,17 +718,13 @@ char* produce_span_json_from_values(
         json_buffer_append_str(&buf, "[]");
     }
     
-    // Serialize call stack - only if expand_spans is false (send child spans separately)
-    // If expand_spans is true, we send child spans as separate messages, so no need for stack field
-    if (!OPA_G(expand_spans)) {
-        debug_log("[produce_span_json_from_values] expand_spans=false, serializing call stack in root span");
-        json_buffer_append_str(&buf, ",\"stack\":");
-        serialize_call_stack_from_root_malloc(&buf);
-        debug_log("[produce_span_json_from_values] Call stack serialization completed");
-    } else {
-        debug_log("[produce_span_json_from_values] expand_spans=true, skipping stack (child spans sent separately)");
-        json_buffer_append_str(&buf, ",\"stack\":[]");
-    }
+    // Always serialize call stack - needed for ExecutionStackTree view even when expand_spans is enabled
+    // When expand_spans is true, we also send child spans as separate messages for other views,
+    // but the full call stack is still needed for the tree visualization
+    debug_log("[produce_span_json_from_values] Serializing call stack (expand_spans=%d)", OPA_G(expand_spans));
+    json_buffer_append_str(&buf, ",\"stack\":");
+    serialize_call_stack_from_root_malloc(&buf);
+    debug_log("[produce_span_json_from_values] Call stack serialization completed");
     
     json_buffer_append_str(&buf, "}\n");
     
