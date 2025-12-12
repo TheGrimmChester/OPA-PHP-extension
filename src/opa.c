@@ -2886,8 +2886,6 @@ PHP_RINIT_FUNCTION(opa) {
         global_collector->global_sql_queries = ecalloc(1, sizeof(zval));
         if (global_collector->global_sql_queries) {
             array_init(global_collector->global_sql_queries);
-            fprintf(stderr, "[OPA RINIT] Initialized global_sql_queries array\n");
-            fflush(stderr);
         }
         pthread_mutex_unlock(&global_collector->global_sql_mutex);
     }
@@ -3066,8 +3064,6 @@ PHP_RINIT_FUNCTION(opa) {
         global_collector->global_sql_queries = ecalloc(1, sizeof(zval));
         if (global_collector->global_sql_queries) {
             array_init(global_collector->global_sql_queries);
-            fprintf(stderr, "[OPA RINIT] Initialized global_sql_queries array\n");
-            fflush(stderr);
         }
         pthread_mutex_unlock(&global_collector->global_sql_mutex);
     }

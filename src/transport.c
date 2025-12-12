@@ -9,25 +9,15 @@ static int agent_addr_cached = 0;
 
 // Pre-resolve agent address in RINIT (before observer callbacks) to avoid DNS calls from unsafe contexts
 void pre_resolve_agent_address(void) {
-    fprintf(stderr, "[OPA Pre-resolve] Starting pre-resolution\n");
-    fflush(stderr);
-    
     if (!OPA_G(enabled) || !OPA_G(socket_path)) {
-        fprintf(stderr, "[OPA Pre-resolve] Early return: enabled=%d, socket_path=%p\n", OPA_G(enabled), OPA_G(socket_path));
-        fflush(stderr);
         return;
     }
     
     const char *sock_path = OPA_G(socket_path);
     int is_unix_socket = (sock_path[0] == '/');
     
-    fprintf(stderr, "[OPA Pre-resolve] socket_path=%s, is_unix=%d\n", sock_path, is_unix_socket);
-    fflush(stderr);
-    
     if (is_unix_socket) {
         // Unix socket - no DNS resolution needed
-        fprintf(stderr, "[OPA Pre-resolve] Unix socket, skipping DNS\n");
-        fflush(stderr);
         return;
     }
     
