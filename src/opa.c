@@ -77,8 +77,14 @@ size_t network_bytes_sent_total = 0;
 size_t network_bytes_received_total = 0;
 pthread_mutex_t network_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// zend_execute_ex hook ()
+// NOTE: zend_execute_ex hook is no longer used - Observer API is used instead
+// Keeping this variable for potential fallback scenarios
 void (*original_zend_execute_ex)(zend_execute_data *execute_data) = NULL;
+
+// Re-entrancy guard: thread-local flag to prevent infinite recursion
+// When opa_execute_ex calls functions that trigger zend_execute_ex again,
+// this flag ensures we bypass the hook logic and call original directly
+static __thread int in_opa_execute_ex = 0;
 
 // Stack sampling (disabled for now - can be re-enabled later if needed)
 // static timer_t sampling_timer;
@@ -1542,17 +1548,25 @@ void opa_exit_function(const char *call_id) {
 }
 
 // zend_execute_ex hook ()
+// NOTE: This function is no longer used - Observer API handles all function tracking
+// Keeping it for potential fallback scenarios
 void opa_execute_ex(zend_execute_data *execute_data) {
-    // TEMPORARILY DISABLED: Remove profiling_active gate for debugging
+    // Re-entrancy guard: if we're already inside opa_execute_ex, bypass hook logic immediately
+    // This must be checked FIRST to prevent infinite recursion and segfaults
+    if (in_opa_execute_ex) {
+        if (original_zend_execute_ex) {
+            original_zend_execute_ex(execute_data);
+        }
+        return;
+    }
+    
     // Fast-path: if not actively profiling, call original immediately
-    /*
     if (!profiling_active) {
         if (original_zend_execute_ex) {
             original_zend_execute_ex(execute_data);
         }
         return;
     }
-    */
     
     // Safety check: ensure original handler exists and execute_data is valid
     if (!original_zend_execute_ex || !execute_data) {
@@ -1574,6 +1588,11 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         return;
     }
     
+    // Set re-entrancy guard flag: we're now inside the hook
+    // This must be set IMMEDIATELY after safety checks to prevent any recursion
+    // Any function calls after this point will bypass the hook via the guard check above
+    in_opa_execute_ex = 1;
+    
     zend_function *func = execute_data->func;
     
     // Get function information
@@ -1591,7 +1610,9 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         class_name = ZSTR_VAL(func->common.scope->name);
     }
     
-    // Debug: Log ALL PDO-related function calls (using php_printf so it's always visible)
+    // Debug: Log ALL PDO-related function calls (DISABLED to prevent segfaults - debug_log may trigger recursion)
+    // Temporarily disabled until we can ensure debug_log is safe to call from hook
+    /*
     if (class_name && (strcmp(class_name, "PDO") == 0 || strcmp(class_name, "PDOStatement") == 0)) {
         debug_log("[execute_ex] PDO CLASS DETECTED: %s::%s (func_type=%d, scope=%p)", 
             class_name, function_name ? function_name : "NULL", func->type, func->common.scope);
@@ -1603,6 +1624,7 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         debug_log("[execute_ex] PDO METHOD NAME DETECTED: %s (class=%s, func_type=%d)", 
             function_name, class_name ? class_name : "NULL", func->type);
     }
+    */
     
     // Determine function type
     if (func->type == ZEND_USER_FUNCTION) {
@@ -1612,8 +1634,14 @@ void opa_execute_ex(zend_execute_data *execute_data) {
     }
     
     // Get file and line information
-    if (execute_data->opline) {
+    // Safety: opline can be NULL or point to invalid memory for internal functions
+    // Always use zend_get_executed_lineno() as it's safer and works for all function types
+    // Only use opline for user functions where we know it's safe
+    if (func->type == ZEND_USER_FUNCTION && execute_data->opline) {
         line = execute_data->opline->lineno;
+    } else {
+        // Fallback: use executed context (safer for internal functions and when opline is invalid)
+        line = zend_get_executed_lineno();
     }
     
     // Get filename from function if available (PHP 8.4)
@@ -1627,18 +1655,20 @@ void opa_execute_ex(zend_execute_data *execute_data) {
     char *call_id = NULL;
     
     // Only track if we have valid function info
+    // NOTE: debug_log calls disabled to prevent segfaults - they may trigger recursion or access unsafe globals
     if (function_name || class_name) {
-        debug_log("[execute_ex] Entering function: %s::%s (type=%d)", 
-            class_name ? class_name : "NULL", function_name ? function_name : "NULL", function_type);
+        // debug_log("[execute_ex] Entering function: %s::%s (type=%d)", 
+        //     class_name ? class_name : "NULL", function_name ? function_name : "NULL", function_type);
         call_id = opa_enter_function(function_name, class_name, file, line, function_type);
-        if (call_id) {
-            debug_log("[execute_ex] Entered function: %s, call_id=%s", function_name ? function_name : "NULL", call_id);
-        } else {
-            debug_log("[execute_ex] Failed to enter function: %s", function_name ? function_name : "NULL");
-        }
-    } else {
-        debug_log("[execute_ex] Skipping function: no name (func=%p)", execute_data->func);
+        // if (call_id) {
+        //     debug_log("[execute_ex] Entered function: %s, call_id=%s", function_name ? function_name : "NULL", call_id);
+        // } else {
+        //     debug_log("[execute_ex] Failed to enter function: %s", function_name ? function_name : "NULL");
+        // }
     }
+    // else {
+    //     debug_log("[execute_ex] Skipping function: no name (func=%p)", execute_data->func);
+    // }
     
     // Check if this is a PDO method call and capture SQL BEFORE execution
     // Try both is_pdo_method and direct class name check
@@ -1663,7 +1693,7 @@ void opa_execute_ex(zend_execute_data *execute_data) {
     // Fallback: check directly by class name and function name
     if (!pdo_method && is_pdo_class && is_pdo_method_name) {
         pdo_method = 1;
-        debug_log("[execute_ex] PDO method detected via direct class name check: %s::%s", class_name, function_name);
+        // debug_log("[execute_ex] PDO method detected via direct class name check: %s::%s", class_name, function_name);
         
         // Note: Lazy hook registration removed - variables not accessible in this scope
         // The hooks should be registered in RINIT
@@ -1678,8 +1708,8 @@ void opa_execute_ex(zend_execute_data *execute_data) {
             (strcmp(func_name, "prepare") == 0 || strcmp(func_name, "query") == 0 || 
              strcmp(func_name, "exec") == 0 || strcmp(func_name, "execute") == 0)) {
             pdo_method = 1;
-            php_printf("[OPA execute_ex] PDO method detected via func->common.scope: %s::%s\n", scope_name, func_name);
-            debug_log("[execute_ex] PDO method detected via func->common.scope: %s::%s", scope_name, func_name);
+            // php_printf("[OPA execute_ex] PDO method detected via func->common.scope: %s::%s\n", scope_name, func_name);
+            // debug_log("[execute_ex] PDO method detected via func->common.scope: %s::%s", scope_name, func_name);
         }
     }
     
@@ -1688,8 +1718,8 @@ void opa_execute_ex(zend_execute_data *execute_data) {
     
     if (pdo_method && execute_data) {
         query_start_time = get_time_seconds();
-        debug_log("[execute_ex] PDO method detected BEFORE execution: function_name=%s, class_name=%s", 
-            function_name ? function_name : "NULL", class_name ? class_name : "NULL");
+        // debug_log("[execute_ex] PDO method detected BEFORE execution: function_name=%s, class_name=%s", 
+        //     function_name ? function_name : "NULL", class_name ? class_name : "NULL");
         
         // Get method name
         const char *method_name = function_name;
@@ -1702,18 +1732,20 @@ void opa_execute_ex(zend_execute_data *execute_data) {
                 strcmp(method_name, "exec") == 0) {
                 // SQL is in first argument
                 uint32_t num_args = ZEND_CALL_NUM_ARGS(execute_data);
-                debug_log("[execute_ex] PDO method %s called with %u arguments", method_name, num_args);
+                // debug_log("[execute_ex] PDO method %s called with %u arguments", method_name, num_args);
                 if (num_args > 0) {
                     zval *arg = ZEND_CALL_ARG(execute_data, 1);
                     if (arg && Z_TYPE_P(arg) == IS_STRING) {
                         sql = estrdup(Z_STRVAL_P(arg));
-                        debug_log("[execute_ex] Captured SQL from %s::%s: %s", pdo_class_name ? pdo_class_name : "PDO", method_name, sql);
-                    } else {
-                        debug_log("[execute_ex] WARNING: First argument is not a string (type=%d)", arg ? Z_TYPE_P(arg) : -1);
+                        // debug_log("[execute_ex] Captured SQL from %s::%s: %s", pdo_class_name ? pdo_class_name : "PDO", method_name, sql);
                     }
-                } else {
-                    debug_log("[execute_ex] WARNING: PDO method %s called with no arguments", method_name);
+                    // else {
+                    //     debug_log("[execute_ex] WARNING: First argument is not a string (type=%d)", arg ? Z_TYPE_P(arg) : -1);
+                    // }
                 }
+                // else {
+                //     debug_log("[execute_ex] WARNING: PDO method %s called with no arguments", method_name);
+                // }
             } else if (strcmp(method_name, "execute") == 0 && pdo_class_name && strcmp(pdo_class_name, "PDOStatement") == 0) {
                 // For execute(), get SQL from PDOStatement's queryString property
                 debug_log("[execute_ex] PDOStatement::execute detected, trying to get queryString");
@@ -1816,8 +1848,16 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         }
     }
     
+    // Reset re-entrancy guard before calling original handler
+    // This allows the original handler to execute normally without recursion protection
+    in_opa_execute_ex = 0;
+    
     // Call original handler
     original_zend_execute_ex(execute_data);
+    
+    // Re-set re-entrancy guard for post-execution processing
+    // Post-processing may call functions that trigger zend_execute_ex
+    in_opa_execute_ex = 1;
     
     // Capture SQL query AFTER execution if it's a PDO method
     if (pdo_method && sql) {
@@ -2208,6 +2248,9 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         opa_exit_function(call_id);
         efree(call_id);
     }
+    
+    // Reset re-entrancy guard at the end of function
+    in_opa_execute_ex = 0;
 }
 
 /* SQL Profiling Hooks */
@@ -2228,11 +2271,24 @@ static zif_handler orig_curl_exec_handler = NULL;
 
 // Track if PDO Observer has been registered (to avoid repeated registration)
 static int pdo_observer_registered = 0;
+static int general_observer_registered = 0;
 
 /* cURL Profiling Hook */
 
 // curl_exec wrapper handler (internal function signature)
 static void zif_opa_curl_exec(zend_execute_data *execute_data, zval *return_value) {
+    // Fast-path: if not actively profiling, call original immediately
+    if (!profiling_active) {
+        if (orig_curl_exec_handler) {
+            orig_curl_exec_handler(execute_data, return_value);
+        } else if (orig_curl_exec_func && orig_curl_exec_func->internal_function.handler) {
+            orig_curl_exec_func->internal_function.handler(execute_data, return_value);
+        } else {
+            ZVAL_FALSE(return_value);
+        }
+        return;
+    }
+    
     // Get curl handle from arguments
     zval *curl_handle = NULL;
     if (ZEND_CALL_NUM_ARGS(execute_data) > 0) {
@@ -2468,6 +2524,16 @@ static double get_microtime(void) {
 
 // MySQLi query hook
 PHP_FUNCTION(opaphp_mysqli_query) {
+    // Fast-path: if not actively profiling, call original immediately
+    if (!profiling_active) {
+        if (orig_mysqli_query_handler) {
+            orig_mysqli_query_handler(execute_data, return_value);
+        } else if (orig_mysqli_query_func && orig_mysqli_query_func->internal_function.handler) {
+            orig_mysqli_query_func->internal_function.handler(execute_data, return_value);
+        }
+        return;
+    }
+    
     zval *link;
     zend_string *query;
     double start = get_microtime();
@@ -2730,10 +2796,394 @@ static void zif_opa_pdo_stmt_execute(zend_execute_data *execute_data, zval *retu
     }
 }
 
+// Per-call observer data structure
+// Stored in hash table keyed by execute_data pointer to persist between begin/end callbacks
+typedef struct _opa_observer_data {
+    char *call_id;                    // Function call ID for tracking
+    double start_time;                // Function start time
+    double start_cpu_time;            // CPU time at start
+    size_t start_memory;              // Memory usage at start
+    size_t start_bytes_sent;          // Network bytes sent at start
+    size_t start_bytes_received;      // Network bytes received at start
+    char *sql;                        // SQL query (for PDO methods)
+    double query_start_time;           // SQL query start time
+    zval *curl_handle;                // cURL handle (if curl function)
+    double curl_start_time;            // cURL start time
+    size_t curl_bytes_sent_before;     // Bytes sent before cURL call
+    size_t curl_bytes_received_before; // Bytes received before cURL call
+    char *apcu_key;                   // APCu cache key
+    const char *apcu_operation;        // APCu operation name
+    double apcu_start_time;            // APCu start time
+    int is_redis_method;               // Flag for Redis methods
+    int is_symfony_cache_method;       // Flag for Symfony Cache methods
+} opa_observer_data_t;
+
+// Hash table to store observer data keyed by execute_data pointer
+static HashTable *observer_data_table = NULL;
+static pthread_mutex_t observer_data_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// General Zend Observer callbacks for all function calls
+// This is the proper way to intercept function calls in PHP 8.0+ (like xdebug)
+// Signature: void (*)(zend_execute_data *)
+static void opa_observer_fcall_begin(zend_execute_data *execute_data) {
+    // Fast-path: if not actively profiling, return immediately
+    if (!profiling_active) {
+        return;
+    }
+    
+    // Safety checks
+    if (!execute_data || !execute_data->func || !global_collector || 
+        !global_collector->active || global_collector->magic != OPA_COLLECTOR_MAGIC) {
+        return;
+    }
+    
+    zend_function *func = execute_data->func;
+    
+    // Get function information
+    const char *function_name = NULL;
+    const char *class_name = NULL;
+    const char *file = NULL;
+    int line = 0;
+    int function_type = 0;
+    
+    if (func->common.function_name) {
+        function_name = ZSTR_VAL(func->common.function_name);
+    }
+    
+    if (func->common.scope && func->common.scope->name) {
+        class_name = ZSTR_VAL(func->common.scope->name);
+    }
+    
+    // Determine function type
+    if (func->type == ZEND_USER_FUNCTION) {
+        function_type = class_name ? 2 : 0;
+    } else if (func->type == ZEND_INTERNAL_FUNCTION) {
+        // Skip internal functions if not collecting them
+        if (!OPA_G(collect_internal_functions)) {
+            return;
+        }
+        function_type = class_name ? 2 : 1;
+    } else {
+        return; // Unknown function type
+    }
+    
+    // Get file and line information
+    // Safety: opline can be NULL or point to invalid memory for internal functions
+    // Always use zend_get_executed_lineno() as it's safer and works for all function types
+    // Only use opline for user functions where we know it's safe
+    if (func->type == ZEND_USER_FUNCTION && execute_data->opline) {
+        line = execute_data->opline->lineno;
+    } else {
+        // Fallback: use executed context (safer for internal functions and when opline is invalid)
+        line = zend_get_executed_lineno();
+    }
+    
+    if (func->type == ZEND_USER_FUNCTION) {
+        zend_op_array *op_array = &func->op_array;
+        if (op_array && op_array->filename) {
+            file = ZSTR_VAL(op_array->filename);
+        }
+    }
+    
+    // Allocate observer data structure
+    opa_observer_data_t *data = emalloc(sizeof(opa_observer_data_t));
+    memset(data, 0, sizeof(opa_observer_data_t));
+    
+    // Store start time and metrics
+    data->start_time = get_time_seconds();
+    data->start_cpu_time = get_cpu_time();
+    data->start_memory = get_memory_usage();
+    data->start_bytes_sent = get_bytes_sent();
+    data->start_bytes_received = get_bytes_received();
+    
+    // Track function entry
+    char *call_id = NULL;
+    if (function_name || class_name) {
+        call_id = opa_enter_function(function_name, class_name, file, line, function_type);
+        if (call_id) {
+            data->call_id = estrdup(call_id);
+            efree(call_id);
+        }
+    }
+    
+    // Detect and capture cURL calls
+    if (function_name && strcmp(function_name, "curl_exec") == 0) {
+        data->curl_start_time = get_time_seconds();
+        data->curl_bytes_sent_before = get_bytes_sent();
+        data->curl_bytes_received_before = get_bytes_received();
+        if (ZEND_CALL_NUM_ARGS(execute_data) > 0) {
+            zval *arg = ZEND_CALL_ARG(execute_data, 1);
+            if (arg && Z_TYPE_P(arg) == IS_OBJECT) {
+                data->curl_handle = arg;
+            }
+        }
+    } else if (is_curl_function(execute_data)) {
+        data->curl_start_time = get_time_seconds();
+        data->curl_bytes_sent_before = get_bytes_sent();
+        data->curl_bytes_received_before = get_bytes_received();
+        if (ZEND_CALL_NUM_ARGS(execute_data) > 0) {
+            zval *arg = ZEND_CALL_ARG(execute_data, 1);
+            if (arg && Z_TYPE_P(arg) == IS_OBJECT) {
+                data->curl_handle = arg;
+            }
+        }
+    }
+    
+    // Detect APCu functions
+    if (is_apcu_function(execute_data) && function_name) {
+        data->apcu_start_time = get_time_seconds();
+        data->apcu_operation = function_name;
+        if (ZEND_CALL_NUM_ARGS(execute_data) > 0) {
+            zval *key_arg = ZEND_CALL_ARG(execute_data, 1);
+            if (key_arg && Z_TYPE_P(key_arg) == IS_STRING) {
+                data->apcu_key = estrdup(Z_STRVAL_P(key_arg));
+            } else if (key_arg && Z_TYPE_P(key_arg) == IS_ARRAY) {
+                data->apcu_key = estrdup("array");
+            }
+        }
+    }
+    
+    // Detect Redis methods
+    if (is_redis_method(execute_data)) {
+        data->is_redis_method = 1;
+    }
+    
+    // Detect Symfony Cache methods
+    if (is_symfony_cache_method(execute_data)) {
+        data->is_symfony_cache_method = 1;
+    }
+    
+    // Store observer data in hash table keyed by execute_data pointer
+    pthread_mutex_lock(&observer_data_mutex);
+    if (!observer_data_table) {
+        observer_data_table = emalloc(sizeof(HashTable));
+        zend_hash_init(observer_data_table, 64, NULL, NULL, 0);
+    }
+    zval data_zv;
+    ZVAL_PTR(&data_zv, data);
+    zend_hash_index_update(observer_data_table, (zend_ulong)execute_data, &data_zv);
+    pthread_mutex_unlock(&observer_data_mutex);
+}
+
+// Signature: void (*)(zend_execute_data *, zval *)
+static void opa_observer_fcall_end(zend_execute_data *execute_data, zval *return_value) {
+    // Fast-path: if not actively profiling, return immediately
+    if (!profiling_active) {
+        return;
+    }
+    
+    // Safety checks
+    if (!execute_data || !execute_data->func || !global_collector || 
+        !global_collector->active || global_collector->magic != OPA_COLLECTOR_MAGIC) {
+        return;
+    }
+    
+    // Retrieve observer data from hash table
+    pthread_mutex_lock(&observer_data_mutex);
+    opa_observer_data_t *data = NULL;
+    if (observer_data_table) {
+        zval *data_zv = zend_hash_index_find(observer_data_table, (zend_ulong)execute_data);
+        if (data_zv) {
+            data = (opa_observer_data_t *)Z_PTR_P(data_zv);
+        }
+    }
+    pthread_mutex_unlock(&observer_data_mutex);
+    
+    if (!data) {
+        return; // No data stored, skip processing
+    }
+    
+    zend_function *func = execute_data->func;
+    const char *function_name = NULL;
+    const char *class_name = NULL;
+    
+    if (func->common.function_name) {
+        function_name = ZSTR_VAL(func->common.function_name);
+    }
+    if (func->common.scope && func->common.scope->name) {
+        class_name = ZSTR_VAL(func->common.scope->name);
+    }
+    
+    // Track function exit
+    if (data->call_id) {
+        opa_exit_function(data->call_id);
+    }
+    
+    // Handle cURL calls
+    if (data->curl_handle || (function_name && strcmp(function_name, "curl_exec") == 0)) {
+        double curl_end_time = get_time_seconds();
+        double curl_duration = curl_end_time - data->curl_start_time;
+        size_t curl_bytes_sent_after = get_bytes_sent();
+        size_t curl_bytes_received_after = get_bytes_received();
+        size_t bytes_sent = curl_bytes_sent_after - data->curl_bytes_sent_before;
+        size_t bytes_received = curl_bytes_received_after - data->curl_bytes_received_before;
+        
+        // Extract cURL information (similar to existing logic in opa_execute_ex)
+        char *curl_url = NULL;
+        char *curl_method = NULL;
+        int status_code = 0;
+        char *error = NULL;
+        
+        if (data->curl_handle && Z_TYPE_P(data->curl_handle) == IS_OBJECT) {
+            // Get curl_getinfo data
+            zval curl_getinfo_func, curl_getinfo_args[1], curl_getinfo_ret;
+            ZVAL_UNDEF(&curl_getinfo_func);
+            ZVAL_UNDEF(&curl_getinfo_args[0]);
+            ZVAL_UNDEF(&curl_getinfo_ret);
+            
+            ZVAL_STRING(&curl_getinfo_func, "curl_getinfo");
+            ZVAL_COPY(&curl_getinfo_args[0], data->curl_handle);
+            
+            zend_fcall_info fci;
+            zend_fcall_info_cache fcc;
+            
+            if (zend_fcall_info_init(&curl_getinfo_func, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
+                fci.param_count = 1;
+                fci.params = curl_getinfo_args;
+                fci.retval = &curl_getinfo_ret;
+                
+                if (zend_call_function(&fci, &fcc) == SUCCESS) {
+                    if (Z_TYPE(curl_getinfo_ret) == IS_ARRAY) {
+                        zval *url_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "url", sizeof("url") - 1);
+                        if (url_val && Z_TYPE_P(url_val) == IS_STRING) {
+                            curl_url = estrdup(Z_STRVAL_P(url_val));
+                        }
+                        
+                        zval *method_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "request_method", sizeof("request_method") - 1);
+                        if (method_val && Z_TYPE_P(method_val) == IS_STRING) {
+                            curl_method = estrdup(Z_STRVAL_P(method_val));
+                        } else {
+                            curl_method = estrdup("GET");
+                        }
+                        
+                        zval *status_val = zend_hash_str_find(Z_ARRVAL(curl_getinfo_ret), "http_code", sizeof("http_code") - 1);
+                        if (status_val && Z_TYPE_P(status_val) == IS_LONG) {
+                            status_code = Z_LVAL_P(status_val);
+                        }
+                    }
+                    zval_dtor(&curl_getinfo_ret);
+                }
+                zval_dtor(&curl_getinfo_func);
+                zval_dtor(&curl_getinfo_args[0]);
+            }
+            
+            // Get curl_error
+            zval curl_error_func, curl_error_args[1], curl_error_ret;
+            ZVAL_UNDEF(&curl_error_func);
+            ZVAL_UNDEF(&curl_error_args[0]);
+            ZVAL_UNDEF(&curl_error_ret);
+            
+            ZVAL_STRING(&curl_error_func, "curl_error");
+            ZVAL_COPY(&curl_error_args[0], data->curl_handle);
+            
+            if (zend_fcall_info_init(&curl_error_func, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
+                fci.param_count = 1;
+                fci.params = curl_error_args;
+                fci.retval = &curl_error_ret;
+                
+                if (zend_call_function(&fci, &fcc) == SUCCESS && Z_TYPE(curl_error_ret) == IS_STRING) {
+                    if (Z_STRLEN(curl_error_ret) > 0) {
+                        error = estrdup(Z_STRVAL(curl_error_ret));
+                    }
+                }
+                zval_dtor(&curl_error_ret);
+                zval_dtor(&curl_error_func);
+                zval_dtor(&curl_error_args[0]);
+            }
+        }
+        
+        // Record HTTP request
+        record_http_request(curl_url ? curl_url : "unknown", curl_method ? curl_method : "GET", 
+                          status_code, bytes_sent, bytes_received, curl_duration, error);
+        
+        if (curl_url) efree(curl_url);
+        if (curl_method) efree(curl_method);
+        if (error) efree(error);
+    }
+    
+    // Handle APCu cache operations
+    if (data->apcu_operation) {
+        double apcu_end_time = get_time_seconds();
+        double apcu_duration = apcu_end_time - data->apcu_start_time;
+        int hit = 0;
+        size_t data_size = 0;
+        
+        // Determine hit/miss based on return value and operation
+        if (strcmp(data->apcu_operation, "apcu_fetch") == 0) {
+            if (return_value && Z_TYPE_P(return_value) != IS_FALSE) {
+                hit = 1;
+                if (Z_TYPE_P(return_value) == IS_STRING) {
+                    data_size = Z_STRLEN_P(return_value);
+                } else if (Z_TYPE_P(return_value) == IS_ARRAY) {
+                    data_size = zend_hash_num_elements(Z_ARRVAL_P(return_value)) * 100; // Estimate
+                }
+            }
+        } else if (strcmp(data->apcu_operation, "apcu_store") == 0 || 
+                   strcmp(data->apcu_operation, "apcu_add") == 0) {
+            hit = 1; // Store/add is always a "hit" (successful operation)
+        } else if (strcmp(data->apcu_operation, "apcu_delete") == 0 ||
+                   strcmp(data->apcu_operation, "apcu_clear_cache") == 0) {
+            hit = 1; // Delete/clear is always a "hit"
+        }
+        
+        record_cache_operation(data->apcu_key, data->apcu_operation, hit, apcu_duration, data_size, "apcu");
+    }
+    
+    // Clean up observer data
+    if (data->call_id) efree(data->call_id);
+    if (data->sql) efree(data->sql);
+    if (data->apcu_key) efree(data->apcu_key);
+    
+    // Remove from hash table and free
+    pthread_mutex_lock(&observer_data_mutex);
+    if (observer_data_table) {
+        zend_hash_index_del(observer_data_table, (zend_ulong)execute_data);
+    }
+    pthread_mutex_unlock(&observer_data_mutex);
+    
+    efree(data);
+}
+
+// Observer initialization function for all function calls
+// Returns handlers structure to register callbacks
+// Signature: zend_observer_fcall_handlers (*)(zend_execute_data *)
+static zend_observer_fcall_handlers opa_observer_fcall_init(zend_execute_data *execute_data) {
+    zend_observer_fcall_handlers handlers = {0};
+    
+    // Fast-path: if not actively profiling, don't register handlers
+    if (!profiling_active) {
+        return handlers;
+    }
+    
+    // Safety checks
+    if (!execute_data || !execute_data->func || !global_collector || 
+        !global_collector->active || global_collector->magic != OPA_COLLECTOR_MAGIC) {
+        return handlers;
+    }
+    
+    zend_function *func = execute_data->func;
+    
+    // Skip internal functions if not collecting them
+    if (func->type == ZEND_INTERNAL_FUNCTION && !OPA_G(collect_internal_functions)) {
+        return handlers;
+    }
+    
+    // Register handlers for all functions (user and internal if enabled)
+    handlers.begin = opa_observer_fcall_begin;
+    handlers.end = opa_observer_fcall_end;
+    
+    return handlers;
+}
+
 // Zend Observer callbacks for PDO methods
 // This is the proper way to intercept PDO calls in PHP 8.0+
 // Signature: void (*)(zend_execute_data *)
 static void opa_observer_pdo_fcall_begin(zend_execute_data *execute_data) {
+    // Fast-path: if not actively profiling, return immediately
+    if (!profiling_active) {
+        return;
+    }
+    
     // Called before PDO method execution
     if (!execute_data || !execute_data->func) {
         return;
@@ -2762,6 +3212,11 @@ static HashTable *pdo_call_times = NULL;
 
 // Signature: void (*)(zend_execute_data *, zval *)
 static void opa_observer_pdo_fcall_end(zend_execute_data *execute_data, zval *return_value) {
+    // Fast-path: if not actively profiling, return immediately
+    if (!profiling_active) {
+        return;
+    }
+    
     // Called after PDO method execution
     if (!execute_data || !execute_data->func) {
         return;
@@ -2860,6 +3315,11 @@ static void opa_observer_pdo_fcall_end(zend_execute_data *execute_data, zval *re
 static zend_observer_fcall_handlers opa_observer_pdo_init(zend_execute_data *execute_data) {
     zend_observer_fcall_handlers handlers = {0};
     
+    // Fast-path: if not actively profiling, don't register handlers
+    if (!profiling_active) {
+        return handlers;
+    }
+    
     // Only observe PDO and PDOStatement methods
     if (execute_data && execute_data->func) {
         zend_function *func = execute_data->func;
@@ -2907,12 +3367,13 @@ PHP_MINIT_FUNCTION(opa) {
     }
     */
     
-    // Hook zend_execute_ex to intercept all function calls
-    // TEMPORARILY: Always hook (hardcode enabled) to avoid OPA_G access crash
-        if (zend_execute_ex && !original_zend_execute_ex) {
-            original_zend_execute_ex = zend_execute_ex;
-            zend_execute_ex = opa_execute_ex;
-    }
+    // NOTE: zend_execute_ex hook is DISABLED - we now use Observer API instead
+    // The Observer API is the recommended approach in PHP 8.0+ and eliminates recursion issues
+    // Keeping original_zend_execute_ex variable for potential fallback, but not hooking it
+    // if (zend_execute_ex && !original_zend_execute_ex) {
+    //     original_zend_execute_ex = zend_execute_ex;
+    //     zend_execute_ex = opa_execute_ex;
+    // }
     
     // Register Zend Observer for PDO methods
     // This is the proper way to intercept PDO calls in PHP 8.0+ (bypasses handler replacement issues)
@@ -2929,6 +3390,13 @@ PHP_MINIT_FUNCTION(opa) {
         //     pdo_call_times = emalloc(sizeof(HashTable));
         //     zend_hash_init(pdo_call_times, 8, NULL, NULL, 0);
         // }
+    }
+    
+    // Register general Zend Observer for all function calls
+    // This replaces the zend_execute_ex hook and eliminates recursion issues
+    if (!general_observer_registered) {
+        zend_observer_fcall_register(opa_observer_fcall_init);
+        general_observer_registered = 1;
     }
     
     // Register SQL profiling hooks (lazy registration - try in RINIT as well)
@@ -3063,9 +3531,37 @@ PHP_MSHUTDOWN_FUNCTION(opa) {
     return SUCCESS;
 }
 
+// Helper function to update INI setting from environment variable
+// This allows environment variables to override INI settings at runtime
+static void update_ini_from_env(const char *env_name, const char *ini_name) {
+    char *env_value = getenv(env_name);
+    if (env_value && strlen(env_value) > 0) {
+        zend_string *ini_key = zend_string_init(ini_name, strlen(ini_name), 0);
+        zend_string *ini_value = zend_string_init(env_value, strlen(env_value), 0);
+        
+        // Use zend_alter_ini_entry to update the INI setting
+        // This will trigger the OnUpdate handler which updates the global
+        zend_alter_ini_entry(ini_key, ini_value, PHP_INI_USER, PHP_INI_STAGE_RUNTIME);
+        
+        zend_string_release(ini_key);
+        zend_string_release(ini_value);
+        
+        // Note: We can't use OPA_G(debug_log_enabled) here because it might not be set yet
+        // The debug log will be shown if debug_log is enabled after this override
+    }
+}
+
 PHP_RINIT_FUNCTION(opa) {
     // RINIT: Reset per-request state AND register hooks (PDO classes available by RINIT time)
     // Following user guidance: Move PDO hook registration to RINIT where classes are available
+    
+    // Initialize observer data hash table for this request
+    pthread_mutex_lock(&observer_data_mutex);
+    if (!observer_data_table) {
+        observer_data_table = emalloc(sizeof(HashTable));
+        zend_hash_init(observer_data_table, 64, NULL, NULL, 0);
+    }
+    pthread_mutex_unlock(&observer_data_mutex);
     
     // Try to register SQL hooks lazily if they weren't found at MINIT
     if (!orig_mysqli_query_func) {
@@ -3078,30 +3574,6 @@ PHP_RINIT_FUNCTION(opa) {
     
     // PDO hooks are now registered via Zend Observer API in MINIT
     // No need to do handler replacement here - Observer API handles it
-    
-    // Pre-resolve agent address in RINIT (before observer callbacks) to avoid DNS calls from unsafe contexts
-    pre_resolve_agent_address();
-    
-    // Initialize and start collector EARLY in RINIT (before any PDO calls)
-    // This ensures the collector is ready when observer callbacks try to record SQL
-    if (!global_collector) {
-        global_collector = opa_collector_init();
-    }
-    if (global_collector && global_collector->magic == OPA_COLLECTOR_MAGIC) {
-        opa_collector_start(global_collector);
-        
-        // Initialize global SQL queries array
-        pthread_mutex_lock(&global_collector->global_sql_mutex);
-        if (global_collector->global_sql_queries) {
-            zval_ptr_dtor(global_collector->global_sql_queries);
-            efree(global_collector->global_sql_queries);
-        }
-        global_collector->global_sql_queries = ecalloc(1, sizeof(zval));
-        if (global_collector->global_sql_queries) {
-            array_init(global_collector->global_sql_queries);
-        }
-        pthread_mutex_unlock(&global_collector->global_sql_mutex);
-    }
     
     // Verify PDO class is available (for debugging)
     zend_class_entry *pdo_ce = NULL;
@@ -3131,7 +3603,81 @@ PHP_RINIT_FUNCTION(opa) {
     
     
     // Reset per-request state
-    profiling_active = 1; // Hardcode enabled for now (avoid OPA_G access)
+    // Check if profiling should be enabled
+    // OPA_ENABLE environment variable overrides INI setting for both CLI and web modes
+    // This allows on-the-fly profiling via environment variables
+    char *opa_enable_env = getenv("OPA_ENABLE");
+    if (opa_enable_env) {
+        // Check for "1" or case-insensitive "true"
+        if (strcmp(opa_enable_env, "1") == 0 || 
+            strcmp(opa_enable_env, "true") == 0 ||
+            strcmp(opa_enable_env, "TRUE") == 0 ||
+            strcmp(opa_enable_env, "True") == 0) {
+            // OPA_ENABLE=1 or OPA_ENABLE=true: enable profiling
+            profiling_active = 1;
+            if (OPA_G(debug_log_enabled)) {
+                const char *mode = (sapi_module.name && strcmp(sapi_module.name, "cli") == 0) ? "CLI" : "Web";
+                debug_log("[RINIT] Profiling enabled via OPA_ENABLE environment variable (value: %s, mode: %s)", 
+                    opa_enable_env, mode);
+            }
+        } else {
+            // OPA_ENABLE set to false/0: disable profiling (overrides INI)
+            profiling_active = 0;
+            if (OPA_G(debug_log_enabled)) {
+                const char *mode = (sapi_module.name && strcmp(sapi_module.name, "cli") == 0) ? "CLI" : "Web";
+                debug_log("[RINIT] Profiling disabled via OPA_ENABLE=%s (overrides INI setting, mode: %s)", 
+                    opa_enable_env, mode);
+            }
+        }
+    } else {
+        // OPA_ENABLE not set: use INI setting (which may have been overridden by OPA_ENABLED env var)
+        profiling_active = OPA_G(enabled) ? 1 : 0;
+        if (OPA_G(debug_log_enabled)) {
+            const char *mode = (sapi_module.name && strcmp(sapi_module.name, "cli") == 0) ? "CLI" : "Web";
+            debug_log("[RINIT] Profiling: OPA_ENABLE not set, using INI setting: %d (mode: %s)", 
+                OPA_G(enabled), mode);
+        }
+    }
+    
+    // Only initialize collector if profiling is active (after profiling_active is set)
+    if (profiling_active) {
+        // Set memory_limit to -1 (unlimited) when profiling is enabled
+        // This prevents memory exhaustion during profiling operations
+        zend_string *memory_limit_key = zend_string_init("memory_limit", sizeof("memory_limit") - 1, 0);
+        zend_string *memory_limit_value = zend_string_init("-1", sizeof("-1") - 1, 0);
+        zend_alter_ini_entry(memory_limit_key, memory_limit_value, PHP_INI_USER, PHP_INI_STAGE_RUNTIME);
+        zend_string_release(memory_limit_key);
+        zend_string_release(memory_limit_value);
+        
+        if (OPA_G(debug_log_enabled)) {
+            debug_log("[RINIT] Set memory_limit to -1 (unlimited) for profiling");
+        }
+        
+        // Pre-resolve agent address in RINIT (before observer callbacks) to avoid DNS calls from unsafe contexts
+        pre_resolve_agent_address();
+        
+        // Initialize and start collector EARLY in RINIT (before any PDO calls)
+        // This ensures the collector is ready when observer callbacks try to record SQL
+        if (!global_collector) {
+            global_collector = opa_collector_init();
+        }
+        if (global_collector && global_collector->magic == OPA_COLLECTOR_MAGIC) {
+            opa_collector_start(global_collector);
+            
+            // Initialize global SQL queries array
+            pthread_mutex_lock(&global_collector->global_sql_mutex);
+            if (global_collector->global_sql_queries) {
+                zval_ptr_dtor(global_collector->global_sql_queries);
+                efree(global_collector->global_sql_queries);
+            }
+            global_collector->global_sql_queries = ecalloc(1, sizeof(zval));
+            if (global_collector->global_sql_queries) {
+                array_init(global_collector->global_sql_queries);
+            }
+            pthread_mutex_unlock(&global_collector->global_sql_mutex);
+        }
+    }
+    
     network_bytes_sent_total = 0;
     network_bytes_received_total = 0;
     
@@ -3537,6 +4083,16 @@ PHP_RSHUTDOWN_FUNCTION(opa) {
     
     // Disable profiling first to stop hook processing ()
     profiling_active = 0;
+    
+    // Clean up observer data hash table
+    pthread_mutex_lock(&observer_data_mutex);
+    if (observer_data_table) {
+        // Free all remaining observer data entries
+        zend_hash_destroy(observer_data_table);
+        efree(observer_data_table);
+        observer_data_table = NULL;
+    }
+    pthread_mutex_unlock(&observer_data_mutex);
     
     // Get root span data from malloc'd global variables (NOT from emalloc'd structure)
     // This is safe even after fastcgi_finish_request()
