@@ -2,11 +2,15 @@
 *.o
 *.lo
 *.la
+*.lai
 *.so
 *.dep
 *.a
 .libs/
 modules/
+*.gcno
+*.gcda
+*.gcov
 
 # Autotools generated files
 config.h
@@ -19,15 +23,20 @@ configure
 configure~
 autom4te.cache/
 libtool
+stamp-h1
 
 # Makefiles (generated)
 Makefile
 Makefile.fragments
 Makefile.objects
+Makefile.global
 
 # Build directories
-build/
+dist/
 *.cache
+# Note: build/ directory contains PHP build system files that should be tracked
+# Only ignore generated files in build/
+build/Makefile.global
 
 # IDE
 .vscode/
@@ -35,13 +44,67 @@ build/
 *.swp
 *.swo
 *~
+*.sublime-project
+*.sublime-workspace
 
 # OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+Desktop.ini
 
 # Test artifacts
 *.log
 *.core
+core.*
 core-dumps/
+logs/
+/tmp/opa_debug.log
+/app/logs/opa_debug.log
 
+# PHP
+*.php~
+composer.lock
+vendor/
+
+# Docker
+.dockerignore
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*.orig
+*.rej
+*~
+
+# Coverage reports
+coverage/
+*.gcov
+*.lcov
+htmlcov/
+.coverage
+.coverage.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Node (if any)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

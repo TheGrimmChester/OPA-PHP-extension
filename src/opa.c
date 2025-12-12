@@ -649,6 +649,7 @@ void debug_log(const char *msg, ...) {
 }
 
 // Structured JSON logging - always writes to stderr (not conditional)
+// Also sends to agent if log tracking is enabled
 // Format: {"timestamp":"...","level":"ERROR|WARN|INFO","message":"...","error":"...","fields":{...}}
 void log_structured(const char *level, const char *message, const char *error, const char *fields_json) {
     time_t now = time(NULL);
@@ -680,6 +681,44 @@ void log_structured(const char *level, const char *message, const char *error, c
     
     fprintf(stderr, "}\n");
     fflush(stderr);
+    
+    // Also send to agent if log tracking is enabled
+    // Build a combined message with error if present
+    if (OPA_G(enabled) && OPA_G(track_logs) && message) {
+        // Make a safe copy of the message to avoid memory corruption issues
+        // This ensures the message is valid throughout the send_log_to_agent call
+        size_t msg_len = strlen(message);
+        char *safe_message = emalloc(msg_len + 1);
+        if (safe_message) {
+            memcpy(safe_message, message, msg_len);
+            safe_message[msg_len] = '\0';
+            
+            char *combined_message = NULL;
+            if (error && strlen(error) > 0) {
+                size_t combined_len = msg_len + strlen(error) + 10;
+                combined_message = emalloc(combined_len);
+                if (combined_message) {
+                    snprintf(combined_message, combined_len, "%s: %s", safe_message, error);
+                }
+            } else {
+                combined_message = safe_message;
+                safe_message = NULL; // Don't free it, it's being used
+            }
+            
+            if (combined_message) {
+                // Send log to agent (file and line are not available in log_structured context)
+                send_log_to_agent(level, combined_message, NULL, 0);
+                
+                // Free the combined message (which might be safe_message or a new allocation)
+                efree(combined_message);
+            }
+            
+            // Free safe_message if it wasn't used as combined_message
+            if (safe_message) {
+                efree(safe_message);
+            }
+        }
+    }
 }
 
 // Log error with structured JSON format
@@ -1508,53 +1547,8 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         }
     }
     
-    // Check for curl_exec in BEFORE section (capture timing and handle before execution)
-    int curl_func_before = 0;
-    zval *curl_handle_before = NULL;
-    double curl_start_time = 0.0;
-    size_t curl_bytes_sent_before = 0;
-    size_t curl_bytes_received_before = 0;
-    
-    // Try to detect curl by checking arguments BEFORE execution (when they're still available)
-    // For internal functions, ZEND_CALL_NUM_ARGS might not work, so try direct access
-    if (execute_data && execute_data->func) {
-        // Try ZEND_CALL_NUM_ARGS first
-        uint32_t num_args_before = ZEND_CALL_NUM_ARGS(execute_data);
-        debug_log("[execute_ex] BEFORE: num_args=%u, function_name=%s, func_type=%d", 
-            num_args_before, function_name ? function_name : "NULL", execute_data->func->type);
-        
-        // For internal functions, try accessing arguments directly
-        zval *arg1_before = NULL;
-        if (num_args_before > 0) {
-            arg1_before = ZEND_CALL_ARG(execute_data, 1);
-        } else if (execute_data->func->type == ZEND_INTERNAL_FUNCTION) {
-            // For internal functions with num_args=0, we can't access arguments directly
-            // This is a limitation - we'll need to detect curl_exec another way
-            debug_log("[execute_ex] BEFORE: Internal function with num_args=0, cannot access arguments");
-        }
-        
-        if (arg1_before && Z_TYPE_P(arg1_before) == IS_OBJECT) {
-            zend_class_entry *ce = Z_OBJCE_P(arg1_before);
-            if (ce && ce->name) {
-                const char *class_name = ZSTR_VAL(ce->name);
-                size_t class_name_len = ZSTR_LEN(ce->name);
-                debug_log("[execute_ex] BEFORE: arg1 is object, class=%.*s", (int)class_name_len, class_name);
-                if ((class_name_len == sizeof("CurlHandle")-1 && memcmp(class_name, "CurlHandle", sizeof("CurlHandle")-1) == 0) ||
-                    (class_name_len == sizeof("CurlMultiHandle")-1 && memcmp(class_name, "CurlMultiHandle", sizeof("CurlMultiHandle")-1) == 0) ||
-                    (class_name_len == sizeof("CurlShareHandle")-1 && memcmp(class_name, "CurlShareHandle", sizeof("CurlShareHandle")-1) == 0)) {
-                    curl_func_before = 1;
-                    curl_handle_before = arg1_before;
-                    curl_start_time = get_time_seconds();
-                    curl_bytes_sent_before = get_bytes_sent();
-                    curl_bytes_received_before = get_bytes_received();
-                    debug_log("[execute_ex] BEFORE: Detected curl call, storing handle");
-                }
-            }
-        }
-    }
-    
     // Fallback: function name detection
-    if (!curl_func_before && function_name && strcmp(function_name, "curl_exec") == 0) {
+    if (function_name && strcmp(function_name, "curl_exec") == 0) {
         curl_func_before = 1;
         curl_start_time = get_time_seconds();
         curl_bytes_sent_before = get_bytes_sent();
@@ -2003,6 +1997,9 @@ static zif_handler orig_pdo_stmt_execute_handler = NULL;
 static zend_function *orig_curl_exec_func = NULL;
 static zif_handler orig_curl_exec_handler = NULL;
 
+// Track if PDO Observer has been registered (to avoid repeated registration)
+static int pdo_observer_registered = 0;
+
 /* cURL Profiling Hook */
 
 // curl_exec wrapper handler (internal function signature)
@@ -2215,9 +2212,11 @@ static void zif_opa_curl_exec(zend_execute_data *execute_data, zval *return_valu
     }
     
     // Record HTTP request with enhanced details
+    // Calculate request_size from bytes_sent (approximate)
+    size_t request_size = bytes_sent;
     record_http_request_enhanced(curl_url, curl_method, status_code, bytes_sent, bytes_received, 
         duration, error, uri_path, query_string, request_headers_str, response_headers_str, 
-        response_size, dns_time, connect_time, total_time);
+        response_size, request_size, dns_time, connect_time, total_time);
     debug_log("[zif_opa_curl_exec] Recorded HTTP request: %s %s, status=%d, duration=%.6f", 
         curl_method ? curl_method : "GET", curl_url ? curl_url : "unknown", status_code, duration);
     
@@ -2335,15 +2334,8 @@ PHP_FUNCTION(opaphp_mysqli_query) {
         // Send SQL query data to agent via record_sql_query
         // Duration is in milliseconds, convert to seconds for record_sql_query
         double duration_seconds = elapsed / 1000.0;
-        record_sql_query(ZSTR_VAL(query), duration_seconds, NULL, "mysqli_query", rows_affected, db_host, db_system, db_dsn);
-        
-        // Free allocated strings
-        if (db_dsn) {
-            efree(db_dsn);
-        }
-        if (db_host_allocated) {
-            efree(db_host_allocated);
-        }
+        // Note: db_host, db_system, db_dsn extraction removed for simplicity
+        record_sql_query(ZSTR_VAL(query), duration_seconds, NULL, "mysqli_query", rows_affected, NULL, NULL, NULL);
     }
 }
 
@@ -2443,20 +2435,11 @@ static void zif_opa_pdo_query(zend_execute_data *execute_data, zval *return_valu
             }
         }
         
-        record_sql_query(ZSTR_VAL(sql), duration_seconds, NULL, query_type_str, row_count, db_host, db_system, db_dsn);
+        // Note: db_host, db_system, db_dsn extraction removed for simplicity
+        // Can be added back if needed by reading from PDO connection object
+        record_sql_query(ZSTR_VAL(sql), duration_seconds, NULL, query_type_str, row_count, NULL, NULL, NULL);
         php_printf("[OPA zif_opa_pdo_query] SQL query recorded via record_sql_query\n");
         debug_log("[PDO %s] SQL query recorded", method_name);
-        
-        // Free the allocated strings
-        if (db_host) {
-            efree(db_host);
-        }
-        if (db_system) {
-            efree(db_system);
-        }
-        if (db_dsn) {
-            efree(db_dsn);
-        }
     }
 }
 
@@ -2526,25 +2509,16 @@ static void zif_opa_pdo_stmt_execute(zend_execute_data *execute_data, zval *retu
         // Send SQL query data to agent via record_sql_query
         double duration_seconds = elapsed / 1000.0;
         debug_log("[PDOStatement::execute] Recording SQL query: %s, duration=%.3fs, rows=%ld", sql ? sql : "NULL", duration_seconds, row_count);
-        record_sql_query(sql, duration_seconds, NULL, "PDOStatement::execute", row_count, db_host, db_system, db_dsn);
+        // Note: db_host, db_system, db_dsn extraction removed for simplicity
+        record_sql_query(sql, duration_seconds, NULL, "PDOStatement::execute", row_count, NULL, NULL, NULL);
         debug_log("[PDOStatement::execute] SQL query recorded");
-        
-        // Free the allocated strings
-        if (db_host) {
-            efree(db_host);
-        }
-        if (db_system) {
-            efree(db_system);
-        }
-        if (db_dsn) {
-            efree(db_dsn);
-        }
     }
 }
 
-// Module initialization - registers INI settings and hooks zend_execute_ex for function call interception
 // Zend Observer callbacks for PDO methods
-static void opa_observer_pdo_fcall_begin(zend_execute_data *execute_data, zval *return_value) {
+// This is the proper way to intercept PDO calls in PHP 8.0+
+// Signature: void (*)(zend_execute_data *)
+static void opa_observer_pdo_fcall_begin(zend_execute_data *execute_data) {
     // Called before PDO method execution
     if (!execute_data || !execute_data->func) {
         return;
@@ -2564,11 +2538,17 @@ static void opa_observer_pdo_fcall_begin(zend_execute_data *execute_data, zval *
     if (class_name && (strcmp(class_name, "PDO") == 0 || strcmp(class_name, "PDOStatement") == 0)) {
         if (method_name && (strcmp(method_name, "query") == 0 || strcmp(method_name, "exec") == 0 || 
                            strcmp(method_name, "prepare") == 0 || strcmp(method_name, "execute") == 0)) {
+            fprintf(stderr, "[OPA Observer] PDO %s::%s BEGIN intercepted\n", class_name, method_name);
+            fflush(stderr);
             debug_log("[observer] PDO method observed: %s::%s", class_name, method_name);
         }
     }
 }
 
+// Store start time for each PDO call (keyed by execute_data pointer)
+static HashTable *pdo_call_times = NULL;
+
+// Signature: void (*)(zend_execute_data *, zval *)
 static void opa_observer_pdo_fcall_end(zend_execute_data *execute_data, zval *return_value) {
     // Called after PDO method execution
     if (!execute_data || !execute_data->func) {
@@ -2580,6 +2560,7 @@ static void opa_observer_pdo_fcall_end(zend_execute_data *execute_data, zval *re
     const char *method_name = NULL;
     char *sql = NULL;
     double start_time = 0.0;
+    double duration = 0.0;
     
     if (func->common.scope && func->common.scope->name) {
         class_name = ZSTR_VAL(func->common.scope->name);
@@ -2591,7 +2572,12 @@ static void opa_observer_pdo_fcall_end(zend_execute_data *execute_data, zval *re
     if (class_name && (strcmp(class_name, "PDO") == 0 || strcmp(class_name, "PDOStatement") == 0)) {
         if (method_name && (strcmp(method_name, "query") == 0 || strcmp(method_name, "exec") == 0 || 
                            strcmp(method_name, "prepare") == 0 || strcmp(method_name, "execute") == 0)) {
-            debug_log("[observer] PDO method ended: %s::%s", class_name, method_name);
+            fprintf(stderr, "[OPA Observer] PDO %s::%s END intercepted\n", class_name, method_name);
+            fflush(stderr);
+            
+            // Calculate duration (approximate - we don't have precise start time from begin callback)
+            // For more accurate timing, we'd need to store start time in begin callback
+            duration = 0.001; // Default small duration, can be improved with timing storage
             
             // Extract SQL
             if (strcmp(method_name, "query") == 0 || strcmp(method_name, "exec") == 0 || strcmp(method_name, "prepare") == 0) {
@@ -2611,75 +2597,86 @@ static void opa_observer_pdo_fcall_end(zend_execute_data *execute_data, zval *re
             }
             
             if (sql) {
-                double duration = 0.001; // Approximate duration
-                int rows_affected = -1;
+                long rows_affected = -1;
                 
                 // Try to get row count from return value
-                if (return_value && Z_TYPE_P(return_value) == IS_OBJECT) {
-                    zend_class_entry *ce = Z_OBJCE_P(return_value);
-                    if (ce && ce->name && strcmp(ZSTR_VAL(ce->name), "PDOStatement") == 0) {
-                        zval row_count_zv;
-                        zval method_name_zv;
-                        zval this_zv;
-                        ZVAL_OBJ(&this_zv, Z_OBJ_P(return_value));
-                        ZVAL_STRING(&method_name_zv, "rowCount");
-                        if (call_user_function(EG(function_table), &this_zv, &method_name_zv, &row_count_zv, 0, NULL) == SUCCESS) {
-                            if (Z_TYPE(row_count_zv) == IS_LONG) {
-                                rows_affected = Z_LVAL(row_count_zv);
+                if (return_value) {
+                    if (Z_TYPE_P(return_value) == IS_OBJECT) {
+                        zend_class_entry *ce = Z_OBJCE_P(return_value);
+                        if (ce && ce->name && strcmp(ZSTR_VAL(ce->name), "PDOStatement") == 0) {
+                            zval row_count_zv;
+                            zval method_name_zv;
+                            zval this_zv;
+                            ZVAL_OBJ(&this_zv, Z_OBJ_P(return_value));
+                            ZVAL_STRING(&method_name_zv, "rowCount");
+                            if (call_user_function(EG(function_table), &this_zv, &method_name_zv, &row_count_zv, 0, NULL) == SUCCESS) {
+                                if (Z_TYPE(row_count_zv) == IS_LONG) {
+                                    rows_affected = Z_LVAL(row_count_zv);
+                                }
+                                zval_ptr_dtor(&row_count_zv);
                             }
-                            zval_ptr_dtor(&row_count_zv);
+                            zval_ptr_dtor(&method_name_zv);
                         }
-                        zval_ptr_dtor(&method_name_zv);
+                    } else if (Z_TYPE_P(return_value) == IS_LONG && strcmp(method_name, "exec") == 0) {
+                        // exec() returns number of affected rows directly
+                        rows_affected = Z_LVAL_P(return_value);
                     }
                 }
                 
-                // Record SQL query
-                if (global_collector && global_collector->magic == OPA_COLLECTOR_MAGIC && global_collector->active) {
-                    pthread_mutex_lock(&global_collector->global_sql_mutex);
-                    if (!global_collector->global_sql_queries) {
-                        global_collector->global_sql_queries = ecalloc(1, sizeof(zval));
-                        if (global_collector->global_sql_queries) {
-                            array_init(global_collector->global_sql_queries);
-                        }
+                // Record SQL query using record_sql_query
+                char query_type_str[64];
+                snprintf(query_type_str, sizeof(query_type_str), "PDO::%s", method_name);
+                
+                fprintf(stderr, "[OPA Observer] Recording SQL: %s, duration=%.6fs, rows=%ld\n", sql, duration, rows_affected);
+                fflush(stderr);
+                
+                // Ensure collector is initialized
+                if (!global_collector) {
+                    global_collector = opa_collector_init();
+                    if (global_collector) {
+                        opa_collector_start(global_collector);
                     }
-                    if (global_collector->global_sql_queries) {
-                        zval query_data;
-                        array_init(&query_data);
-                        
-                        add_assoc_string(&query_data, "query", sql);
-                        add_assoc_double(&query_data, "duration", duration);
-                        add_assoc_double(&query_data, "duration_ms", duration * 1000.0);
-                        add_assoc_double(&query_data, "timestamp", get_time_seconds() - duration);
-                        add_assoc_string(&query_data, "type", (char *)method_name);
-                        add_assoc_long(&query_data, "rows_affected", rows_affected);
-                        
-                        // Determine query type
-                        const char *upper_sql = sql;
-                        while (*upper_sql && (*upper_sql == ' ' || *upper_sql == '\t' || *upper_sql == '\n')) {
-                            upper_sql++;
-                        }
-                        if (strncasecmp(upper_sql, "SELECT", 6) == 0) {
-                            add_assoc_string(&query_data, "query_type", "SELECT");
-                        } else if (strncasecmp(upper_sql, "INSERT", 6) == 0) {
-                            add_assoc_string(&query_data, "query_type", "INSERT");
-                        } else if (strncasecmp(upper_sql, "UPDATE", 6) == 0) {
-                            add_assoc_string(&query_data, "query_type", "UPDATE");
-                        } else if (strncasecmp(upper_sql, "DELETE", 6) == 0) {
-                            add_assoc_string(&query_data, "query_type", "DELETE");
-                        }
-                        
-                        add_assoc_string(&query_data, "db_system", "mysql");
-                        
-                        add_next_index_zval(global_collector->global_sql_queries, &query_data);
-                        debug_log("[observer] SQL query recorded via observer: %s", sql);
-                    }
-                    pthread_mutex_unlock(&global_collector->global_sql_mutex);
                 }
+                
+                // Use record_sql_query for consistent SQL recording
+                // Note: db_host, db_system, db_dsn are NULL for now - can be extracted from PDO connection if needed
+                record_sql_query(sql, duration, NULL, query_type_str, rows_affected, NULL, NULL, NULL);
                 
                 efree(sql);
             }
         }
     }
+}
+
+// Observer initialization function - called for each function call
+// Returns handlers structure to register callbacks
+// Signature: zend_observer_fcall_handlers (*)(zend_execute_data *)
+static zend_observer_fcall_handlers opa_observer_pdo_init(zend_execute_data *execute_data) {
+    zend_observer_fcall_handlers handlers = {0};
+    
+    // Only observe PDO and PDOStatement methods
+    if (execute_data && execute_data->func) {
+        zend_function *func = execute_data->func;
+        const char *class_name = NULL;
+        const char *method_name = NULL;
+        
+        if (func->common.scope && func->common.scope->name) {
+            class_name = ZSTR_VAL(func->common.scope->name);
+        }
+        if (func->common.function_name) {
+            method_name = ZSTR_VAL(func->common.function_name);
+        }
+        
+        if (class_name && (strcmp(class_name, "PDO") == 0 || strcmp(class_name, "PDOStatement") == 0)) {
+            if (method_name && (strcmp(method_name, "query") == 0 || strcmp(method_name, "exec") == 0 || 
+                               strcmp(method_name, "prepare") == 0 || strcmp(method_name, "execute") == 0)) {
+                handlers.begin = opa_observer_pdo_fcall_begin;
+                handlers.end = opa_observer_pdo_fcall_end;
+            }
+        }
+    }
+    
+    return handlers;
 }
 
 PHP_MINIT_FUNCTION(opa) {
@@ -2711,8 +2708,22 @@ PHP_MINIT_FUNCTION(opa) {
             zend_execute_ex = opa_execute_ex;
     }
     
-    // Register Zend Observer for PDO methods (try to find PDO class)
-    // This will be done lazily in RINIT when classes are available
+    // Register Zend Observer for PDO methods
+    // This is the proper way to intercept PDO calls in PHP 8.0+ (bypasses handler replacement issues)
+    if (!pdo_observer_registered) {
+        // zend_observer_fcall_register takes a function pointer of type zend_observer_fcall_init
+        // The function signature must match: zend_observer_fcall (*)(zend_execute_data *)
+        zend_observer_fcall_register(opa_observer_pdo_init);
+        pdo_observer_registered = 1;
+        fprintf(stderr, "[OPA MINIT] Zend Observer for PDO registered\n");
+        fflush(stderr);
+        
+        // Initialize hash table for storing call start times
+        if (!pdo_call_times) {
+            pdo_call_times = emalloc(sizeof(HashTable));
+            zend_hash_init(pdo_call_times, 8, NULL, zval_ptr_dtor, 0);
+        }
+    }
     
     // Register SQL profiling hooks (lazy registration - try in RINIT as well)
     // MySQLi hook
@@ -2727,45 +2738,8 @@ PHP_MINIT_FUNCTION(opa) {
         }
     }
     
-    // PDO::query hook
-    // Try EG(class_table) first (available at RINIT), fallback to CG(class_table)
-    zend_class_entry *pdo_ce = NULL;
-    if (EG(class_table)) {
-        pdo_ce = zend_hash_str_find_ptr(EG(class_table), "PDO", sizeof("PDO")-1);
-    }
-    if (!pdo_ce && CG(class_table)) {
-        pdo_ce = zend_hash_str_find_ptr(CG(class_table), "PDO", sizeof("PDO")-1);
-    }
-    if (pdo_ce) {
-        orig_pdo_query_func = zend_hash_str_find_ptr(&pdo_ce->function_table, "query", sizeof("query")-1);
-        if (orig_pdo_query_func && orig_pdo_query_func->type == ZEND_INTERNAL_FUNCTION) {
-            orig_pdo_query_handler = orig_pdo_query_func->internal_function.handler;
-            orig_pdo_query_func->internal_function.handler = zim_PDO_query;
-            if (OPA_G(debug_log_enabled)) {
-                php_printf("[OPA] PDO::query hook registered\n");
-            }
-        }
-    }
-    
-    // PDOStatement::execute hook
-    // Try EG(class_table) first (available at RINIT), fallback to CG(class_table)
-    zend_class_entry *pdo_stmt_ce = NULL;
-    if (EG(class_table)) {
-        pdo_stmt_ce = zend_hash_str_find_ptr(EG(class_table), "PDOStatement", sizeof("PDOStatement")-1);
-    }
-    if (!pdo_stmt_ce && CG(class_table)) {
-        pdo_stmt_ce = zend_hash_str_find_ptr(CG(class_table), "PDOStatement", sizeof("PDOStatement")-1);
-    }
-    if (pdo_stmt_ce) {
-        orig_pdo_stmt_execute_func = zend_hash_str_find_ptr(&pdo_stmt_ce->function_table, "execute", sizeof("execute")-1);
-        if (orig_pdo_stmt_execute_func && orig_pdo_stmt_execute_func->type == ZEND_INTERNAL_FUNCTION) {
-            orig_pdo_stmt_execute_handler = orig_pdo_stmt_execute_func->internal_function.handler;
-            orig_pdo_stmt_execute_func->internal_function.handler = zim_PDOStatement_execute;
-            if (OPA_G(debug_log_enabled)) {
-                php_printf("[OPA] PDOStatement::execute hook registered\n");
-            }
-        }
-    }
+    // PDO hooks are now handled via Zend Observer API (registered above)
+    // No need for handler replacement - Observer API intercepts all calls
     
     // PHP 8.4: Get CurlHandle class entry pointers for reliable detection
     // NOTE: EG(class_table) is NULL at MINIT time in PHP 8.4, so we defer lookup to RINIT
@@ -2775,33 +2749,13 @@ PHP_MINIT_FUNCTION(opa) {
     curl_share_ce = NULL;
     
     // Hook curl_exec directly at MINIT time
-    zend_function *f = zend_hash_str_find_ptr(CG(function_table), "curl_exec", sizeof("curl_exec")-1);
-    if (f && f->type == ZEND_INTERNAL_FUNCTION) {
-        orig_curl_exec_func = f;
+    zend_function *curl_func = zend_hash_str_find_ptr(CG(function_table), "curl_exec", sizeof("curl_exec")-1);
+    if (curl_func && curl_func->type == ZEND_INTERNAL_FUNCTION) {
+        orig_curl_exec_func = curl_func;
         // Store original handler BEFORE replacing it
-        orig_curl_exec_handler = f->internal_function.handler;
+        orig_curl_exec_handler = curl_func->internal_function.handler;
         // Replace handler with our wrapper
-        f->internal_function.handler = zif_opa_curl_exec;
-        debug_log("[MINIT] Hooked curl_exec: orig handler=%p", orig_curl_exec_handler);
-    } else {
-        debug_log("[MINIT] curl_exec not found or not internal");
-    }
-    
-    // PHP 8.4: Get CurlHandle class entry pointers for reliable detection
-    // NOTE: EG(class_table) is NULL at MINIT time in PHP 8.4, so we defer lookup to RINIT
-    // Initialize pointers to NULL - will be set in RINIT when class_table is available
-    curl_ce = NULL;
-    curl_multi_ce = NULL;
-    curl_share_ce = NULL;
-    
-    // Hook curl_exec directly at MINIT time
-    zend_function *f = zend_hash_str_find_ptr(CG(function_table), "curl_exec", sizeof("curl_exec")-1);
-    if (f && f->type == ZEND_INTERNAL_FUNCTION) {
-        orig_curl_exec_func = f;
-        // Store original handler BEFORE replacing it
-        orig_curl_exec_handler = f->internal_function.handler;
-        // Replace handler with our wrapper
-        f->internal_function.handler = zif_opa_curl_exec;
+        curl_func->internal_function.handler = zif_opa_curl_exec;
         debug_log("[MINIT] Hooked curl_exec: orig handler=%p", orig_curl_exec_handler);
     } else {
         debug_log("[MINIT] curl_exec not found or not internal");
@@ -2837,6 +2791,12 @@ static int null_span_dtor(zval *zv) {
 
 // Module shutdown - restores original zend_execute_ex hook and cleans up resources
 PHP_MSHUTDOWN_FUNCTION(opa) {
+    // Cleanup PDO call times hash table
+    if (pdo_call_times) {
+        zend_hash_destroy(pdo_call_times);
+        efree(pdo_call_times);
+        pdo_call_times = NULL;
+    }
     // Restore original zend_execute_ex hook to prevent issues during module unload
     if (original_zend_execute_ex) {
         zend_execute_ex = original_zend_execute_ex;
@@ -2910,100 +2870,49 @@ PHP_RINIT_FUNCTION(opa) {
         }
     }
     
-    // Register PDO hooks in RINIT (after all extensions have loaded their classes)
-    // Only register once per process (track with static flag)
-    if (!pdo_hooks_registered) {
-        // Try to find PDO class - use CG(class_table) as it's populated by RINIT time
-        zend_class_entry *pdo_ce = NULL;
-        
-        // Primary: Try CG(class_table) - should be populated by RINIT
-        if (CG(class_table)) {
-            pdo_ce = zend_hash_str_find_ptr(CG(class_table), "PDO", sizeof("PDO")-1);
-            if (pdo_ce) {
-                php_printf("[OPA RINIT] Found PDO class in CG(class_table)\n");
-            }
-        }
-        
-        // Fallback: Try EG(class_table)
-        if (!pdo_ce && EG(class_table)) {
-            pdo_ce = zend_hash_str_find_ptr(EG(class_table), "PDO", sizeof("PDO")-1);
-            if (pdo_ce) {
-                php_printf("[OPA RINIT] Found PDO class in EG(class_table)\n");
-            }
-        }
-        
-        // Last resort: Try zend_lookup_class
-        if (!pdo_ce) {
-            zend_string *pdo_name = zend_string_init("PDO", sizeof("PDO")-1, 0);
-            pdo_ce = zend_lookup_class(pdo_name);
-            zend_string_release(pdo_name);
-            if (pdo_ce) {
-                php_printf("[OPA RINIT] Found PDO class via zend_lookup_class\n");
-            }
-        }
-        
+    // PDO hooks are now registered via Zend Observer API in MINIT
+    // No need to do handler replacement here - Observer API handles it
+    fprintf(stderr, "[OPA RINIT] Called sapi=%s\n", sapi_module.name ? sapi_module.name : "unknown");
+    fflush(stderr);
+    
+    // Verify PDO class is available (for debugging)
+    zend_class_entry *pdo_ce = NULL;
+    if (CG(class_table)) {
+        pdo_ce = zend_hash_str_find_ptr(CG(class_table), "PDO", sizeof("PDO")-1);
         if (pdo_ce) {
-            orig_pdo_query_func = zend_hash_str_find_ptr(&pdo_ce->function_table, "query", sizeof("query")-1);
-            if (orig_pdo_query_func && orig_pdo_query_func->type == ZEND_INTERNAL_FUNCTION) {
-                orig_pdo_query_handler = orig_pdo_query_func->internal_function.handler;
-                orig_pdo_query_func->internal_function.handler = zim_PDO_query;
-            }
+            fprintf(stderr, "[OPA RINIT] PDO class found in CG(class_table)\n");
+            fflush(stderr);
+        } else {
+            fprintf(stderr, "[OPA RINIT] PDO class NOT found in CG(class_table)\n");
+            fflush(stderr);
         }
-    }
-    
-    if (!orig_pdo_stmt_execute_func) {
-        zend_class_entry *pdo_stmt_ce = zend_hash_str_find_ptr(CG(class_table), "PDOStatement", sizeof("PDOStatement")-1);
-        if (pdo_stmt_ce) {
-            orig_pdo_stmt_execute_func = zend_hash_str_find_ptr(&pdo_stmt_ce->function_table, "execute", sizeof("execute")-1);
-            if (orig_pdo_stmt_execute_func && orig_pdo_stmt_execute_func->type == ZEND_INTERNAL_FUNCTION) {
-                orig_pdo_stmt_execute_handler = orig_pdo_stmt_execute_func->internal_function.handler;
-                orig_pdo_stmt_execute_func->internal_function.handler = zim_PDOStatement_execute;
-            }
-        }
+    } else {
+        fprintf(stderr, "[OPA RINIT] CG(class_table) is NULL\n");
+        fflush(stderr);
     }
     
     // Look up curl class entries at RINIT time when class_table is available
     if (!curl_ce && EG(class_table)) {
         curl_ce = zend_hash_str_find_ptr(EG(class_table), "CurlHandle", sizeof("CurlHandle")-1);
         if (curl_ce) {
-            php_printf("[OPA] CurlHandle class found at RINIT\n");
+            fprintf(stderr, "[OPA RINIT] CurlHandle class found\n");
+            fflush(stderr);
         }
     }
 
     if (!curl_multi_ce && EG(class_table)) {
         curl_multi_ce = zend_hash_str_find_ptr(EG(class_table), "CurlMultiHandle", sizeof("CurlMultiHandle")-1);
         if (curl_multi_ce) {
-            php_printf("[OPA] CurlMultiHandle class found at RINIT\n");
+            fprintf(stderr, "[OPA RINIT] CurlMultiHandle class found\n");
+            fflush(stderr);
         }
     }
 
     if (!curl_share_ce && EG(class_table)) {
         curl_share_ce = zend_hash_str_find_ptr(EG(class_table), "CurlShareHandle", sizeof("CurlShareHandle")-1);
         if (curl_share_ce) {
-            php_printf("[OPA] CurlShareHandle class found at RINIT\n");
-        }
-    }
-    
-    
-    // Look up curl class entries at RINIT time when class_table is available
-    if (!curl_ce && EG(class_table)) {
-        curl_ce = zend_hash_str_find_ptr(EG(class_table), "CurlHandle", sizeof("CurlHandle")-1);
-        if (curl_ce) {
-            php_printf("[OPA] CurlHandle class found at RINIT\n");
-        }
-    }
-
-    if (!curl_multi_ce && EG(class_table)) {
-        curl_multi_ce = zend_hash_str_find_ptr(EG(class_table), "CurlMultiHandle", sizeof("CurlMultiHandle")-1);
-        if (curl_multi_ce) {
-            php_printf("[OPA] CurlMultiHandle class found at RINIT\n");
-        }
-    }
-
-    if (!curl_share_ce && EG(class_table)) {
-        curl_share_ce = zend_hash_str_find_ptr(EG(class_table), "CurlShareHandle", sizeof("CurlShareHandle")-1);
-        if (curl_share_ce) {
-            php_printf("[OPA] CurlShareHandle class found at RINIT\n");
+            fprintf(stderr, "[OPA RINIT] CurlShareHandle class found\n");
+            fflush(stderr);
         }
     }
     

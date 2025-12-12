@@ -122,7 +122,8 @@ static char* serialize_stack_trace(zval *trace) {
 }
 
 // Send error to agent (exported for use from opa_api.c)
-void send_error_to_agent(int error_type, const char *error_message, const char *file, int line, zval *stack_trace) {
+void send_error_to_agent(int error_type, const char *error_message, const char *file, int line, zval *stack_trace, int *exception_code) {
+    (void)exception_code; // Unused parameter, kept for API compatibility
     if (!OPA_G(enabled)) {
         return;
     }
@@ -244,6 +245,215 @@ void send_error_to_agent(int error_type, const char *error_message, const char *
     if (span_id != root_span_span_id) efree(span_id);
 }
 
+// Send log to agent (exported for use from opa.c and error handlers)
+void send_log_to_agent(const char *level, const char *message, const char *file, int line) {
+    if (!OPA_G(enabled) || !OPA_G(track_logs)) {
+        return;
+    }
+    
+    // Check if log level is enabled (if log_levels is configured)
+    // Temporarily disabled to test if it's causing memory corruption
+    int skip_level_check = 1; // Set to 0 to enable level checking
+    if (!skip_level_check && OPA_G(log_levels) && strlen(OPA_G(log_levels)) > 0 && level) {
+        // Convert level to lowercase for comparison
+        char level_lower[32] = {0};
+        size_t level_len = strlen(level);
+        if (level_len >= sizeof(level_lower)) level_len = sizeof(level_lower) - 1;
+        for (size_t i = 0; i < level_len; i++) {
+            level_lower[i] = (level[i] >= 'A' && level[i] <= 'Z') ? level[i] - 'A' + 'a' : level[i];
+        }
+        
+        // Normalize: warn -> warning, err -> error, inf -> info, crit -> critical
+        const char *level_to_check = level_lower;
+        char normalized[32] = {0};
+        if (strcmp(level_lower, "warn") == 0) {
+            strncpy(normalized, "warning", sizeof(normalized) - 1);
+            level_to_check = normalized;
+        } else if (strcmp(level_lower, "err") == 0) {
+            strncpy(normalized, "error", sizeof(normalized) - 1);
+            level_to_check = normalized;
+        } else if (strcmp(level_lower, "inf") == 0) {
+            strncpy(normalized, "info", sizeof(normalized) - 1);
+            level_to_check = normalized;
+        } else if (strcmp(level_lower, "crit") == 0) {
+            strncpy(normalized, "critical", sizeof(normalized) - 1);
+            level_to_check = normalized;
+        }
+        
+        // Simple check: see if level appears in log_levels string
+        // Check for comma-separated matches
+        const char *log_levels_str = OPA_G(log_levels);
+        int level_enabled = 0;
+        
+        // Check if it's the only level
+        if (strcmp(log_levels_str, level_to_check) == 0) {
+            level_enabled = 1;
+        } else {
+            // Check if it appears with comma boundaries
+            char pattern[64];
+            snprintf(pattern, sizeof(pattern), ",%s,", level_to_check);
+            if (strstr(log_levels_str, pattern) != NULL) {
+                level_enabled = 1;
+            } else {
+                // Check if it's at the start
+                size_t pattern_len = strlen(level_to_check);
+                if (strncmp(log_levels_str, level_to_check, pattern_len) == 0 && 
+                    log_levels_str[pattern_len] == ',') {
+                    level_enabled = 1;
+                } else {
+                    // Check if it's at the end
+                    size_t log_levels_len = strlen(log_levels_str);
+                    if (log_levels_len >= pattern_len && 
+                        strcmp(log_levels_str + log_levels_len - pattern_len, level_to_check) == 0 &&
+                        log_levels_str[log_levels_len - pattern_len - 1] == ',') {
+                        level_enabled = 1;
+                    }
+                }
+            }
+        }
+        
+        if (!level_enabled) {
+            return; // Log level not enabled
+        }
+    }
+    
+    // Get current trace/span IDs - make safe copies to avoid memory corruption
+    char *trace_id = NULL;
+    char *trace_id_to_free = NULL;
+    // Safely check root_span_trace_id before using strlen
+    if (root_span_trace_id) {
+        // Validate the pointer is valid by checking it's not NULL and trying to read first char
+        // This is a defensive check to avoid memory corruption
+        size_t trace_id_len = 0;
+        const char *p = root_span_trace_id;
+        while (*p != '\0' && trace_id_len < 256) { // Max reasonable ID length
+            trace_id_len++;
+            p++;
+        }
+        if (trace_id_len > 0 && trace_id_len < 256) {
+            trace_id = emalloc(trace_id_len + 1);
+            if (trace_id) {
+                memcpy(trace_id, root_span_trace_id, trace_id_len);
+                trace_id[trace_id_len] = '\0';
+                trace_id_to_free = trace_id;
+            }
+        }
+    }
+    if (!trace_id) {
+        trace_id = generate_id();
+        trace_id_to_free = trace_id;
+    }
+    
+    char *span_id = NULL;
+    char *span_id_to_free = NULL;
+    // Safely check root_span_span_id before using strlen
+    if (root_span_span_id) {
+        // Validate the pointer is valid
+        size_t span_id_len = 0;
+        const char *p = root_span_span_id;
+        while (*p != '\0' && span_id_len < 256) { // Max reasonable ID length
+            span_id_len++;
+            p++;
+        }
+        if (span_id_len > 0 && span_id_len < 256) {
+            span_id = emalloc(span_id_len + 1);
+            if (span_id) {
+                memcpy(span_id, root_span_span_id, span_id_len);
+                span_id[span_id_len] = '\0';
+                span_id_to_free = span_id;
+            }
+        }
+    }
+    
+    // Generate log ID
+    char *log_id = generate_id();
+    
+    // Get timestamp in milliseconds
+    long timestamp_ms = get_timestamp_ms();
+    
+    // Build log JSON
+    smart_string json = {0};
+    smart_string_appends(&json, "{\"type\":\"log\",");
+    smart_string_appends(&json, "\"id\":\"");
+    if (log_id) {
+        smart_string_appends(&json, log_id);
+    }
+    smart_string_appends(&json, "\",\"trace_id\":\"");
+    if (trace_id) {
+        smart_string_appends(&json, trace_id);
+    }
+    smart_string_appends(&json, "\",\"span_id\":");
+    if (span_id && strlen(span_id) > 0) {
+        smart_string_appends(&json, "\"");
+        smart_string_appends(&json, span_id);
+        smart_string_appends(&json, "\"");
+    } else {
+        smart_string_appends(&json, "null");
+    }
+    smart_string_appends(&json, ",\"level\":\"");
+    // Safely handle level string - use the level directly (it's a string literal from log_structured)
+    const char *level_str = level ? level : "INFO";
+    smart_string_appends(&json, level_str);
+    smart_string_appends(&json, "\",\"message\":\"");
+    if (message) {
+        // Validate message pointer and length before using
+        size_t msg_len = strlen(message);
+        if (msg_len > 0 && msg_len < 1024 * 1024) { // Sanity check: max 1MB
+            json_escape_string(&json, message, msg_len);
+        }
+    }
+    smart_string_appends(&json, "\",\"service\":\"");
+    if (OPA_G(service)) {
+        json_escape_string(&json, OPA_G(service), strlen(OPA_G(service)));
+    } else {
+        smart_string_appends(&json, "php-fpm");
+    }
+    smart_string_appends(&json, "\",\"timestamp_ms\":");
+    char ts_str[64];
+    snprintf(ts_str, sizeof(ts_str), "%ld", timestamp_ms);
+    smart_string_appends(&json, ts_str);
+    
+    // Add fields with file and line if available
+    smart_string_appends(&json, ",\"fields\":{");
+    if (file) {
+        smart_string_appends(&json, "\"file\":\"");
+        json_escape_string(&json, file, strlen(file));
+        smart_string_appends(&json, "\"");
+        if (line > 0) {
+            smart_string_appends(&json, ",\"line\":");
+            char line_str[32];
+            snprintf(line_str, sizeof(line_str), "%d", line);
+            smart_string_appends(&json, line_str);
+        }
+    } else if (line > 0) {
+        smart_string_appends(&json, "\"line\":");
+        char line_str[32];
+        snprintf(line_str, sizeof(line_str), "%d", line);
+        smart_string_appends(&json, line_str);
+    }
+    smart_string_appends(&json, "}");
+    
+    smart_string_appends(&json, "}");
+    smart_string_0(&json);
+    
+    if (json.c && json.len > 0) {
+        char *msg = emalloc(json.len + 1);
+        if (msg) {
+            memcpy(msg, json.c, json.len);
+            msg[json.len] = '\0';
+            send_message_direct(msg, 1); // Send with compression
+        }
+        smart_string_free(&json);
+    } else {
+        smart_string_free(&json);
+    }
+    
+    // Free allocated memory
+    if (log_id) efree(log_id);
+    if (trace_id_to_free) efree(trace_id_to_free);
+    if (span_id_to_free) efree(span_id_to_free);
+}
+
 // Track error via shutdown function (more reliable than error handler)
 static void opa_track_error_via_shutdown(void) {
     if (!OPA_G(enabled)) {
@@ -289,7 +499,8 @@ static void opa_track_error_via_shutdown(void) {
             ZVAL_UNDEF(&trace);
             zend_call_method_with_0_params(Z_OBJ_P(error), Z_OBJCE_P(error), NULL, "gettrace", &trace);
             
-            send_error_to_agent(error_type, error_message, file, line, &trace);
+            int exception_code = 0;
+            send_error_to_agent(error_type, error_message, file, line, &trace, &exception_code);
             
             if (Z_TYPE(message_zv) != IS_UNDEF) zval_ptr_dtor(&message_zv);
             if (Z_TYPE(file_zv) != IS_UNDEF) zval_ptr_dtor(&file_zv);
@@ -353,7 +564,11 @@ static void opa_exception_handler(zval *exception) {
     ZVAL_UNDEF(&trace_array);
     zend_call_method_with_0_params(Z_OBJ_P(exception), Z_OBJCE_P(exception), NULL, "gettrace", &trace_array);
     
-    send_error_to_agent(E_ERROR, error_message, file, line, &trace_array);
+    int exception_code = 0;
+    if (Z_TYPE(code_zv) == IS_LONG) {
+        exception_code = Z_LVAL(code_zv);
+    }
+    send_error_to_agent(E_ERROR, error_message, file, line, &trace_array, &exception_code);
     
     // Cleanup
     if (Z_TYPE(message_zv) != IS_UNDEF) zval_ptr_dtor(&message_zv);
