@@ -2392,6 +2392,10 @@ static void zif_opa_pdo_query(zend_execute_data *execute_data, zval *return_valu
     
     // Log SQL query
     if (sql) {
+        if (OPA_G(debug_log_enabled)) {
+            php_printf("[OPA SQL Profiling] PDO Query: %s | Time: %.3fms | Rows: %ld\n", 
+                   ZSTR_VAL(sql), elapsed, row_count);
+        }
         
         // Send SQL query data to agent via record_sql_query
         double duration_seconds = elapsed / 1000.0;
@@ -2474,10 +2478,6 @@ static void zif_opa_pdo_stmt_execute(zend_execute_data *execute_data, zval *retu
     
     // Log SQL query
     if (sql) {
-        if (OPA_G(debug_log_enabled)) {
-            php_printf("[OPA SQL Profiling] PDOStatement Execute: %s | Time: %.3fms | Rows: %ld\n", 
-                   sql, elapsed, row_count);
-        }
         
         // Send SQL query data to agent via record_sql_query
         double duration_seconds = elapsed / 1000.0;
