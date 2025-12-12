@@ -1351,8 +1351,6 @@ void opa_execute_ex(zend_execute_data *execute_data) {
     
     // Debug: Log ALL PDO-related function calls (using php_printf so it's always visible)
     if (class_name && (strcmp(class_name, "PDO") == 0 || strcmp(class_name, "PDOStatement") == 0)) {
-        php_printf("[OPA execute_ex] PDO CLASS DETECTED: %s::%s (func_type=%d)\n", 
-            class_name, function_name ? function_name : "NULL", func->type);
         debug_log("[execute_ex] PDO CLASS DETECTED: %s::%s (func_type=%d, scope=%p)", 
             class_name, function_name ? function_name : "NULL", func->type, func->common.scope);
     }
@@ -1423,7 +1421,6 @@ void opa_execute_ex(zend_execute_data *execute_data) {
     // Fallback: check directly by class name and function name
     if (!pdo_method && is_pdo_class && is_pdo_method_name) {
         pdo_method = 1;
-        php_printf("[OPA execute_ex] PDO method detected: %s::%s\n", class_name, function_name);
         debug_log("[execute_ex] PDO method detected via direct class name check: %s::%s", class_name, function_name);
         
         // Note: Lazy hook registration removed - variables not accessible in this scope
@@ -1587,9 +1584,6 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         const char *query_type = function_name ? function_name : "PDO";
         int rows_affected = -1;
         
-        php_printf("[OPA execute_ex] PDO method detected: pdo_method=%d, sql=%s, call_id=%s, function_name=%s, class_name=%s\n", 
-            pdo_method, sql ? sql : "NULL", call_id ? call_id : "NULL", 
-            function_name ? function_name : "NULL", class_name ? class_name : "NULL");
         debug_log("[execute_ex] PDO method detected: pdo_method=%d, sql=%s, call_id=%s, function_name=%s, class_name=%s", 
             pdo_method, sql ? sql : "NULL", call_id ? call_id : "NULL", 
             function_name ? function_name : "NULL", class_name ? class_name : "NULL");
@@ -1602,7 +1596,6 @@ void opa_execute_ex(zend_execute_data *execute_data) {
                 global_collector->global_sql_queries = ecalloc(1, sizeof(zval));
                 if (global_collector->global_sql_queries) {
                     array_init(global_collector->global_sql_queries);
-                    php_printf("[OPA execute_ex] Initialized global_sql_queries array\n");
                 }
             }
             if (global_collector->global_sql_queries) {
@@ -1638,7 +1631,6 @@ void opa_execute_ex(zend_execute_data *execute_data) {
                     sql, query_duration, zend_hash_num_elements(Z_ARRVAL_P(global_collector->global_sql_queries)));
                 debug_log("[execute_ex] SQL query added directly to global array: %s, duration=%.6f", sql, query_duration);
             } else {
-                php_printf("[OPA execute_ex] ERROR: Failed to initialize global_sql_queries array\n");
             }
             pthread_mutex_unlock(&global_collector->global_sql_mutex);
         } else {
@@ -2538,7 +2530,6 @@ static void opa_observer_pdo_fcall_begin(zend_execute_data *execute_data) {
     if (class_name && (strcmp(class_name, "PDO") == 0 || strcmp(class_name, "PDOStatement") == 0)) {
         if (method_name && (strcmp(method_name, "query") == 0 || strcmp(method_name, "exec") == 0 || 
                            strcmp(method_name, "prepare") == 0 || strcmp(method_name, "execute") == 0)) {
-            debug_log("[observer] PDO method observed: %s::%s", class_name, method_name);
         }
     }
 }
