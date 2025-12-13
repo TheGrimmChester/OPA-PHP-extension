@@ -428,7 +428,10 @@ static void serialize_call_node_json_malloc(json_buffer_t *buf, call_node_t *cal
 
 // Create span context
 span_context_t* create_span_context(const char *span_id, const char *trace_id, const char *name) {
-    span_context_t *span = emalloc(sizeof(span_context_t));
+    // Use malloc instead of emalloc to prevent PHP from automatically freeing
+    // the span structure during request cleanup, which causes use-after-free crashes
+    // when spans are accessed after RSHUTDOWN
+    span_context_t *span = malloc(sizeof(span_context_t));
     memset(span, 0, sizeof(span_context_t));
     span->span_id = span_id ? estrdup(span_id) : NULL;
     span->trace_id = trace_id ? estrdup(trace_id) : NULL;
@@ -503,7 +506,7 @@ void free_span_context(span_context_t *span) {
         if (span->dumps) efree(span->dumps);
     }
     
-    efree(span);
+    free(span); // Use free (not efree) since we used malloc
 }
 
 // Produce span JSON from individual values - returns char* allocated with malloc (not emalloc)
