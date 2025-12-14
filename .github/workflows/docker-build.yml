@@ -65,10 +65,14 @@ jobs:
             SHA=$(echo ${{ github.sha }} | cut -c1-7)
             echo "version=$SHA" >> $GITHUB_OUTPUT
             echo "should_push=true" >> $GITHUB_OUTPUT
+<<<<<<< HEAD
             {
               echo "${{ env.REGISTRY }}/thegrimmchester/${{ env.IMAGE_NAME_PREFIX }}-${{ matrix.php_version }}:latest"
               echo "${{ env.REGISTRY }}/thegrimmchester/${{ env.IMAGE_NAME_PREFIX }}-${{ matrix.php_version }}:sha-$SHA"
             } > tags.txt
+=======
+            echo "${{ env.REGISTRY }}/thegrimmchester/${{ env.IMAGE_NAME_PREFIX }}-${{ matrix.php_version }}:sha-$SHA" > tags.txt
+>>>>>>> ci/add-docker-build-workflow
           fi
           echo "tags<<EOF" >> $GITHUB_OUTPUT
           cat tags.txt >> $GITHUB_OUTPUT
