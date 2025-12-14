@@ -115,9 +115,9 @@ run_php_test() {
     
     cd "${PHP_EXTENSION_DIR}" || return 1
     
-    # Create a test script - use TESTS_DIR if available (for container), otherwise PHP_EXTENSION_DIR/tests
-    local tests_base="${TESTS_DIR:-${PHP_EXTENSION_DIR}/tests}"
-    local test_dir="${tests_base}/e2e/curl_e2e"
+    # Create a test script - use TESTS_DIR consistently
+    # TESTS_DIR is set by common.sh and is /app/tests in container, ${PHP_EXTENSION_DIR}/tests on host
+    local test_dir="${TESTS_DIR}/e2e/curl_e2e"
     mkdir -p "${test_dir}" 2>/dev/null || true
     local test_script="${test_dir}/curl_e2e.php"
     cat > "$test_script" << 'EOF'
@@ -148,14 +148,12 @@ for ($i = 0; $i < 3; $i++) {
 echo "Test completed.\n";
 EOF
     
-    # Determine PHP file path based on environment
-    local php_test_file
+    # Determine PHP file path - use TESTS_DIR consistently
+    local php_test_file="${TESTS_DIR}/e2e/curl_e2e/curl_e2e.php"
     if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
-        php_test_file="/app/tests/e2e/curl_e2e/curl_e2e.php"
         # Running in container, execute PHP directly
         TEST_URL="$TEST_URL" php "$php_test_file" 2>&1 || true
     else
-        php_test_file="${TESTS_DIR:-${PHP_EXTENSION_DIR}/tests}/e2e/curl_e2e/curl_e2e.php"
         # Running on host, use docker-compose (if available)
         if command -v docker-compose >/dev/null 2>&1 || docker compose version >/dev/null 2>&1; then
             TEST_URL="$TEST_URL" docker-compose -f "${PROJECT_ROOT}/docker-compose.test.yml" run --rm \

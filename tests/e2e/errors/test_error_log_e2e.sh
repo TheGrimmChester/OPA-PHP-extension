@@ -113,9 +113,9 @@ run_php_test() {
     
     cd "${PHP_EXTENSION_DIR}" || return 1
     
-    # Create a test script - use TESTS_DIR if available (for container), otherwise PHP_EXTENSION_DIR/tests
-    local tests_base="${TESTS_DIR:-${PHP_EXTENSION_DIR}/tests}"
-    local test_dir="${tests_base}/e2e/error_log_e2e"
+    # Create a test script - use TESTS_DIR consistently
+    # TESTS_DIR is set by common.sh and is /app/tests in container, ${PHP_EXTENSION_DIR}/tests on host
+    local test_dir="${TESTS_DIR}/e2e/error_log_e2e"
     mkdir -p "${test_dir}" 2>/dev/null || true
     local test_script="${test_dir}/error_log_e2e.php"
     cat > "$test_script" << 'EOF'
@@ -200,7 +200,7 @@ EOF
         -e OPA_TRACK_ERRORS=1 \
         -e OPA_TRACK_LOGS=1 \
         -e OPA_LOG_LEVELS="critical,error,warning" \
-        php php "${TESTS_DIR:-/app/tests}/e2e/error_log_e2e/error_log_e2e.php" 2>&1 | grep -v "^Container" || true
+        php php "${TESTS_DIR}/e2e/error_log_e2e/error_log_e2e.php" 2>&1 | grep -v "^Container" || true
     
     rm -f "$test_script"
     

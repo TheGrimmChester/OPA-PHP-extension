@@ -270,7 +270,7 @@ main() {
     cd "${PROJECT_ROOT}" || exit 1
     
     # Start services in background
-    $DOCKER_COMPOSE -f docker/compose/docker-compose.test.yml up -d nginx php 2>&1 | grep -v "Creating\|Starting\|Created\|Started" || true
+    $DOCKER_COMPOSE -f "${PROJECT_ROOT}/docker-compose.test.yml" up -d nginx-test symfony-php 2>&1 | grep -v "Creating\|Starting\|Created\|Started" || true
     
     # Wait for services to be ready
     log_info "Waiting for services to be ready..."

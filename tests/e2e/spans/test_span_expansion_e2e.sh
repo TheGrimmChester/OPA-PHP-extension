@@ -213,13 +213,17 @@ run_php_test() {
     
     log_info "Running span expansion E2E test..."
     
-    # Build PHP image if needed
-    if ! docker images | grep -q "php-extension-test"; then
-        log_info "Building PHP extension test image..."
-        docker build -t php-extension-test -f Dockerfile . > /dev/null 2>&1 || {
-            log_error "Failed to build PHP extension image"
-            return 1
-        }
+    # Build PHP image if needed (skip if running inside container - image should already exist)
+    if [[ -z "${DOCKER_CONTAINER:-}" ]] && [[ ! -f /.dockerenv ]]; then
+        if ! docker images | grep -q "php-extension-test"; then
+            log_info "Building PHP extension test image..."
+            docker build -t php-extension-test -f Dockerfile . > /dev/null 2>&1 || {
+                log_error "Failed to build PHP extension image"
+                return 1
+            }
+        fi
+    else
+        log_info "Running inside container, using existing PHP environment"
     fi
     
     # Run test in PHP container
@@ -246,7 +250,7 @@ run_php_test() {
         -e OPA_COLLECT_INTERNAL_FUNCTIONS=1 \
         -e OPA_DEBUG_LOG=1 \
         -e OPA_EXPAND_SPANS=1 \
-        php php "${TESTS_DIR:-/app/tests}/e2e/span_expansion_simple/span_expansion_simple.php" 2>&1) || {
+        php php "${TESTS_DIR}/e2e/span_expansion_simple/span_expansion_simple.php" 2>&1) || {
         log_error "PHP test execution failed"
         echo "$test_output"
         return 1

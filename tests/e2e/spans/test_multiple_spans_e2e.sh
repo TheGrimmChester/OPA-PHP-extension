@@ -40,11 +40,36 @@ if ! curl -s http://localhost:8081/api/traces?limit=1 > /dev/null 2>&1; then
     exit 1
 fi
 
+# Source common helpers for path detection if not already sourced
+if [[ -z "${PROJECT_ROOT:-}" ]]; then
+    if [[ -f "${SCRIPT_DIR}/helpers/common.sh" ]]; then
+        source "${SCRIPT_DIR}/helpers/common.sh"
+    else
+        PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+        export PROJECT_ROOT
+    fi
+fi
+
+# Set API_URL based on environment (override if needed)
+if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+    API_URL="${API_URL:-http://agent:8080}"
+else
+    API_URL="${API_URL:-http://localhost:8081}"
+fi
+
+# Check if agent is running
+log_info "Checking if agent is available at ${API_URL}..."
+if ! curl -s "${API_URL}/api/traces?limit=1" > /dev/null 2>&1; then
+    log_error "Agent is not available at ${API_URL}"
+    log_info "Please start the agent first: docker-compose up -d agent"
+    exit 1
+fi
+
 # Check if MySQL is running
 log_info "Checking if MySQL is available..."
 if ! docker exec mysql-test mysqladmin ping -h localhost --silent 2>/dev/null; then
     log_warn "MySQL container not found, starting it..."
-    $DOCKER_COMPOSE -f docker/compose/docker-compose.test.yml up -d mysql-test
+    $DOCKER_COMPOSE -f "${PROJECT_ROOT}/docker-compose.test.yml" up -d mysql-test 2>&1 | grep -v "Creating\|Starting\|Created\|Started" || true
     log_info "Waiting for MySQL to be ready..."
     sleep 5
 fi
@@ -53,7 +78,7 @@ log_info "Running PHP test to generate multiple spans..."
 echo ""
 
 # Run the PHP test
-test_output=$($DOCKER_COMPOSE -f docker/compose/docker-compose.test.yml run --rm \
+test_output=$($DOCKER_COMPOSE -f "${PROJECT_ROOT}/docker-compose.test.yml" run --rm \
     --entrypoint /usr/local/bin/docker-entrypoint-custom.sh \
     -e OPA_ENABLED=1 \
     -e OPA_SOCKET_PATH=opa-agent:9090 \
@@ -69,7 +94,7 @@ test_output=$($DOCKER_COMPOSE -f docker/compose/docker-compose.test.yml run --rm
     -e MYSQL_USER=test_user \
     -e MYSQL_PASSWORD=test_password \
     -e MYSQL_ROOT_PASSWORD=root_password \
-    php php "${TESTS_DIR:-/app/tests}/e2e/multiple_spans_e2e/multiple_spans_e2e.php" 2>&1)
+    php php "${TESTS_DIR}/e2e/multiple_spans_e2e/multiple_spans_e2e.php" 2>&1)
 
 # Filter out log noise
 echo "$test_output" | grep -v "timestamp\|level\|message\|fields\|ERROR.*Failed to connect" || true

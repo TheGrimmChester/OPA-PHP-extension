@@ -40,11 +40,19 @@ detect_environment() {
         export BASE_URL="${BASE_URL:-http://nginx-test}"
         export MYSQL_HOST="${MYSQL_HOST:-mysql-test}"
         export MYSQL_PORT="${MYSQL_PORT:-3306}"
-        # In container, tests are mounted at /app/tests, not ${PHP_EXTENSION_DIR}/tests
+        # In container, tests are mounted at /app/tests
+        # Always use /app/tests in container, regardless of PHP_EXTENSION_DIR resolution
         if [[ -d "/app/tests" ]]; then
             export TESTS_DIR="/app/tests"
+        elif [[ -d "/var/www/html/tests" ]]; then
+            export TESTS_DIR="/var/www/html/tests"
         else
-            export TESTS_DIR="${PHP_EXTENSION_DIR}/tests"
+            # Fallback: use PHP_EXTENSION_DIR but ensure no double /tests
+            if [[ "${PHP_EXTENSION_DIR}" == "/app" ]] || [[ "${PHP_EXTENSION_DIR}" == "/usr/src/opa" ]]; then
+                export TESTS_DIR="/app/tests"
+            else
+                export TESTS_DIR="${PHP_EXTENSION_DIR}/tests"
+            fi
         fi
     else
         export IN_CONTAINER=0

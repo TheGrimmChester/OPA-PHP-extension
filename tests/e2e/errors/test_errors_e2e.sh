@@ -451,14 +451,14 @@ main() {
     echo "Running error test scripts..."
     echo ""
     
-    # List of tests to run - use TESTS_DIR if available (for container), otherwise PHP_EXTENSION_DIR/tests
-    local tests_base="${TESTS_DIR:-${PHP_EXTENSION_DIR}/tests}"
+    # List of tests to run - use TESTS_DIR consistently
+    # TESTS_DIR is set by common.sh and is /app/tests in container, ${PHP_EXTENSION_DIR}/tests on host
     declare -a tests=(
-        "${tests_base}/e2e/errors/test_errors_basic.php:Basic Error Tests"
-        "${tests_base}/e2e/errors/test_errors_exceptions.php:Exception Error Tests"
-        "${tests_base}/e2e/errors/test_errors_fatal.php:Fatal Error Tests"
-        "${tests_base}/e2e/errors/test_errors_context.php:Context Error Tests"
-        "${tests_base}/e2e/errors/test_errors_context_comprehensive.php:Comprehensive Context Tests"
+        "${TESTS_DIR}/e2e/errors/test_errors_basic.php:Basic Error Tests"
+        "${TESTS_DIR}/e2e/errors/test_errors_exceptions.php:Exception Error Tests"
+        "${TESTS_DIR}/e2e/errors/test_errors_fatal.php:Fatal Error Tests"
+        "${TESTS_DIR}/e2e/errors/test_errors_context.php:Context Error Tests"
+        "${TESTS_DIR}/e2e/errors/test_errors_context_comprehensive.php:Comprehensive Context Tests"
     )
     
     # Run each test

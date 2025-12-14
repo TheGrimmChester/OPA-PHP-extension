@@ -121,8 +121,10 @@ run_php_test() {
     
     cd "${PHP_EXTENSION_DIR}" || return 1
     
-    # Create a test script in the mounted volume
-    local test_script="${PHP_EXTENSION_DIR}/tests/e2e/sql_e2e/sql_e2e.php"
+    # Create a test script - use TESTS_DIR consistently
+    # TESTS_DIR is set by common.sh and is /app/tests in container, ${PHP_EXTENSION_DIR}/tests on host
+    local test_script="${TESTS_DIR}/e2e/sql_e2e/sql_e2e.php"
+    mkdir -p "$(dirname "$test_script")" 2>/dev/null || true
     cat > "$test_script" << 'EOF'
 <?php
 echo "Making SQL queries for E2E test...\n";
@@ -216,7 +218,7 @@ EOF
         -e MYSQL_DATABASE="$MYSQL_DATABASE" \
         -e MYSQL_USER="$MYSQL_USER" \
         -e MYSQL_PASSWORD="$MYSQL_PASSWORD" \
-        php php "${TESTS_DIR:-/app/tests}/e2e/sql_e2e/sql_e2e.php" 2>&1 | grep -v "^Container" || true
+        php php "${TESTS_DIR}/e2e/sql_e2e/sql_e2e.php" 2>&1 | grep -v "^Container" || true
     
     rm -f "$test_script"
     
