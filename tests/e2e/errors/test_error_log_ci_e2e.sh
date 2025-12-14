@@ -32,7 +32,14 @@ else
 fi
 
 # Configuration
-API_URL="${API_URL:-http://localhost:8081}"
+# API_URL is set by common.sh if sourced, otherwise use environment-aware default
+if [[ -z "${API_URL:-}" ]]; then
+    if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+        API_URL="http://agent:8080"
+    else
+        API_URL="http://localhost:8081"
+    fi
+fi
 CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-clickhouse}"
 CLICKHOUSE_PORT="${CLICKHOUSE_PORT:-9000}"
 CLICKHOUSE_HTTP_PORT="${CLICKHOUSE_HTTP_PORT:-8123}"
@@ -117,8 +124,13 @@ clickhouse_query() {
     local result
     local exit_code
     
-    # Try to find ClickHouse container (GitHub Actions service)
-    clickhouse_container=$(docker ps --filter "ancestor=clickhouse/clickhouse-server:23.3" --format "{{.ID}}" | head -1)
+    # Try to find ClickHouse container - check multiple name patterns
+    clickhouse_container=$(docker ps --filter "name=clickhouse-test" --format "{{.ID}}" | head -1)
+    
+    if [[ -z "$clickhouse_container" ]]; then
+        # Try by ancestor (GitHub Actions service)
+        clickhouse_container=$(docker ps --filter "ancestor=clickhouse/clickhouse-server:23.3" --format "{{.ID}}" | head -1)
+    fi
     
     if [[ -z "$clickhouse_container" ]]; then
         # Also try by name pattern (GitHub Actions service containers have specific naming)
@@ -135,6 +147,18 @@ clickhouse_query() {
             return 0
         elif [[ "$VERBOSE" -eq 1 ]] || [[ "$CI_MODE" -eq 1 ]]; then
             log_warn "ClickHouse query failed via docker exec (exit code: $exit_code): $result"
+        fi
+    fi
+    
+    # Fallback: try docker-compose.test.yml from main project (for test environment)
+    if [[ -f "${PROJECT_ROOT}/docker-compose.test.yml" ]]; then
+        result=$(cd "${PROJECT_ROOT}" && docker compose -f docker-compose.test.yml exec -T clickhouse-test clickhouse-client --query "$query" 2>&1)
+        exit_code=$?
+        if [[ $exit_code -eq 0 ]]; then
+            echo "$result"
+            return 0
+        elif [[ "$VERBOSE" -eq 1 ]]; then
+            log_warn "ClickHouse query failed via docker-compose.test.yml (exit code: $exit_code): $result"
         fi
     fi
     

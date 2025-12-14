@@ -32,21 +32,10 @@ else
     DOCKER_COMPOSE="docker-compose"
 fi
 
-# Source common helpers for path detection
-if [[ -f "${SCRIPT_DIR}/helpers/common.sh" ]]; then
-    source "${SCRIPT_DIR}/helpers/common.sh"
-fi
-
-# Set API_URL based on environment
-API_URL="${API_URL:-http://localhost:8081}"
-if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
-    API_URL="${API_URL:-http://agent:8080}"
-fi
-
 # Check if agent is running
-log_info "Checking if agent is available at ${API_URL}..."
-if ! curl -s "${API_URL}/api/traces?limit=1" > /dev/null 2>&1; then
-    log_error "Agent is not available at ${API_URL}"
+log_info "Checking if agent is available..."
+if ! curl -s http://localhost:8081/api/traces?limit=1 > /dev/null 2>&1; then
+    log_error "Agent is not available at http://localhost:8081"
     log_info "Please start the agent first: docker-compose up -d agent"
     exit 1
 fi

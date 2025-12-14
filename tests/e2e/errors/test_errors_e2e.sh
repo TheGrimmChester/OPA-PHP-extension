@@ -29,7 +29,14 @@ else
 fi
 
 # Configuration
-API_URL="${API_URL:-http://localhost:8081}"
+# API_URL is set by common.sh if sourced, otherwise use environment-aware default
+if [[ -z "${API_URL:-}" ]]; then
+    if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+        API_URL="http://agent:8080"
+    else
+        API_URL="http://localhost:8081"
+    fi
+fi
 DASHBOARD_URL="${DASHBOARD_URL:-http://localhost:3000}"
 SERVICE_NAME="${SERVICE_NAME:-error-e2e-test}"
 VERBOSE="${VERBOSE:-0}"
@@ -444,13 +451,14 @@ main() {
     echo "Running error test scripts..."
     echo ""
     
-    # List of tests to run
+    # List of tests to run - use TESTS_DIR if available (for container), otherwise PHP_EXTENSION_DIR/tests
+    local tests_base="${TESTS_DIR:-${PHP_EXTENSION_DIR}/tests}"
     declare -a tests=(
-        "${PHP_EXTENSION_DIR}/tests/e2e/errors_basic/errors_basic.php:Basic Error Tests"
-        "${PHP_EXTENSION_DIR}/tests/e2e/errors_exceptions/errors_exceptions.php:Exception Error Tests"
-        "${PHP_EXTENSION_DIR}/tests/e2e/errors_fatal/errors_fatal.php:Fatal Error Tests"
-        "${PHP_EXTENSION_DIR}/tests/e2e/errors_context/errors_context.php:Context Error Tests"
-        "${PHP_EXTENSION_DIR}/tests/e2e/errors_context_comprehensive/errors_context_comprehensive.php:Comprehensive Context Tests"
+        "${tests_base}/e2e/errors/test_errors_basic.php:Basic Error Tests"
+        "${tests_base}/e2e/errors/test_errors_exceptions.php:Exception Error Tests"
+        "${tests_base}/e2e/errors/test_errors_fatal.php:Fatal Error Tests"
+        "${tests_base}/e2e/errors/test_errors_context.php:Context Error Tests"
+        "${tests_base}/e2e/errors/test_errors_context_comprehensive.php:Comprehensive Context Tests"
     )
     
     # Run each test

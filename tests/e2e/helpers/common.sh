@@ -40,12 +40,19 @@ detect_environment() {
         export BASE_URL="${BASE_URL:-http://nginx-test}"
         export MYSQL_HOST="${MYSQL_HOST:-mysql-test}"
         export MYSQL_PORT="${MYSQL_PORT:-3306}"
+        # In container, tests are mounted at /app/tests, not ${PHP_EXTENSION_DIR}/tests
+        if [[ -d "/app/tests" ]]; then
+            export TESTS_DIR="/app/tests"
+        else
+            export TESTS_DIR="${PHP_EXTENSION_DIR}/tests"
+        fi
     else
         export IN_CONTAINER=0
         export API_URL="${API_URL:-http://localhost:8081}"
         export BASE_URL="${BASE_URL:-http://localhost:8090}"
         export MYSQL_HOST="${MYSQL_HOST:-localhost}"
         export MYSQL_PORT="${MYSQL_PORT:-3307}"
+        export TESTS_DIR="${PHP_EXTENSION_DIR}/tests"
     fi
     
     # Export other common variables

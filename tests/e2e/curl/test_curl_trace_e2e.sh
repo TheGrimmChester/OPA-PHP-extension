@@ -13,11 +13,31 @@ set -euo pipefail
 #   TEST_URL: URL to test with (default: https://aisenseapi.com/services/v1/ping)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
-PHP_EXTENSION_DIR="${PROJECT_ROOT}"
+
+# Source common helpers for path detection
+if [[ -f "${SCRIPT_DIR}/helpers/common.sh" ]]; then
+    source "${SCRIPT_DIR}/helpers/common.sh"
+else
+    # Fallback if common.sh not available
+    PHP_EXTENSION_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+    if [[ -d "${PHP_EXTENSION_DIR}/../agent" ]] && [[ -d "${PHP_EXTENSION_DIR}/../clickhouse" ]]; then
+        PROJECT_ROOT="${PHP_EXTENSION_DIR}/.."
+    else
+        PROJECT_ROOT="${PHP_EXTENSION_DIR}"
+    fi
+    export PROJECT_ROOT
+    export PHP_EXTENSION_DIR
+fi
 
 # Configuration
-API_URL="${API_URL:-http://localhost:8081}"
+# API_URL is set by common.sh if sourced, otherwise use environment-aware default
+if [[ -z "${API_URL:-}" ]]; then
+    if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+        API_URL="http://agent:8080"
+    else
+        API_URL="http://localhost:8081"
+    fi
+fi
 DASHBOARD_URL="${DASHBOARD_URL:-http://localhost:3000}"
 TEST_URL="${TEST_URL:-https://aisenseapi.com/services/v1/ping}"
 VERBOSE="${VERBOSE:-0}"
@@ -95,8 +115,11 @@ run_php_test() {
     
     cd "${PHP_EXTENSION_DIR}" || return 1
     
-    # Create a test script in the mounted volume
-    local test_script="${PHP_EXTENSION_DIR}/tests/e2e/curl_e2e/curl_e2e.php"
+    # Create a test script - use TESTS_DIR if available (for container), otherwise PHP_EXTENSION_DIR/tests
+    local tests_base="${TESTS_DIR:-${PHP_EXTENSION_DIR}/tests}"
+    local test_dir="${tests_base}/e2e/curl_e2e"
+    mkdir -p "${test_dir}" 2>/dev/null || true
+    local test_script="${test_dir}/curl_e2e.php"
     cat > "$test_script" << 'EOF'
 <?php
 echo "Making curl requests for E2E test...\n";
@@ -125,16 +148,31 @@ for ($i = 0; $i < 3; $i++) {
 echo "Test completed.\n";
 EOF
     
-    TEST_URL="$TEST_URL" docker-compose run --rm \
-        -e OPA_ENABLED=1 \
-        -e OPA_SOCKET_PATH=opa-agent:9090 \
-        -e OPA_SAMPLING_RATE=1.0 \
-        -e OPA_COLLECT_INTERNAL_FUNCTIONS=1 \
-        -e OPA_DEBUG_LOG=0 \
-        -e OPA_CURL_CAPTURE_BODY=1 \
-        -e OPA_SERVICE=curl-e2e-test \
-        -e TEST_URL="$TEST_URL" \
-        php php /var/www/html/tests/e2e/curl_e2e/curl_e2e.php 2>&1 | grep -v "^Container" || true
+    # Determine PHP file path based on environment
+    local php_test_file
+    if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+        php_test_file="/app/tests/e2e/curl_e2e/curl_e2e.php"
+        # Running in container, execute PHP directly
+        TEST_URL="$TEST_URL" php "$php_test_file" 2>&1 || true
+    else
+        php_test_file="${TESTS_DIR:-${PHP_EXTENSION_DIR}/tests}/e2e/curl_e2e/curl_e2e.php"
+        # Running on host, use docker-compose (if available)
+        if command -v docker-compose >/dev/null 2>&1 || docker compose version >/dev/null 2>&1; then
+            TEST_URL="$TEST_URL" docker-compose -f "${PROJECT_ROOT}/docker-compose.test.yml" run --rm \
+                -e OPA_ENABLED=1 \
+                -e OPA_SOCKET_PATH=opa-agent:9090 \
+                -e OPA_SAMPLING_RATE=1.0 \
+                -e OPA_COLLECT_INTERNAL_FUNCTIONS=1 \
+                -e OPA_DEBUG_LOG=0 \
+                -e OPA_CURL_CAPTURE_BODY=1 \
+                -e OPA_SERVICE=curl-e2e-test \
+                -e TEST_URL="$TEST_URL" \
+                php php "$php_test_file" 2>&1 | grep -v "^Container" || true
+        else
+            log_error "docker-compose not available and not running in container"
+            return 1
+        fi
+    fi
     
     rm -f "$test_script"
     

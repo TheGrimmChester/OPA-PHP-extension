@@ -6,7 +6,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
+# Source common helpers for path detection
+if [[ -f "${SCRIPT_DIR}/helpers/common.sh" ]]; then
+    source "${SCRIPT_DIR}/helpers/common.sh"
+else
+    # Fallback if common.sh not available
+    PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+    export PROJECT_ROOT
+fi
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -14,7 +22,14 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
-API_URL="${API_URL:-http://localhost:8081}"
+# API_URL is set by common.sh if sourced, otherwise use environment-aware default
+if [[ -z "${API_URL:-}" ]]; then
+    if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+        API_URL="http://agent:8080"
+    else
+        API_URL="http://localhost:8081"
+    fi
+fi
 VERBOSE="${VERBOSE:-0}"
 
 log_info() {

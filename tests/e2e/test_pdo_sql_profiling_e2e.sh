@@ -18,7 +18,14 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 PHP_EXTENSION_DIR="${PROJECT_ROOT}"
 
 # Configuration
-API_URL="${API_URL:-http://localhost:8081}"
+# API_URL is set by common.sh if sourced, otherwise use environment-aware default
+if [[ -z "${API_URL:-}" ]]; then
+    if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+        API_URL="http://agent:8080"
+    else
+        API_URL="http://localhost:8081"
+    fi
+fi
 MYSQL_HOST="${MYSQL_HOST:-mysql-test}"
 MYSQL_PORT="${MYSQL_PORT:-3306}"
 MYSQL_DATABASE="${MYSQL_DATABASE:-test_db}"
@@ -55,13 +62,31 @@ else
     exit 1
 fi
 
+# Source common helpers for path detection
+if [[ -f "${SCRIPT_DIR}/helpers/common.sh" ]]; then
+    source "${SCRIPT_DIR}/helpers/common.sh"
+else
+    # Fallback if common.sh not available
+    if [[ -d "${PHP_EXTENSION_DIR}/../agent" ]] && [[ -d "${PHP_EXTENSION_DIR}/../clickhouse" ]]; then
+        PROJECT_ROOT="${PHP_EXTENSION_DIR}/.."
+    else
+        PROJECT_ROOT="${PHP_EXTENSION_DIR}"
+    fi
+    export PROJECT_ROOT
+fi
+
+# Set docker-compose file path
+DOCKER_COMPOSE_FILE="${PROJECT_ROOT}/docker-compose.test.yml"
+
 # Cleanup function
 cleanup() {
     local exit_code=$?
-    cd "${PHP_EXTENSION_DIR}" || true
+    cd "${PROJECT_ROOT}" || true
     
-    # Stop MySQL test container
-    ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml down > /dev/null 2>&1 || true
+    # Stop MySQL test container (only if not in CI container)
+    if [[ -z "${DOCKER_CONTAINER:-}" ]]; then
+        ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" down > /dev/null 2>&1 || true
+    fi
     
     return $exit_code
 }
@@ -114,12 +139,18 @@ test_result() {
 
 # Start MySQL test database
 start_mysql() {
-    cd "${PHP_EXTENSION_DIR}" || return 1
+    # Skip if already in container with services running
+    if [[ -n "${DOCKER_CONTAINER:-}" ]]; then
+        log_info "Running in container, MySQL should already be running"
+        return 0
+    fi
+    
+    cd "${PROJECT_ROOT}" || return 1
     
     log_info "Starting MySQL test database..."
     
     local compose_output
-    compose_output=$(${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml up -d mysql-test 2>&1) || true
+    compose_output=$(${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" up -d mysql-test 2>&1) || true
     if [[ "$VERBOSE" -eq 1 ]]; then
         echo "$compose_output" | grep -v "Creating\|Created\|Starting\|Started" || true
     fi
@@ -128,13 +159,13 @@ start_mysql() {
     local max_attempts=30
     local attempt=0
     while [[ $attempt -lt $max_attempts ]]; do
-        if ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml exec -T mysql-test mysqladmin ping -h localhost -u root -p"${MYSQL_ROOT_PASSWORD}" --silent 2>/dev/null; then
+        if ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" exec -T mysql-test mysqladmin ping -h localhost -u root -p"${MYSQL_ROOT_PASSWORD}" --silent 2>/dev/null; then
             log_info "MySQL is ready"
             
             sleep 2
             
             # Create database and user if they don't exist
-            ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml exec -T mysql-test mysql -u root -p"${MYSQL_ROOT_PASSWORD}" <<EOF 2>/dev/null || true
+            ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" exec -T mysql-test mysql -u root -p"${MYSQL_ROOT_PASSWORD}" <<EOF 2>/dev/null || true
 CREATE DATABASE IF NOT EXISTS ${MYSQL_DATABASE};
 CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
 GRANT ALL PRIVILEGES ON ${MYSQL_DATABASE}.* TO '${MYSQL_USER}'@'%';
@@ -151,7 +182,7 @@ EOF
     
     log_error "MySQL failed to start"
     if [[ "$VERBOSE" -eq 1 ]]; then
-        ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml logs mysql-test 2>&1 | tail -20
+        ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" logs mysql-test 2>&1 | tail -20
     fi
     return 1
 }
@@ -181,7 +212,7 @@ run_php_test() {
     MYSQL_DATABASE="$MYSQL_DATABASE" \
     MYSQL_USER="$MYSQL_USER" \
     MYSQL_PASSWORD="$MYSQL_PASSWORD" \
-    ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml run --rm \
+    ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" run --rm \
         -e MYSQL_HOST="$MYSQL_HOST" \
         -e MYSQL_PORT="$MYSQL_PORT" \
         -e MYSQL_DATABASE="$MYSQL_DATABASE" \
@@ -560,9 +591,9 @@ main() {
         log_error "PHP test failed"
         if [[ "$VERBOSE" -eq 1 ]] || [[ "$CI_MODE" -eq 1 ]]; then
             log_info "Checking MySQL container status..."
-            ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml ps mysql-test 2>&1 || true
+            ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" ps mysql-test 2>&1 || true
             log_info "Checking MySQL logs (last 20 lines)..."
-            ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml logs --tail 20 mysql-test 2>&1 || true
+            ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" logs --tail 20 mysql-test 2>&1 || true
         fi
         exit 1
     fi

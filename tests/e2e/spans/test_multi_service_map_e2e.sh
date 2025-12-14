@@ -33,10 +33,21 @@ else
     DOCKER_COMPOSE="docker-compose"
 fi
 
+# Source common helpers for path detection
+if [[ -f "${SCRIPT_DIR}/helpers/common.sh" ]]; then
+    source "${SCRIPT_DIR}/helpers/common.sh"
+fi
+
+# Set API_URL based on environment
+API_URL="${API_URL:-http://localhost:8081}"
+if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+    API_URL="${API_URL:-http://agent:8080}"
+fi
+
 # Check if agent is running
-log_info "Checking if agent is available..."
-if ! curl -s http://localhost:8081/api/traces?limit=1 > /dev/null 2>&1; then
-    log_error "Agent is not available at http://localhost:8081"
+log_info "Checking if agent is available at ${API_URL}..."
+if ! curl -s "${API_URL}/api/traces?limit=1" > /dev/null 2>&1; then
+    log_error "Agent is not available at ${API_URL}"
     log_info "Please start the agent first: docker-compose up -d agent"
     exit 1
 fi
@@ -128,7 +139,7 @@ test_output_a=$($DOCKER_COMPOSE -f docker/compose/docker-compose.test.yml run --
         -d opa.full_capture_threshold_ms=0 \
         -d opa.stack_depth=50 \
         -d opa.collect_internal_functions=1 \
-        /var/www/html/tests/e2e/multi_service_map_e2e/multi_service_map_e2e.php 2>&1)
+        "${TESTS_DIR:-/app/tests}/e2e/multi_service_map_e2e/multi_service_map_e2e.php" 2>&1)
 
 # Filter out log noise
 echo "$test_output_a" | grep -v "timestamp\|level\|message\|fields\|ERROR.*Failed to connect" || true
@@ -163,7 +174,7 @@ test_output_b=$($DOCKER_COMPOSE -f docker/compose/docker-compose.test.yml run --
         -d opa.full_capture_threshold_ms=0 \
         -d opa.stack_depth=50 \
         -d opa.collect_internal_functions=1 \
-        /var/www/html/tests/e2e/multi_service_map_e2e/multi_service_map_e2e.php 2>&1)
+        "${TESTS_DIR:-/app/tests}/e2e/multi_service_map_e2e/multi_service_map_e2e.php" 2>&1)
 
 echo "$test_output_b" | grep -v "timestamp\|level\|message\|fields\|ERROR.*Failed to connect" || true
 
@@ -196,7 +207,7 @@ test_output_c=$($DOCKER_COMPOSE -f docker/compose/docker-compose.test.yml run --
         -d opa.full_capture_threshold_ms=0 \
         -d opa.stack_depth=50 \
         -d opa.collect_internal_functions=1 \
-        /var/www/html/tests/e2e/multi_service_map_e2e/multi_service_map_e2e.php 2>&1)
+        "${TESTS_DIR:-/app/tests}/e2e/multi_service_map_e2e/multi_service_map_e2e.php" 2>&1)
 
 echo "$test_output_c" | grep -v "timestamp\|level\|message\|fields\|ERROR.*Failed to connect" || true
 

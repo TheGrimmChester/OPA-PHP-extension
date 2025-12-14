@@ -29,7 +29,14 @@ else
 fi
 
 # Configuration
-API_URL="${API_URL:-http://localhost:8081}"
+# API_URL is set by common.sh if sourced, otherwise use environment-aware default
+if [[ -z "${API_URL:-}" ]]; then
+    if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+        API_URL="http://agent:8080"
+    else
+        API_URL="http://localhost:8081"
+    fi
+fi
 DASHBOARD_URL="${DASHBOARD_URL:-http://localhost:3000}"
 VERBOSE="${VERBOSE:-0}"
 
@@ -106,8 +113,11 @@ run_php_test() {
     
     cd "${PHP_EXTENSION_DIR}" || return 1
     
-    # Create a test script in the mounted volume
-    local test_script="${PHP_EXTENSION_DIR}/tests/e2e/error_log_e2e/error_log_e2e.php"
+    # Create a test script - use TESTS_DIR if available (for container), otherwise PHP_EXTENSION_DIR/tests
+    local tests_base="${TESTS_DIR:-${PHP_EXTENSION_DIR}/tests}"
+    local test_dir="${tests_base}/e2e/error_log_e2e"
+    mkdir -p "${test_dir}" 2>/dev/null || true
+    local test_script="${test_dir}/error_log_e2e.php"
     cat > "$test_script" << 'EOF'
 <?php
 echo "Generating errors and logs for E2E test...\n";
@@ -190,7 +200,7 @@ EOF
         -e OPA_TRACK_ERRORS=1 \
         -e OPA_TRACK_LOGS=1 \
         -e OPA_LOG_LEVELS="critical,error,warning" \
-        php php /var/www/html/tests/e2e/error_log_e2e/error_log_e2e.php 2>&1 | grep -v "^Container" || true
+        php php "${TESTS_DIR:-/app/tests}/e2e/error_log_e2e/error_log_e2e.php" 2>&1 | grep -v "^Container" || true
     
     rm -f "$test_script"
     

@@ -67,7 +67,7 @@ $DOCKER_COMPOSE -f docker/compose/docker-compose.test.yml run --rm \
     -e MYSQL_USER=test_user \
     -e MYSQL_PASSWORD=test_password \
     -e MYSQL_ROOT_PASSWORD=root_password \
-    php php /var/www/html/tests/e2e/generate_multiple_spans/generate_multiple_spans.php 2>&1 | grep -v "timestamp\|level\|message\|fields" || true
+    php php "${TESTS_DIR:-/app/tests}/e2e/generate_multiple_spans/generate_multiple_spans.php" 2>&1 | grep -v "timestamp\|level\|message\|fields" || true
 
 echo ""
 log_info "Waiting for trace to be stored in ClickHouse..."

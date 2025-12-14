@@ -31,7 +31,14 @@ else
 fi
 
 # Configuration
-API_URL="${API_URL:-http://localhost:8081}"
+# API_URL is set by common.sh if sourced, otherwise use environment-aware default
+if [[ -z "${API_URL:-}" ]]; then
+    if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+        API_URL="http://agent:8080"
+    else
+        API_URL="http://localhost:8081"
+    fi
+fi
 MYSQL_HOST="${MYSQL_HOST:-mysql-test}"
 MYSQL_PORT="${MYSQL_PORT:-3306}"
 MYSQL_DATABASE="${MYSQL_DATABASE:-test_db}"
@@ -58,13 +65,18 @@ fi
 TESTS_PASSED=0
 TESTS_FAILED=0
 
+# Set docker-compose file path
+DOCKER_COMPOSE_FILE="${PROJECT_ROOT}/docker-compose.test.yml"
+
 # Cleanup function
 cleanup() {
     local exit_code=$?
-    cd "${PHP_EXTENSION_DIR}" || true
+    cd "${PROJECT_ROOT}" || true
     
-    # Stop MySQL test container
-    docker-compose -f docker/compose/docker/compose/docker-compose.test.yml down > /dev/null 2>&1 || true
+    # Stop MySQL test container (only if not in CI container)
+    if [[ -z "${DOCKER_CONTAINER:-}" ]]; then
+        docker-compose -f "${DOCKER_COMPOSE_FILE}" down > /dev/null 2>&1 || true
+    fi
     
     return $exit_code
 }
@@ -117,22 +129,28 @@ test_result() {
 
 # Start MySQL test database
 start_mysql() {
-    cd "${PHP_EXTENSION_DIR}" || return 1
+    # Skip if already in container with services running
+    if [[ -n "${DOCKER_CONTAINER:-}" ]]; then
+        log_info "Running in container, MySQL should already be running"
+        return 0
+    fi
+    
+    cd "${PROJECT_ROOT}" || return 1
     
     log_info "Starting MySQL test database..."
     
     # Start MySQL using docker-compose
-    docker-compose -f docker/compose/docker/compose/docker-compose.test.yml up -d mysql-test 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
+    docker-compose -f "${DOCKER_COMPOSE_FILE}" up -d mysql-test 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
     
     # Wait for MySQL to be ready
     local max_attempts=30
     local attempt=0
     while [[ $attempt -lt $max_attempts ]]; do
-        if docker-compose -f docker/compose/docker/compose/docker-compose.test.yml exec -T mysql-test mysqladmin ping -h localhost -u root -p"${MYSQL_ROOT_PASSWORD}" --silent 2>/dev/null; then
+        if docker-compose -f "${DOCKER_COMPOSE_FILE}" exec -T mysql-test mysqladmin ping -h localhost -u root -p"${MYSQL_ROOT_PASSWORD}" --silent 2>/dev/null; then
             log_info "MySQL is ready"
             
             # Create database and user if they don't exist
-            docker-compose -f docker/compose/docker/compose/docker-compose.test.yml exec -T mysql-test mysql -u root -p"${MYSQL_ROOT_PASSWORD}" <<EOF 2>/dev/null || true
+            docker-compose -f "${DOCKER_COMPOSE_FILE}" exec -T mysql-test mysql -u root -p"${MYSQL_ROOT_PASSWORD}" <<EOF 2>/dev/null || true
 CREATE DATABASE IF NOT EXISTS ${MYSQL_DATABASE};
 CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
 GRANT ALL PRIVILEGES ON ${MYSQL_DATABASE}.* TO '${MYSQL_USER}'@'%';
@@ -147,7 +165,7 @@ EOF
     
     log_error "MySQL failed to start"
     if [[ "$VERBOSE" -eq 1 ]]; then
-        docker-compose -f docker/compose/docker/compose/docker-compose.test.yml logs mysql-test 2>&1 | tail -20
+        docker-compose -f "${DOCKER_COMPOSE_FILE}" logs mysql-test 2>&1 | tail -20
     fi
     return 1
 }
@@ -309,7 +327,7 @@ EOF
     MYSQL_DATABASE="$MYSQL_DATABASE" \
     MYSQL_USER="$MYSQL_USER" \
     MYSQL_PASSWORD="$MYSQL_PASSWORD" \
-    docker-compose -f docker/compose/docker/compose/docker-compose.test.yml run --rm \
+    docker-compose -f "${DOCKER_COMPOSE_FILE}" run --rm \
         -e OPA_ENABLED=1 \
         -e OPA_SOCKET_PATH=opa-agent:9090 \
         -e OPA_SAMPLING_RATE=1.0 \
@@ -321,7 +339,7 @@ EOF
         -e MYSQL_DATABASE="$MYSQL_DATABASE" \
         -e MYSQL_USER="$MYSQL_USER" \
         -e MYSQL_PASSWORD="$MYSQL_PASSWORD" \
-        php php /var/www/html/tests/e2e/sql_ci_e2e/sql_ci_e2e.php 2>&1 | grep -v "^Container" || true
+        php php "${TESTS_DIR:-/app/tests}/e2e/sql_ci_e2e/sql_ci_e2e.php" 2>&1 | grep -v "^Container" || true
     
     local php_exit_code=$?
     rm -f "$test_script"

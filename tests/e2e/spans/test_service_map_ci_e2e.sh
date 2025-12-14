@@ -13,11 +13,31 @@ set -euo pipefail
 #   CI_MODE: Set to '1' for CI mode (structured output)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"" && pwd)}"
-PHP_EXTENSION_DIR="${PROJECT_ROOT}"
+
+# Source common helpers for path detection
+if [[ -f "${SCRIPT_DIR}/helpers/common.sh" ]]; then
+    source "${SCRIPT_DIR}/helpers/common.sh"
+else
+    # Fallback if common.sh not available
+    PHP_EXTENSION_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+    if [[ -d "${PHP_EXTENSION_DIR}/../agent" ]] && [[ -d "${PHP_EXTENSION_DIR}/../clickhouse" ]]; then
+        PROJECT_ROOT="${PHP_EXTENSION_DIR}/.."
+    else
+        PROJECT_ROOT="${PHP_EXTENSION_DIR}"
+    fi
+    export PROJECT_ROOT
+    export PHP_EXTENSION_DIR
+fi
 
 # Configuration
-API_URL="${API_URL:-http://localhost:8081}"
+# API_URL is set by common.sh if sourced, otherwise use environment-aware default
+if [[ -z "${API_URL:-}" ]]; then
+    if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+        API_URL="http://agent:8080"
+    else
+        API_URL="http://localhost:8081"
+    fi
+fi
 MOCK_SERVER_PORT="${MOCK_SERVER_PORT:-8888}"
 MOCK_SERVER_URL="http://localhost:${MOCK_SERVER_PORT}"
 CI_MODE="${CI_MODE:-0}"
@@ -50,13 +70,18 @@ else
     exit 1
 fi
 
+# Set docker-compose file path
+DOCKER_COMPOSE_FILE="${PROJECT_ROOT}/docker-compose.test.yml"
+
 # Cleanup function
 cleanup() {
     local exit_code=$?
-    cd "${PHP_EXTENSION_DIR}" || true
+    cd "${PROJECT_ROOT}" || true
     
-    # Stop test containers
-    ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml down > /dev/null 2>&1 || true
+    # Stop test containers (only if not in CI container)
+    if [[ -z "${DOCKER_CONTAINER:-}" ]]; then
+        ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" down > /dev/null 2>&1 || true
+    fi
     
     return $exit_code
 }
@@ -109,11 +134,24 @@ test_result() {
 
 # Start mock HTTP server
 start_mock_server() {
-    cd "${PHP_EXTENSION_DIR}" || return 1
+    # Skip if already in container with services running
+    if [[ -n "${DOCKER_CONTAINER:-}" ]]; then
+        log_info "Running in container, checking if mock server is accessible..."
+        if curl -sf "http://mock-http-server:8888/status/200" > /dev/null 2>&1; then
+            log_info "Mock server is accessible"
+            MOCK_SERVER_URL="http://mock-http-server:8888"
+            return 0
+        else
+            log_warn "Mock server not accessible in container, may need to be started separately"
+            return 1
+        fi
+    fi
+    
+    cd "${PROJECT_ROOT}" || return 1
     
     log_info "Starting mock HTTP server..."
     
-    ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml up -d mock-http-server 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
+    ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" up -d mock-http-server 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
     
     local max_attempts=20
     local attempt=0
@@ -133,20 +171,26 @@ start_mock_server() {
 
 # Start MySQL test database
 start_mysql() {
-    cd "${PHP_EXTENSION_DIR}" || return 1
+    # Skip if already in container with services running
+    if [[ -n "${DOCKER_CONTAINER:-}" ]]; then
+        log_info "Running in container, MySQL should already be running"
+        return 0
+    fi
+    
+    cd "${PROJECT_ROOT}" || return 1
     
     log_info "Starting MySQL test database..."
     
-    ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml up -d mysql-test 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
+    ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" up -d mysql-test 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
     
     local max_attempts=30
     local attempt=0
     while [[ $attempt -lt $max_attempts ]]; do
-        if ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml exec -T mysql-test mysqladmin ping -h localhost -u root -p"${MYSQL_ROOT_PASSWORD:-root_password}" --silent 2>/dev/null; then
+        if ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" exec -T mysql-test mysqladmin ping -h localhost -u root -p"${MYSQL_ROOT_PASSWORD:-root_password}" --silent 2>/dev/null; then
             log_info "MySQL is ready"
             
             # Create database and user if they don't exist
-            ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml exec -T mysql-test mysql -u root -p"${MYSQL_ROOT_PASSWORD:-root_password}" <<EOF 2>/dev/null || true
+            ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" exec -T mysql-test mysql -u root -p"${MYSQL_ROOT_PASSWORD:-root_password}" <<EOF 2>/dev/null || true
 CREATE DATABASE IF NOT EXISTS ${MYSQL_DATABASE:-test_db};
 CREATE USER IF NOT EXISTS '${MYSQL_USER:-test_user}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD:-test_password}';
 GRANT ALL PRIVILEGES ON ${MYSQL_DATABASE:-test_db}.* TO '${MYSQL_USER:-test_user}'@'%';
@@ -166,16 +210,28 @@ EOF
 
 # Start Redis test server
 start_redis() {
-    cd "${PHP_EXTENSION_DIR}" || return 1
+    # Skip if already in container with services running
+    if [[ -n "${DOCKER_CONTAINER:-}" ]]; then
+        log_info "Running in container, checking if Redis is accessible..."
+        if timeout 2 bash -c "echo > /dev/tcp/redis-symfony-test/6379" 2>/dev/null || redis-cli -h redis-symfony-test ping 2>/dev/null | grep -q "PONG"; then
+            log_info "Redis is accessible"
+            return 0
+        else
+            log_warn "Redis not accessible in container, may need to be started separately"
+            return 1
+        fi
+    fi
+    
+    cd "${PROJECT_ROOT}" || return 1
     
     log_info "Starting Redis test server..."
     
-    ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml up -d redis-test 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
+    ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" up -d redis-test 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
     
     local max_attempts=20
     local attempt=0
     while [[ $attempt -lt $max_attempts ]]; do
-        if ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml exec -T redis-test redis-cli ping 2>/dev/null | grep -q "PONG"; then
+        if ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" exec -T redis-test redis-cli ping 2>/dev/null | grep -q "PONG"; then
             log_info "Redis is ready"
             return 0
         fi
@@ -206,7 +262,7 @@ run_php_test() {
     
     cd "${PHP_EXTENSION_DIR}" || return 1
     
-    MOCK_SERVER_URL="$MOCK_SERVER_URL" ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml run --rm \
+    MOCK_SERVER_URL="$MOCK_SERVER_URL" ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" run --rm \
         -e MOCK_SERVER_URL="$MOCK_SERVER_URL" \
         -e MYSQL_HOST="${MYSQL_HOST:-mysql-test}" \
         -e MYSQL_PORT="${MYSQL_PORT:-3306}" \
@@ -222,7 +278,7 @@ run_php_test() {
             -d opa.collect_internal_functions=1 \
             -d opa.debug_log=0 \
             -d opa.service=service-map-e2e-test \
-            /var/www/html/tests/e2e/service_map_e2e/service_map_e2e.php 2>&1 | grep -v "^Container" || true
+            "${TESTS_DIR:-/app/tests}/e2e/service_map_e2e/service_map_e2e.php" 2>&1 | grep -v "^Container" || true
     
     local php_exit_code=$?
     

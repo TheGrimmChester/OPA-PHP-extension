@@ -31,7 +31,14 @@ else
 fi
 
 # Configuration
-API_URL="${API_URL:-http://localhost:8081}"
+# API_URL is set by common.sh if sourced, otherwise use environment-aware default
+if [[ -z "${API_URL:-}" ]]; then
+    if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+        API_URL="http://agent:8080"
+    else
+        API_URL="http://localhost:8081"
+    fi
+fi
 DASHBOARD_URL="${DASHBOARD_URL:-http://localhost:3000}"
 MYSQL_HOST="${MYSQL_HOST:-mysql}"
 MYSQL_PORT="${MYSQL_PORT:-3306}"
@@ -209,7 +216,7 @@ EOF
         -e MYSQL_DATABASE="$MYSQL_DATABASE" \
         -e MYSQL_USER="$MYSQL_USER" \
         -e MYSQL_PASSWORD="$MYSQL_PASSWORD" \
-        php php /var/www/html/tests/e2e/sql_e2e/sql_e2e.php 2>&1 | grep -v "^Container" || true
+        php php "${TESTS_DIR:-/app/tests}/e2e/sql_e2e/sql_e2e.php" 2>&1 | grep -v "^Container" || true
     
     rm -f "$test_script"
     

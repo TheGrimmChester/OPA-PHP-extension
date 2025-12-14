@@ -30,7 +30,14 @@ else
 fi
 
 # Configuration
-API_URL="${API_URL:-http://localhost:8081}"
+# API_URL is set by common.sh if sourced, otherwise use environment-aware default
+if [[ -z "${API_URL:-}" ]]; then
+    if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+        API_URL="http://agent:8080"
+    else
+        API_URL="http://localhost:8081"
+    fi
+fi
 MOCK_SERVER_PORT="${MOCK_SERVER_PORT:-8888}"
 MOCK_SERVER_URL="http://localhost:${MOCK_SERVER_PORT}"
 CI_MODE="${CI_MODE:-0}"
@@ -54,13 +61,18 @@ TESTS_PASSED=0
 TESTS_FAILED=0
 MOCK_SERVER_PID=""
 
+# Set docker-compose file path
+DOCKER_COMPOSE_FILE="${PROJECT_ROOT}/docker-compose.test.yml"
+
 # Cleanup function
 cleanup() {
     local exit_code=$?
-    cd "${PHP_EXTENSION_DIR}" || true
+    cd "${PROJECT_ROOT}" || true
     
-    # Stop mock server container
-    docker-compose -f docker/compose/docker/compose/docker-compose.test.yml down > /dev/null 2>&1 || true
+    # Stop mock server container (only if not in CI container)
+    if [[ -z "${DOCKER_CONTAINER:-}" ]]; then
+        docker-compose -f "${DOCKER_COMPOSE_FILE}" down > /dev/null 2>&1 || true
+    fi
     
     return $exit_code
 }
@@ -113,12 +125,25 @@ test_result() {
 
 # Start mock HTTP server
 start_mock_server() {
-    cd "${PHP_EXTENSION_DIR}" || return 1
+    # Skip if already in container with services running
+    if [[ -n "${DOCKER_CONTAINER:-}" ]]; then
+        log_info "Running in container, checking if mock server is accessible..."
+        if curl -sf "http://mock-http-server:8888/status/200" > /dev/null 2>&1; then
+            log_info "Mock server is accessible"
+            MOCK_SERVER_URL="http://mock-http-server:8888"
+            return 0
+        else
+            log_warn "Mock server not accessible in container, may need to be started separately"
+            return 1
+        fi
+    fi
+    
+    cd "${PROJECT_ROOT}" || return 1
     
     log_info "Starting mock HTTP server as Docker service..."
     
     # Start mock server using docker-compose
-    docker-compose -f docker/compose/docker/compose/docker-compose.test.yml up -d mock-http-server 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
+    docker-compose -f "${DOCKER_COMPOSE_FILE}" up -d mock-http-server 2>&1 | grep -v "Creating\|Created\|Starting\|Started" || true
     
     # Wait for server to be ready (check from host)
     local max_attempts=20
@@ -135,7 +160,7 @@ start_mock_server() {
     
     log_error "Mock server failed to start"
     if [[ "$VERBOSE" -eq 1 ]]; then
-        docker-compose -f docker/compose/docker/compose/docker-compose.test.yml logs mock-http-server 2>&1 | tail -20
+        docker-compose -f "${DOCKER_COMPOSE_FILE}" logs mock-http-server 2>&1 | tail -20
     fi
     return 1
 }
@@ -267,7 +292,7 @@ EOF
     
     log_info "Using mock server URL for container: $MOCK_SERVER_URL"
     
-    MOCK_SERVER_URL="$MOCK_SERVER_URL" docker-compose -f docker/compose/docker/compose/docker-compose.yaml run --rm \
+    MOCK_SERVER_URL="$MOCK_SERVER_URL" docker-compose -f "${DOCKER_COMPOSE_FILE}" run --rm \
         -e OPA_ENABLED=1 \
         -e OPA_SOCKET_PATH=opa-agent:9090 \
         -e OPA_SAMPLING_RATE=1.0 \
@@ -276,7 +301,7 @@ EOF
         -e OPA_CURL_CAPTURE_BODY=1 \
         -e OPA_SERVICE=curl-ci-test \
         -e MOCK_SERVER_URL="$MOCK_SERVER_URL" \
-        php php /var/www/html/tests/e2e/curl/test_curl_ci_e2e.php 2>&1 | grep -v "^Container" || true
+        php php "${TESTS_DIR:-/app/tests}/e2e/curl/test_curl_ci_e2e.php" 2>&1 | grep -v "^Container" || true
     
     local php_exit_code=$?
     rm -f "$test_script"

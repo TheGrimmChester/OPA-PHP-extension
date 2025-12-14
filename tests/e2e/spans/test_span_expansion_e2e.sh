@@ -14,8 +14,21 @@ set -euo pipefail
 #   CI_MODE: Set to '1' for CI mode (structured output)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"" && pwd)}"
-PHP_EXTENSION_DIR="${PROJECT_ROOT}"
+
+# Source common helpers for path detection
+if [[ -f "${SCRIPT_DIR}/helpers/common.sh" ]]; then
+    source "${SCRIPT_DIR}/helpers/common.sh"
+else
+    # Fallback if common.sh not available
+    PHP_EXTENSION_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+    if [[ -d "${PHP_EXTENSION_DIR}/../agent" ]] && [[ -d "${PHP_EXTENSION_DIR}/../clickhouse" ]]; then
+        PROJECT_ROOT="${PHP_EXTENSION_DIR}/.."
+    else
+        PROJECT_ROOT="${PHP_EXTENSION_DIR}"
+    fi
+    export PROJECT_ROOT
+    export PHP_EXTENSION_DIR
+fi
 
 # Configuration
 # Default to opa-agent:8080 (internal Docker network) or localhost:8081 (host)
@@ -56,13 +69,18 @@ else
     exit 1
 fi
 
+# Set docker-compose file path
+DOCKER_COMPOSE_FILE="${PROJECT_ROOT}/docker-compose.test.yml"
+
 # Cleanup function
 cleanup() {
     local exit_code=$?
-    cd "${PHP_EXTENSION_DIR}" || true
+    cd "${PROJECT_ROOT}" || true
     
-    # Stop test containers
-    ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml down > /dev/null 2>&1 || true
+    # Stop test containers (only if not in CI container)
+    if [[ -z "${DOCKER_CONTAINER:-}" ]]; then
+        ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" down > /dev/null 2>&1 || true
+    fi
     
     return $exit_code
 }
@@ -115,12 +133,18 @@ test_result() {
 
 # Start MySQL test database
 start_mysql() {
-    cd "${PHP_EXTENSION_DIR}" || return 1
+    # Skip if already in container with services running
+    if [[ -n "${DOCKER_CONTAINER:-}" ]]; then
+        log_info "Running in container, MySQL should already be running"
+        return 0
+    fi
+    
+    cd "${PROJECT_ROOT}" || return 1
     
     log_info "Starting MySQL test database..."
     
     local compose_output
-    compose_output=$(${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml up -d mysql-test 2>&1) || true
+    compose_output=$(${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" up -d mysql-test 2>&1) || true
     if [[ "$VERBOSE" -eq 1 ]]; then
         echo "$compose_output" | grep -v "Creating\|Created\|Starting\|Started" || true
     fi
@@ -129,12 +153,12 @@ start_mysql() {
     local max_attempts=30
     local attempt=0
     while [[ $attempt -lt $max_attempts ]]; do
-        if ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml exec -T mysql-test mysqladmin ping -h localhost -u root -p"${MYSQL_ROOT_PASSWORD}" --silent 2>/dev/null; then
+        if ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" exec -T mysql-test mysqladmin ping -h localhost -u root -p"${MYSQL_ROOT_PASSWORD}" --silent 2>/dev/null; then
             log_info "MySQL is ready"
             sleep 2
             
             # Create database and user
-            ${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml exec -T mysql-test mysql -u root -p"${MYSQL_ROOT_PASSWORD}" <<EOF 2>/dev/null || true
+            ${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" exec -T mysql-test mysql -u root -p"${MYSQL_ROOT_PASSWORD}" <<EOF 2>/dev/null || true
 CREATE DATABASE IF NOT EXISTS ${MYSQL_DATABASE};
 CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
 GRANT ALL PRIVILEGES ON ${MYSQL_DATABASE}.* TO '${MYSQL_USER}'@'%';
@@ -205,7 +229,7 @@ run_php_test() {
     log_info "Running PHP test with OPA_SOCKET_PATH=${agent_host_port}"
     
     local test_output
-    test_output=$(${DOCKER_COMPOSE} -f docker/compose/docker-compose.test.yml run --rm \
+    test_output=$(${DOCKER_COMPOSE} -f "${DOCKER_COMPOSE_FILE}" run --rm \
         --entrypoint /usr/local/bin/docker-entrypoint-custom.sh \
         -e API_URL="${API_URL}" \
         -e MYSQL_HOST="${MYSQL_HOST}" \
@@ -222,7 +246,7 @@ run_php_test() {
         -e OPA_COLLECT_INTERNAL_FUNCTIONS=1 \
         -e OPA_DEBUG_LOG=1 \
         -e OPA_EXPAND_SPANS=1 \
-        php php /var/www/html/tests/e2e/span_expansion_simple/span_expansion_simple.php 2>&1) || {
+        php php "${TESTS_DIR:-/app/tests}/e2e/span_expansion_simple/span_expansion_simple.php" 2>&1) || {
         log_error "PHP test execution failed"
         echo "$test_output"
         return 1
