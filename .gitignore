@@ -90,6 +90,9 @@ htmlcov/
 .coverage
 .coverage.*
 
+# Tests
+tests/
+
 # Python
 __pycache__/
 *.py[cod]
