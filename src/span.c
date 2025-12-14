@@ -190,6 +190,144 @@ static int aggregate_sql_queries_from_calls(json_buffer_t *buf) {
     return query_count;
 }
 
+// Aggregate cache operations from all call nodes
+static int aggregate_cache_operations_from_calls(json_buffer_t *buf) {
+    int op_count = 0;
+    
+    if (!global_collector || global_collector->magic != OPA_COLLECTOR_MAGIC) {
+        json_buffer_append_str(buf, "[]");
+        return 0;
+    }
+    
+    json_buffer_append_str(buf, "[");
+    int first = 1;
+    
+    // Add cache operations from call nodes
+    call_node_t *call = global_collector->calls;
+    while (call) {
+        if (call->magic == OPA_CALL_NODE_MAGIC && 
+            call->cache_operations && 
+            Z_TYPE_P(call->cache_operations) == IS_ARRAY &&
+            zend_hash_num_elements(Z_ARRVAL_P(call->cache_operations)) > 0) {
+            
+            HashTable *ht = Z_ARRVAL_P(call->cache_operations);
+            zval *val;
+            ZEND_HASH_FOREACH_VAL(ht, val) {
+                if (!first) {
+                    json_buffer_append_str(buf, ",");
+                }
+                // Serialize cache operation zval to JSON
+                smart_string temp_buf = {0};
+                serialize_zval_json(&temp_buf, val);
+                smart_string_0(&temp_buf);
+                if (temp_buf.c && temp_buf.len > 0) {
+                    json_buffer_append(buf, temp_buf.c, temp_buf.len);
+                    op_count++;
+                }
+                smart_string_free(&temp_buf);
+                first = 0;
+            } ZEND_HASH_FOREACH_END();
+        }
+        call = call->next;
+    }
+    
+    json_buffer_append_str(buf, "]");
+    debug_log("[aggregate_cache_operations_from_calls] Total cache operations aggregated: %d", op_count);
+    return op_count;
+}
+
+// Aggregate HTTP requests from all call nodes
+static int aggregate_http_requests_from_calls(json_buffer_t *buf) {
+    int req_count = 0;
+    
+    if (!global_collector || global_collector->magic != OPA_COLLECTOR_MAGIC) {
+        json_buffer_append_str(buf, "[]");
+        return 0;
+    }
+    
+    json_buffer_append_str(buf, "[");
+    int first = 1;
+    
+    // Add HTTP requests from call nodes
+    call_node_t *call = global_collector->calls;
+    while (call) {
+        if (call->magic == OPA_CALL_NODE_MAGIC && 
+            call->http_requests && 
+            Z_TYPE_P(call->http_requests) == IS_ARRAY &&
+            zend_hash_num_elements(Z_ARRVAL_P(call->http_requests)) > 0) {
+            
+            HashTable *ht = Z_ARRVAL_P(call->http_requests);
+            zval *val;
+            ZEND_HASH_FOREACH_VAL(ht, val) {
+                if (!first) {
+                    json_buffer_append_str(buf, ",");
+                }
+                // Serialize HTTP request zval to JSON
+                smart_string temp_buf = {0};
+                serialize_zval_json(&temp_buf, val);
+                smart_string_0(&temp_buf);
+                if (temp_buf.c && temp_buf.len > 0) {
+                    json_buffer_append(buf, temp_buf.c, temp_buf.len);
+                    req_count++;
+                }
+                smart_string_free(&temp_buf);
+                first = 0;
+            } ZEND_HASH_FOREACH_END();
+        }
+        call = call->next;
+    }
+    
+    json_buffer_append_str(buf, "]");
+    debug_log("[aggregate_http_requests_from_calls] Total HTTP requests aggregated: %d", req_count);
+    return req_count;
+}
+
+// Aggregate Redis operations from all call nodes
+static int aggregate_redis_operations_from_calls(json_buffer_t *buf) {
+    int op_count = 0;
+    
+    if (!global_collector || global_collector->magic != OPA_COLLECTOR_MAGIC) {
+        json_buffer_append_str(buf, "[]");
+        return 0;
+    }
+    
+    json_buffer_append_str(buf, "[");
+    int first = 1;
+    
+    // Add Redis operations from call nodes
+    call_node_t *call = global_collector->calls;
+    while (call) {
+        if (call->magic == OPA_CALL_NODE_MAGIC && 
+            call->redis_operations && 
+            Z_TYPE_P(call->redis_operations) == IS_ARRAY &&
+            zend_hash_num_elements(Z_ARRVAL_P(call->redis_operations)) > 0) {
+            
+            HashTable *ht = Z_ARRVAL_P(call->redis_operations);
+            zval *val;
+            ZEND_HASH_FOREACH_VAL(ht, val) {
+                if (!first) {
+                    json_buffer_append_str(buf, ",");
+                }
+                // Serialize Redis operation zval to JSON
+                smart_string temp_buf = {0};
+                serialize_zval_json(&temp_buf, val);
+                smart_string_0(&temp_buf);
+                if (temp_buf.c && temp_buf.len > 0) {
+                    json_buffer_append(buf, temp_buf.c, temp_buf.len);
+                    op_count++;
+                }
+                smart_string_free(&temp_buf);
+                first = 0;
+            } ZEND_HASH_FOREACH_END();
+        }
+        call = call->next;
+    }
+    
+    json_buffer_append_str(buf, "]");
+    debug_log("[aggregate_redis_operations_from_calls] Total Redis operations aggregated: %d", op_count);
+    return op_count;
+}
+
 // External reference to global collector ()
 extern opa_collector_t *global_collector;
 
@@ -835,6 +973,21 @@ char* produce_span_json_from_values(
     json_buffer_append_str(&buf, ",\"sql\":");
     int sql_count = aggregate_sql_queries_from_calls(&buf);
     debug_log("[produce_span_json_from_values] Aggregated %d SQL queries from call stack", sql_count);
+    
+    // Aggregate HTTP requests from call stack
+    json_buffer_append_str(&buf, ",\"http\":");
+    int http_count = aggregate_http_requests_from_calls(&buf);
+    debug_log("[produce_span_json_from_values] Aggregated %d HTTP requests from call stack", http_count);
+    
+    // Aggregate cache operations from call stack
+    json_buffer_append_str(&buf, ",\"cache\":");
+    int cache_count = aggregate_cache_operations_from_calls(&buf);
+    debug_log("[produce_span_json_from_values] Aggregated %d cache operations from call stack", cache_count);
+    
+    // Aggregate Redis operations from call stack
+    json_buffer_append_str(&buf, ",\"redis\":");
+    int redis_count = aggregate_redis_operations_from_calls(&buf);
+    debug_log("[produce_span_json_from_values] Aggregated %d Redis operations from call stack", redis_count);
     
     // Serialize dumps if present
     json_buffer_append_str(&buf, ",\"dumps\":");

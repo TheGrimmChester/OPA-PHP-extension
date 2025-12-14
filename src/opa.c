@@ -1819,8 +1819,18 @@ int is_redis_method(zend_execute_data *execute_data) {
                     strcmp(method_name, "exists") == 0 ||
                     strcmp(method_name, "hget") == 0 ||
                     strcmp(method_name, "hset") == 0 ||
+                    strcmp(method_name, "hgetall") == 0 ||
                     strcmp(method_name, "lpush") == 0 ||
                     strcmp(method_name, "rpop") == 0 ||
+                    strcmp(method_name, "llen") == 0 ||
+                    strcmp(method_name, "sadd") == 0 ||
+                    strcmp(method_name, "smembers") == 0 ||
+                    strcmp(method_name, "scard") == 0 ||
+                    strcmp(method_name, "incr") == 0 ||
+                    strcmp(method_name, "decr") == 0 ||
+                    strcmp(method_name, "expire") == 0 ||
+                    strcmp(method_name, "ttl") == 0 ||
+                    strcmp(method_name, "keys") == 0 ||
                     strcmp(method_name, "mget") == 0 ||
                     strcmp(method_name, "mset") == 0) {
                     return 1;
@@ -3339,6 +3349,9 @@ typedef struct _opa_observer_data {
     const char *apcu_operation;        // APCu operation name
     double apcu_start_time;            // APCu start time
     int is_redis_method;               // Flag for Redis methods
+    char *redis_key;                  // Redis key being operated on
+    const char *redis_command;         // Redis command/method name
+    double redis_start_time;           // Redis operation start time
     int is_symfony_cache_method;       // Flag for Symfony Cache methods
 } opa_observer_data_t;
 
@@ -3488,6 +3501,42 @@ static void opa_observer_fcall_begin(zend_execute_data *execute_data) {
     // Detect Redis methods
     if (is_redis_method(execute_data)) {
         data->is_redis_method = 1;
+        data->redis_start_time = get_time_seconds();
+        data->redis_command = function_name; // Store method name as command
+        
+        // Extract Redis key from arguments based on method type
+        if (function_name) {
+            int num_args = ZEND_CALL_NUM_ARGS(execute_data);
+            
+            // For hash methods (hget, hset, hgetall), second arg is the key (first is hash name)
+            if (strcmp(function_name, "hget") == 0 || 
+                strcmp(function_name, "hset") == 0 ||
+                strcmp(function_name, "hgetall") == 0) {
+                if (num_args >= 2) {
+                    zval *key_arg = ZEND_CALL_ARG(execute_data, 2);
+                    if (key_arg && Z_TYPE_P(key_arg) == IS_STRING) {
+                        data->redis_key = estrdup(Z_STRVAL_P(key_arg));
+                    }
+                }
+            }
+            // For all other methods, first arg is typically the key
+            else if (num_args >= 1) {
+                zval *key_arg = ZEND_CALL_ARG(execute_data, 1);
+                if (key_arg && Z_TYPE_P(key_arg) == IS_STRING) {
+                    data->redis_key = estrdup(Z_STRVAL_P(key_arg));
+                } else if (key_arg && Z_TYPE_P(key_arg) == IS_LONG) {
+                    // Some methods might pass integer keys, convert to string
+                    char key_buf[32];
+                    snprintf(key_buf, sizeof(key_buf), "%ld", Z_LVAL_P(key_arg));
+                    data->redis_key = estrdup(key_buf);
+                }
+            }
+            
+            // For methods with no key argument (like keys with pattern), use method name
+            if (!data->redis_key && function_name) {
+                data->redis_key = estrdup(function_name);
+            }
+        }
     }
     
     // Detect Symfony Cache methods
@@ -3822,10 +3871,102 @@ static void opa_observer_fcall_end(zend_execute_data *execute_data, zval *return
         record_cache_operation(data->apcu_key, data->apcu_operation, hit, apcu_duration, data_size, "apcu");
     }
     
+    // Handle Redis operations
+    if (data->is_redis_method) {
+        double redis_end_time = get_time_seconds();
+        double redis_duration = redis_end_time - data->redis_start_time;
+        int hit = 0;
+        const char *error = NULL;
+        
+        // Determine hit/miss and extract error based on return value and command
+        if (data->redis_command) {
+            // For get operations: hit = 1 if return value is not FALSE
+            if (strcmp(data->redis_command, "get") == 0 || strcmp(data->redis_command, "hget") == 0) {
+                if (return_value && Z_TYPE_P(return_value) != IS_FALSE) {
+                    hit = 1;
+                } else {
+                    error = "Key not found";
+                }
+            }
+            // For exists: hit = 1 if return value > 0
+            else if (strcmp(data->redis_command, "exists") == 0) {
+                if (return_value && Z_TYPE_P(return_value) == IS_LONG && Z_LVAL_P(return_value) > 0) {
+                    hit = 1;
+                }
+            }
+            // For del: hit = 1 if return value > 0
+            else if (strcmp(data->redis_command, "del") == 0 || strcmp(data->redis_command, "delete") == 0) {
+                if (return_value && Z_TYPE_P(return_value) == IS_LONG && Z_LVAL_P(return_value) > 0) {
+                    hit = 1;
+                } else {
+                    error = "Key not found or deletion failed";
+                }
+            }
+            // For set, hset, lpush, sadd, incr, decr, expire: hit = 1 (always successful if no exception)
+            else if (strcmp(data->redis_command, "set") == 0 ||
+                     strcmp(data->redis_command, "hset") == 0 ||
+                     strcmp(data->redis_command, "lpush") == 0 ||
+                     strcmp(data->redis_command, "sadd") == 0 ||
+                     strcmp(data->redis_command, "incr") == 0 ||
+                     strcmp(data->redis_command, "decr") == 0 ||
+                     strcmp(data->redis_command, "expire") == 0) {
+                if (return_value && Z_TYPE_P(return_value) != IS_FALSE) {
+                    hit = 1;
+                } else {
+                    error = "Operation failed";
+                }
+            }
+            // For operations returning arrays (hgetall, smembers): hit = 1 if array is not empty
+            else if (strcmp(data->redis_command, "hgetall") == 0 ||
+                     strcmp(data->redis_command, "smembers") == 0) {
+                if (return_value && Z_TYPE_P(return_value) == IS_ARRAY) {
+                    HashTable *ht = Z_ARRVAL_P(return_value);
+                    if (ht && zend_hash_num_elements(ht) > 0) {
+                        hit = 1;
+                    }
+                }
+            }
+            // For operations returning integers (llen, scard, ttl): hit = 1 if return value >= 0
+            else if (strcmp(data->redis_command, "llen") == 0 ||
+                     strcmp(data->redis_command, "scard") == 0 ||
+                     strcmp(data->redis_command, "ttl") == 0) {
+                if (return_value && Z_TYPE_P(return_value) == IS_LONG) {
+                    hit = 1; // Always record as hit for these operations
+                }
+            }
+            // For rpop: hit = 1 if return value is not FALSE
+            else if (strcmp(data->redis_command, "rpop") == 0) {
+                if (return_value && Z_TYPE_P(return_value) != IS_FALSE) {
+                    hit = 1;
+                } else {
+                    error = "List empty or operation failed";
+                }
+            }
+            // For keys: hit = 1 if return value is an array
+            else if (strcmp(data->redis_command, "keys") == 0) {
+                if (return_value && Z_TYPE_P(return_value) == IS_ARRAY) {
+                    hit = 1;
+                }
+            }
+            // Default: check if return value indicates success
+            else {
+                if (return_value && Z_TYPE_P(return_value) != IS_FALSE) {
+                    hit = 1;
+                } else {
+                    error = "Operation failed";
+                }
+            }
+        }
+        
+        // Record Redis operation
+        record_redis_operation(data->redis_command, data->redis_key, hit, redis_duration, error);
+    }
+    
     // Clean up observer data
     if (data->call_id) efree(data->call_id);
     if (data->sql) efree(data->sql);
     if (data->apcu_key) efree(data->apcu_key);
+    if (data->redis_key) efree(data->redis_key);
     
     // Remove from hash table and free
     // CRITICAL: Add same extensive validation as in the find operation
