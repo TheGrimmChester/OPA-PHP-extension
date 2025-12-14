@@ -3352,6 +3352,8 @@ typedef struct _opa_observer_data {
     char *redis_key;                  // Redis key being operated on
     const char *redis_command;         // Redis command/method name
     double redis_start_time;           // Redis operation start time
+    char *redis_host;                  // Redis connection host
+    char *redis_port;                  // Redis connection port
     int is_symfony_cache_method;       // Flag for Symfony Cache methods
 } opa_observer_data_t;
 
@@ -3536,6 +3538,37 @@ static void opa_observer_fcall_begin(zend_execute_data *execute_data) {
             if (!data->redis_key && function_name) {
                 data->redis_key = estrdup(function_name);
             }
+        }
+        
+        // Extract Redis connection host and port from the Redis object
+        // Use execute_data->This for observer callbacks (not getThis())
+        if (execute_data && Z_TYPE(execute_data->This) == IS_OBJECT) {
+            zval host_zv, port_zv;
+            zval method_host, method_port;
+            zval this_obj;
+            ZVAL_OBJ(&this_obj, Z_OBJ(execute_data->This));
+            
+            // Call getHost() method
+            ZVAL_STRING(&method_host, "getHost");
+            if (call_user_function(EG(function_table), &this_obj, &method_host, &host_zv, 0, NULL) == SUCCESS) {
+                if (Z_TYPE(host_zv) == IS_STRING && Z_STRLEN(host_zv) > 0) {
+                    data->redis_host = estrdup(Z_STRVAL(host_zv));
+                }
+                zval_ptr_dtor(&host_zv);
+            }
+            zval_ptr_dtor(&method_host);
+            
+            // Call getPort() method
+            ZVAL_STRING(&method_port, "getPort");
+            if (call_user_function(EG(function_table), &this_obj, &method_port, &port_zv, 0, NULL) == SUCCESS) {
+                if (Z_TYPE(port_zv) == IS_LONG && Z_LVAL(port_zv) > 0) {
+                    char port_buf[16];
+                    snprintf(port_buf, sizeof(port_buf), "%ld", Z_LVAL(port_zv));
+                    data->redis_port = estrdup(port_buf);
+                }
+                zval_ptr_dtor(&port_zv);
+            }
+            zval_ptr_dtor(&method_port);
         }
     }
     
@@ -3959,7 +3992,7 @@ static void opa_observer_fcall_end(zend_execute_data *execute_data, zval *return
         }
         
         // Record Redis operation
-        record_redis_operation(data->redis_command, data->redis_key, hit, redis_duration, error);
+        record_redis_operation(data->redis_command, data->redis_key, hit, redis_duration, error, data->redis_host, data->redis_port);
     }
     
     // Clean up observer data
@@ -3967,6 +4000,8 @@ static void opa_observer_fcall_end(zend_execute_data *execute_data, zval *return
     if (data->sql) efree(data->sql);
     if (data->apcu_key) efree(data->apcu_key);
     if (data->redis_key) efree(data->redis_key);
+    if (data->redis_host) efree(data->redis_host);
+    if (data->redis_port) efree(data->redis_port);
     
     // Remove from hash table and free
     // CRITICAL: Add same extensive validation as in the find operation

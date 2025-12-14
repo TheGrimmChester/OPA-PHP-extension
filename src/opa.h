@@ -193,7 +193,7 @@ int is_symfony_cache_method(zend_execute_data *execute_data);
 int is_redis_method(zend_execute_data *execute_data);
 void record_http_request(const char *url, const char *method, int status_code, size_t bytes_sent, size_t bytes_received, double duration, const char *error);
 void record_cache_operation(const char *key, const char *operation, int hit, double duration, size_t data_size, const char *cache_type);
-void record_redis_operation(const char *command, const char *key, int hit, double duration, const char *error);
+void record_redis_operation(const char *command, const char *key, int hit, double duration, const char *error, const char *host, const char *port);
 
 // Error tracking functions
 void opa_init_error_tracking(void);
