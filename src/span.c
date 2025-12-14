@@ -426,6 +426,107 @@ static void serialize_call_node_json_malloc(json_buffer_t *buf, call_node_t *cal
     json_buffer_append_str(buf, "}");
 }
 
+// Tag management functions
+
+// Create a new tag node with malloc'd strings
+span_tag_t* create_span_tag(const char *key, const char *value) {
+    if (!key || !value) {
+        return NULL;
+    }
+    
+    span_tag_t *tag = malloc(sizeof(span_tag_t));
+    if (!tag) {
+        return NULL;
+    }
+    
+    tag->key = strdup(key);
+    tag->value = strdup(value);
+    tag->next = NULL;
+    
+    if (!tag->key || !tag->value) {
+        // Allocation failed, clean up
+        if (tag->key) free(tag->key);
+        if (tag->value) free(tag->value);
+        free(tag);
+        return NULL;
+    }
+    
+    return tag;
+}
+
+// Free entire tag list
+void free_span_tags(span_tag_t *tags) {
+    span_tag_t *current = tags;
+    while (current) {
+        span_tag_t *next = current->next;
+        if (current->key) free(current->key);
+        if (current->value) free(current->value);
+        free(current);
+        current = next;
+    }
+}
+
+// Add or update a tag in the span's tag list
+void span_add_tag(span_context_t *span, const char *key, const char *value) {
+    if (!span || !key || !value) {
+        return;
+    }
+    
+    // Check if tag with this key already exists
+    span_tag_t *current = span->tags;
+    while (current) {
+        if (current->key && strcmp(current->key, key) == 0) {
+            // Update existing tag value
+            if (current->value) {
+                free(current->value);
+            }
+            current->value = strdup(value);
+            return;
+        }
+        current = current->next;
+    }
+    
+    // Create new tag and add to front of list
+    span_tag_t *new_tag = create_span_tag(key, value);
+    if (new_tag) {
+        new_tag->next = span->tags;
+        span->tags = new_tag;
+    }
+}
+
+// Serialize tags to JSON string (malloc'd, caller must free)
+char* serialize_tags_json(span_tag_t *tags) {
+    if (!tags) {
+        return NULL;
+    }
+    
+    json_buffer_t buf;
+    json_buffer_init(&buf);
+    
+    json_buffer_append_str(&buf, "{");
+    int first = 1;
+    
+    span_tag_t *current = tags;
+    while (current) {
+        if (current->key && current->value) {
+            if (!first) {
+                json_buffer_append_str(&buf, ",");
+            }
+            json_buffer_append_str(&buf, "\"");
+            json_escape_string_malloc(&buf, current->key, strlen(current->key));
+            json_buffer_append_str(&buf, "\":\"");
+            json_escape_string_malloc(&buf, current->value, strlen(current->value));
+            json_buffer_append_str(&buf, "\"");
+            first = 0;
+        }
+        current = current->next;
+    }
+    
+    json_buffer_append_str(&buf, "}");
+    
+    return buf.data; // Caller must free this
+}
+
 // Create span context
 span_context_t* create_span_context(const char *span_id, const char *trace_id, const char *name) {
     // Use malloc instead of emalloc to prevent PHP from automatically freeing
@@ -457,17 +558,16 @@ void free_span_context(span_context_t *span) {
     if (span->parent_id) efree(span->parent_id);
     if (span->name) efree(span->name);
     
+    // Free tags (malloc'd linked list, safe to free anytime)
+    if (span->tags) {
+        free_span_tags(span->tags);
+        span->tags = NULL;
+    }
+    
     // Free zvals if allocated - but ONLY if not in shutdown
     // During MSHUTDOWN, the Zend heap is being destroyed and accessing zvals causes corruption
     if (!in_shutdown) {
         // Check type before destroying to avoid corruption
-        if (span->tags) {
-            if (Z_TYPE_P(span->tags) != IS_UNDEF) {
-                zval_ptr_dtor(span->tags);
-            }
-            efree(span->tags);
-            span->tags = NULL;
-        }
         if (span->net) {
             if (Z_TYPE_P(span->net) != IS_UNDEF) {
                 zval_ptr_dtor(span->net);
@@ -499,7 +599,7 @@ void free_span_context(span_context_t *span) {
     } else {
         // During shutdown: just free the zval pointers without accessing them
         // PHP will clean up the zval contents automatically
-        if (span->tags) efree(span->tags);
+        // Tags are already freed above (malloc'd, safe to free anytime)
         if (span->net) efree(span->net);
         if (span->sql) efree(span->sql);
         if (span->stack) efree(span->stack);
@@ -517,7 +617,8 @@ char* produce_span_json_from_values(
     const char *trace_id, const char *span_id, const char *parent_id, const char *name,
     const char *url_scheme, const char *url_host, const char *url_path,
     long start_ts, long end_ts, int cpu_ms, int status, const char *dumps_json,
-    const char *cli_args_json, const char *http_request_json, const char *http_response_json
+    const char *cli_args_json, const char *http_request_json, const char *http_response_json,
+    const char *tags_json
 ) {
     debug_log("[produce_span_json_from_values] Called: trace_id=%s, span_id=%s", 
         trace_id ? trace_id : "NULL", span_id ? span_id : "NULL");
@@ -634,9 +735,33 @@ char* produce_span_json_from_values(
         }
     }
     
-    // Add tags - include organization_id, project_id, CLI args and HTTP request/response if present
+    // Add tags - include organization_id, project_id, CLI args, HTTP request/response, and custom tags
     json_buffer_append_str(&buf, ",\"tags\":{");
     int tag_first = 1;
+    
+    // First, add custom tags from tags_json (if provided)
+    // tags_json should be a JSON object like {"key":"value",...}
+    if (tags_json && strlen(tags_json) > 0) {
+        // Remove outer braces to merge with system tags
+        const char *tags_content = tags_json;
+        size_t tags_len = strlen(tags_content);
+        
+        // Skip opening brace if present
+        if (tags_len > 0 && *tags_content == '{') {
+            tags_content++;
+            tags_len--;
+        }
+        // Skip closing brace if present
+        if (tags_len > 0 && tags_content[tags_len - 1] == '}') {
+            tags_len--;
+        }
+        
+        // Only append if there's actual content (not just "{}")
+        if (tags_len > 0) {
+            json_buffer_append(&buf, tags_content, tags_len);
+            tag_first = 0;
+        }
+    }
     
     // Add organization_id and project_id to tags (agent reads from tags)
     if (OPA_G(organization_id) && strlen(OPA_G(organization_id)) > 0) {
@@ -1128,17 +1253,29 @@ char* produce_span_json(span_context_t *span) {
         }
     }
     
+    // Serialize tags to JSON string (malloc'd, persistent)
+    char *tags_json = NULL;
+    if (span->tags) {
+        tags_json = serialize_tags_json(span->tags);
+    }
+    
     // Call the safe function
     char *result = produce_span_json_from_values(
         trace_id_copy, span_id_copy, parent_id_copy, name_copy,
         url_scheme_copy, url_host_copy, url_path_copy,
         start_ts, end_ts, cpu_ms, status, dumps_json,
-        NULL, NULL, NULL  // cli_args_json, http_request_json, http_response_json
+        NULL, NULL, NULL,  // cli_args_json, http_request_json, http_response_json
+        tags_json  // custom tags
     );
     
     // Free dumps JSON if allocated
     if (dumps_json) {
         free(dumps_json);
+    }
+    
+    // Free tags JSON if allocated
+    if (tags_json) {
+        free(tags_json);
     }
     
     // Free copied strings (they're now in the JSON output)

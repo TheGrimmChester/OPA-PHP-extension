@@ -4990,7 +4990,8 @@ PHP_RSHUTDOWN_FUNCTION(opa) {
             root_span_trace_id, root_span_span_id, root_span_parent_id, root_span_name,
             root_span_url_scheme, root_span_url_host, root_span_url_path,
             root_span_start_ts, end_ts, root_span_cpu_ms, status, dumps_json,
-            root_span_cli_args_json, root_span_http_request_json, root_span_http_response_json
+            root_span_cli_args_json, root_span_http_request_json, root_span_http_response_json,
+            NULL  // tags_json (root span doesn't have custom tags)
         );
         debug_log("[RSHUTDOWN] Span JSON produced, json_str=%p, len=%zu", json_str, json_str ? strlen(json_str) : 0);
         

@@ -29,9 +29,102 @@ PHP_FUNCTION(opa_start_span) {
     span->is_manual = 1;
     span->status = -1;
     
-    if (tags) {
-        span->tags = emalloc(sizeof(zval));
-        ZVAL_COPY(span->tags, tags);
+    // Convert zval array to span_tag_t linked list
+    if (tags && Z_TYPE_P(tags) == IS_ARRAY) {
+        HashTable *ht = Z_ARRVAL_P(tags);
+        zend_string *key;
+        zval *val;
+        
+        ZEND_HASH_FOREACH_STR_KEY_VAL(ht, key, val) {
+            // Convert key to string
+            char *key_str = NULL;
+            char key_buf[64] = {0};
+            if (key) {
+                key_str = ZSTR_VAL(key);
+            } else {
+                // Numeric key - convert to string
+                zend_ulong num_key;
+                zend_hash_get_current_key(ht, NULL, &num_key);
+                snprintf(key_buf, sizeof(key_buf), "%lu", num_key);
+                key_str = key_buf;
+            }
+            
+            if (!key_str) continue;
+            
+            // Convert value to string
+            char *value_str = NULL;
+            size_t value_len = 0;
+            char value_buf[128] = {0};
+            smart_string json_buf = {0};
+            int needs_json_free = 0;
+            
+            if (Z_TYPE_P(val) == IS_STRING) {
+                value_str = Z_STRVAL_P(val);
+                value_len = Z_STRLEN_P(val);
+            } else if (Z_TYPE_P(val) == IS_LONG) {
+                snprintf(value_buf, sizeof(value_buf), "%ld", Z_LVAL_P(val));
+                value_str = value_buf;
+                value_len = strlen(value_buf);
+            } else if (Z_TYPE_P(val) == IS_DOUBLE) {
+                snprintf(value_buf, sizeof(value_buf), "%.6f", Z_DVAL_P(val));
+                value_str = value_buf;
+                value_len = strlen(value_buf);
+            } else if (Z_TYPE_P(val) == IS_TRUE) {
+                value_str = "true";
+                value_len = 4;
+            } else if (Z_TYPE_P(val) == IS_FALSE) {
+                value_str = "false";
+                value_len = 5;
+            } else if (Z_TYPE_P(val) == IS_NULL) {
+                value_str = "null";
+                value_len = 4;
+            } else {
+                // For other types, serialize to JSON
+                serialize_zval_json(&json_buf, val);
+                smart_string_0(&json_buf);
+                if (json_buf.c && json_buf.len > 0) {
+                    value_str = json_buf.c;
+                    value_len = json_buf.len;
+                    needs_json_free = 1;
+                } else {
+                    smart_string_free(&json_buf);
+                    continue;
+                }
+            }
+            
+            if (value_str && value_len > 0) {
+                // Create tag with malloc'd strings
+                span_tag_t *tag = malloc(sizeof(span_tag_t));
+                if (tag) {
+                    // Copy key
+                    if (key && ZSTR_LEN(key) > 0) {
+                        tag->key = strdup(ZSTR_VAL(key));
+                    } else {
+                        tag->key = strdup(key_str);
+                    }
+                    
+                    // Copy value (always malloc, even for string types)
+                    tag->value = malloc(value_len + 1);
+                    if (tag->key && tag->value) {
+                        memcpy(tag->value, value_str, value_len);
+                        tag->value[value_len] = '\0';
+                        
+                        tag->next = span->tags;
+                        span->tags = tag;
+                    } else {
+                        // Allocation failed, clean up
+                        if (tag->key) free(tag->key);
+                        if (tag->value) free(tag->value);
+                        free(tag);
+                    }
+                }
+            }
+            
+            // Free smart_string if used
+            if (needs_json_free && json_buf.c) {
+                smart_string_free(&json_buf);
+            }
+        } ZEND_HASH_FOREACH_END();
     }
     
     zend_string *key = zend_string_init(span->span_id, strlen(span->span_id), 0);
@@ -135,20 +228,10 @@ PHP_FUNCTION(opa_add_tag) {
     
     zend_string_release(skey);
     
-    // CRITICAL: span->tags zval is allocated with emalloc() and becomes invalid after request cleanup
-    // Even though span structure is now persistent (malloc), the zval and its hash table are request-local
-    // The zval's internal hash table (allocated by array_init) uses PHP's allocator and becomes invalid
-    // after request cleanup, causing segfaults when accessed. We must skip this operation entirely
-    // if there's any risk the zval has been freed.
-    //
-    // SOLUTION: Skip tag addition entirely to prevent segfaults. Tags are optional metadata and
-    // skipping them is preferable to crashing. This is a safety measure until a better solution
-    // (e.g., using malloc for zval storage or different data structure) can be implemented.
-    //
-    // TODO: Consider implementing a persistent tag storage mechanism that doesn't rely on emalloc'd zvals
+    // Add tag using persistent tag storage (malloc'd, safe after request cleanup)
+    span_add_tag(span, key, value);
     
     pthread_mutex_unlock(&active_spans_mutex);
-    // Skip tag addition to prevent segfault - return TRUE to indicate "success" (tag just wasn't added)
     RETURN_TRUE;
 }
 

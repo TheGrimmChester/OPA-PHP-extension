@@ -97,6 +97,13 @@ typedef struct call_node {
     struct call_node *stack_next; // Next in call stack (for unlimited depth)
 } call_node_t;
 
+// Tag storage structure (malloc'd, persistent across requests)
+typedef struct span_tag {
+    char *key;                    // malloc'd string
+    char *value;                  // malloc'd string
+    struct span_tag *next;        // Next tag in linked list
+} span_tag_t;
+
 // Span context structure
 typedef struct {
     char *span_id;
@@ -108,7 +115,7 @@ typedef struct {
     char *url_scheme;  // http or https
     char *url_host;    // hostname:port
     char *url_path;    // /path/to/resource
-    zval *tags;
+    span_tag_t *tags;  // Linked list of tags (malloc'd, persistent)
     zval *net;
     zval *sql;
     zval *http; // HTTP requests (cURL) for span-level aggregation
