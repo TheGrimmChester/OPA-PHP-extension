@@ -93,6 +93,11 @@ htmlcov/
 # Tests
 tests/
 
+# E2E and Profiling CI
+.github/workflows/*e2e*.yml
+.github/workflows/*test*.yml
+.github/workflows/*profiling*.yml
+
 # Python
 __pycache__/
 *.py[cod]
