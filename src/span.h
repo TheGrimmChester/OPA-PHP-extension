@@ -15,8 +15,15 @@ char* produce_span_json_from_values(
     const char *trace_id, const char *span_id, const char *parent_id, const char *name,
     const char *url_scheme, const char *url_host, const char *url_path,
     long start_ts, long end_ts, int cpu_ms, int status, const char *dumps_json,
-    const char *cli_args_json, const char *http_request_json, const char *http_response_json
+    const char *cli_args_json, const char *http_request_json, const char *http_response_json,
+    const char *tags_json
 ); // Returns char* (malloc'd), caller must free
+
+// Tag management functions
+span_tag_t* create_span_tag(const char *key, const char *value);
+void free_span_tags(span_tag_t *tags);
+void span_add_tag(span_context_t *span, const char *key, const char *value);
+char* serialize_tags_json(span_tag_t *tags); // Returns char* (malloc'd), caller must free
 
 // Produce child span JSON from call node - safe after fastcgi_finish_request()
 // Returns NULL if call node is not significant (no SQL/HTTP/cache/Redis and duration <= 10ms)

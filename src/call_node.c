@@ -403,7 +403,7 @@ void record_cache_operation(const char *key, const char *operation, int hit, dou
 }
 
 // Record Redis operation in current call context
-void record_redis_operation(const char *command, const char *key, int hit, double duration, const char *error) {
+void record_redis_operation(const char *command, const char *key, int hit, double duration, const char *error, const char *host, const char *port) {
     if (!OPA_G(enabled) || !profiling_active) return;
     
     extern opa_collector_t *global_collector;
@@ -444,6 +444,12 @@ void record_redis_operation(const char *command, const char *key, int hit, doubl
         add_assoc_double(&operation_data, "timestamp", get_time_seconds() - duration);
         if (error) {
             add_assoc_string(&operation_data, "error", (char *)error);
+        }
+        if (host) {
+            add_assoc_string(&operation_data, "host", (char *)host);
+        }
+        if (port) {
+            add_assoc_string(&operation_data, "port", (char *)port);
         }
         add_assoc_string(&operation_data, "type", "redis");
         

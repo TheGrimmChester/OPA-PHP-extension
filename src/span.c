@@ -190,6 +190,144 @@ static int aggregate_sql_queries_from_calls(json_buffer_t *buf) {
     return query_count;
 }
 
+// Aggregate cache operations from all call nodes
+static int aggregate_cache_operations_from_calls(json_buffer_t *buf) {
+    int op_count = 0;
+    
+    if (!global_collector || global_collector->magic != OPA_COLLECTOR_MAGIC) {
+        json_buffer_append_str(buf, "[]");
+        return 0;
+    }
+    
+    json_buffer_append_str(buf, "[");
+    int first = 1;
+    
+    // Add cache operations from call nodes
+    call_node_t *call = global_collector->calls;
+    while (call) {
+        if (call->magic == OPA_CALL_NODE_MAGIC && 
+            call->cache_operations && 
+            Z_TYPE_P(call->cache_operations) == IS_ARRAY &&
+            zend_hash_num_elements(Z_ARRVAL_P(call->cache_operations)) > 0) {
+            
+            HashTable *ht = Z_ARRVAL_P(call->cache_operations);
+            zval *val;
+            ZEND_HASH_FOREACH_VAL(ht, val) {
+                if (!first) {
+                    json_buffer_append_str(buf, ",");
+                }
+                // Serialize cache operation zval to JSON
+                smart_string temp_buf = {0};
+                serialize_zval_json(&temp_buf, val);
+                smart_string_0(&temp_buf);
+                if (temp_buf.c && temp_buf.len > 0) {
+                    json_buffer_append(buf, temp_buf.c, temp_buf.len);
+                    op_count++;
+                }
+                smart_string_free(&temp_buf);
+                first = 0;
+            } ZEND_HASH_FOREACH_END();
+        }
+        call = call->next;
+    }
+    
+    json_buffer_append_str(buf, "]");
+    debug_log("[aggregate_cache_operations_from_calls] Total cache operations aggregated: %d", op_count);
+    return op_count;
+}
+
+// Aggregate HTTP requests from all call nodes
+static int aggregate_http_requests_from_calls(json_buffer_t *buf) {
+    int req_count = 0;
+    
+    if (!global_collector || global_collector->magic != OPA_COLLECTOR_MAGIC) {
+        json_buffer_append_str(buf, "[]");
+        return 0;
+    }
+    
+    json_buffer_append_str(buf, "[");
+    int first = 1;
+    
+    // Add HTTP requests from call nodes
+    call_node_t *call = global_collector->calls;
+    while (call) {
+        if (call->magic == OPA_CALL_NODE_MAGIC && 
+            call->http_requests && 
+            Z_TYPE_P(call->http_requests) == IS_ARRAY &&
+            zend_hash_num_elements(Z_ARRVAL_P(call->http_requests)) > 0) {
+            
+            HashTable *ht = Z_ARRVAL_P(call->http_requests);
+            zval *val;
+            ZEND_HASH_FOREACH_VAL(ht, val) {
+                if (!first) {
+                    json_buffer_append_str(buf, ",");
+                }
+                // Serialize HTTP request zval to JSON
+                smart_string temp_buf = {0};
+                serialize_zval_json(&temp_buf, val);
+                smart_string_0(&temp_buf);
+                if (temp_buf.c && temp_buf.len > 0) {
+                    json_buffer_append(buf, temp_buf.c, temp_buf.len);
+                    req_count++;
+                }
+                smart_string_free(&temp_buf);
+                first = 0;
+            } ZEND_HASH_FOREACH_END();
+        }
+        call = call->next;
+    }
+    
+    json_buffer_append_str(buf, "]");
+    debug_log("[aggregate_http_requests_from_calls] Total HTTP requests aggregated: %d", req_count);
+    return req_count;
+}
+
+// Aggregate Redis operations from all call nodes
+static int aggregate_redis_operations_from_calls(json_buffer_t *buf) {
+    int op_count = 0;
+    
+    if (!global_collector || global_collector->magic != OPA_COLLECTOR_MAGIC) {
+        json_buffer_append_str(buf, "[]");
+        return 0;
+    }
+    
+    json_buffer_append_str(buf, "[");
+    int first = 1;
+    
+    // Add Redis operations from call nodes
+    call_node_t *call = global_collector->calls;
+    while (call) {
+        if (call->magic == OPA_CALL_NODE_MAGIC && 
+            call->redis_operations && 
+            Z_TYPE_P(call->redis_operations) == IS_ARRAY &&
+            zend_hash_num_elements(Z_ARRVAL_P(call->redis_operations)) > 0) {
+            
+            HashTable *ht = Z_ARRVAL_P(call->redis_operations);
+            zval *val;
+            ZEND_HASH_FOREACH_VAL(ht, val) {
+                if (!first) {
+                    json_buffer_append_str(buf, ",");
+                }
+                // Serialize Redis operation zval to JSON
+                smart_string temp_buf = {0};
+                serialize_zval_json(&temp_buf, val);
+                smart_string_0(&temp_buf);
+                if (temp_buf.c && temp_buf.len > 0) {
+                    json_buffer_append(buf, temp_buf.c, temp_buf.len);
+                    op_count++;
+                }
+                smart_string_free(&temp_buf);
+                first = 0;
+            } ZEND_HASH_FOREACH_END();
+        }
+        call = call->next;
+    }
+    
+    json_buffer_append_str(buf, "]");
+    debug_log("[aggregate_redis_operations_from_calls] Total Redis operations aggregated: %d", op_count);
+    return op_count;
+}
+
 // External reference to global collector ()
 extern opa_collector_t *global_collector;
 
@@ -426,6 +564,107 @@ static void serialize_call_node_json_malloc(json_buffer_t *buf, call_node_t *cal
     json_buffer_append_str(buf, "}");
 }
 
+// Tag management functions
+
+// Create a new tag node with malloc'd strings
+span_tag_t* create_span_tag(const char *key, const char *value) {
+    if (!key || !value) {
+        return NULL;
+    }
+    
+    span_tag_t *tag = malloc(sizeof(span_tag_t));
+    if (!tag) {
+        return NULL;
+    }
+    
+    tag->key = strdup(key);
+    tag->value = strdup(value);
+    tag->next = NULL;
+    
+    if (!tag->key || !tag->value) {
+        // Allocation failed, clean up
+        if (tag->key) free(tag->key);
+        if (tag->value) free(tag->value);
+        free(tag);
+        return NULL;
+    }
+    
+    return tag;
+}
+
+// Free entire tag list
+void free_span_tags(span_tag_t *tags) {
+    span_tag_t *current = tags;
+    while (current) {
+        span_tag_t *next = current->next;
+        if (current->key) free(current->key);
+        if (current->value) free(current->value);
+        free(current);
+        current = next;
+    }
+}
+
+// Add or update a tag in the span's tag list
+void span_add_tag(span_context_t *span, const char *key, const char *value) {
+    if (!span || !key || !value) {
+        return;
+    }
+    
+    // Check if tag with this key already exists
+    span_tag_t *current = span->tags;
+    while (current) {
+        if (current->key && strcmp(current->key, key) == 0) {
+            // Update existing tag value
+            if (current->value) {
+                free(current->value);
+            }
+            current->value = strdup(value);
+            return;
+        }
+        current = current->next;
+    }
+    
+    // Create new tag and add to front of list
+    span_tag_t *new_tag = create_span_tag(key, value);
+    if (new_tag) {
+        new_tag->next = span->tags;
+        span->tags = new_tag;
+    }
+}
+
+// Serialize tags to JSON string (malloc'd, caller must free)
+char* serialize_tags_json(span_tag_t *tags) {
+    if (!tags) {
+        return NULL;
+    }
+    
+    json_buffer_t buf;
+    json_buffer_init(&buf);
+    
+    json_buffer_append_str(&buf, "{");
+    int first = 1;
+    
+    span_tag_t *current = tags;
+    while (current) {
+        if (current->key && current->value) {
+            if (!first) {
+                json_buffer_append_str(&buf, ",");
+            }
+            json_buffer_append_str(&buf, "\"");
+            json_escape_string_malloc(&buf, current->key, strlen(current->key));
+            json_buffer_append_str(&buf, "\":\"");
+            json_escape_string_malloc(&buf, current->value, strlen(current->value));
+            json_buffer_append_str(&buf, "\"");
+            first = 0;
+        }
+        current = current->next;
+    }
+    
+    json_buffer_append_str(&buf, "}");
+    
+    return buf.data; // Caller must free this
+}
+
 // Create span context
 span_context_t* create_span_context(const char *span_id, const char *trace_id, const char *name) {
     // Use malloc instead of emalloc to prevent PHP from automatically freeing
@@ -457,17 +696,16 @@ void free_span_context(span_context_t *span) {
     if (span->parent_id) efree(span->parent_id);
     if (span->name) efree(span->name);
     
+    // Free tags (malloc'd linked list, safe to free anytime)
+    if (span->tags) {
+        free_span_tags(span->tags);
+        span->tags = NULL;
+    }
+    
     // Free zvals if allocated - but ONLY if not in shutdown
     // During MSHUTDOWN, the Zend heap is being destroyed and accessing zvals causes corruption
     if (!in_shutdown) {
         // Check type before destroying to avoid corruption
-        if (span->tags) {
-            if (Z_TYPE_P(span->tags) != IS_UNDEF) {
-                zval_ptr_dtor(span->tags);
-            }
-            efree(span->tags);
-            span->tags = NULL;
-        }
         if (span->net) {
             if (Z_TYPE_P(span->net) != IS_UNDEF) {
                 zval_ptr_dtor(span->net);
@@ -499,7 +737,7 @@ void free_span_context(span_context_t *span) {
     } else {
         // During shutdown: just free the zval pointers without accessing them
         // PHP will clean up the zval contents automatically
-        if (span->tags) efree(span->tags);
+        // Tags are already freed above (malloc'd, safe to free anytime)
         if (span->net) efree(span->net);
         if (span->sql) efree(span->sql);
         if (span->stack) efree(span->stack);
@@ -517,7 +755,8 @@ char* produce_span_json_from_values(
     const char *trace_id, const char *span_id, const char *parent_id, const char *name,
     const char *url_scheme, const char *url_host, const char *url_path,
     long start_ts, long end_ts, int cpu_ms, int status, const char *dumps_json,
-    const char *cli_args_json, const char *http_request_json, const char *http_response_json
+    const char *cli_args_json, const char *http_request_json, const char *http_response_json,
+    const char *tags_json
 ) {
     debug_log("[produce_span_json_from_values] Called: trace_id=%s, span_id=%s", 
         trace_id ? trace_id : "NULL", span_id ? span_id : "NULL");
@@ -634,9 +873,33 @@ char* produce_span_json_from_values(
         }
     }
     
-    // Add tags - include organization_id, project_id, CLI args and HTTP request/response if present
+    // Add tags - include organization_id, project_id, CLI args, HTTP request/response, and custom tags
     json_buffer_append_str(&buf, ",\"tags\":{");
     int tag_first = 1;
+    
+    // First, add custom tags from tags_json (if provided)
+    // tags_json should be a JSON object like {"key":"value",...}
+    if (tags_json && strlen(tags_json) > 0) {
+        // Remove outer braces to merge with system tags
+        const char *tags_content = tags_json;
+        size_t tags_len = strlen(tags_content);
+        
+        // Skip opening brace if present
+        if (tags_len > 0 && *tags_content == '{') {
+            tags_content++;
+            tags_len--;
+        }
+        // Skip closing brace if present
+        if (tags_len > 0 && tags_content[tags_len - 1] == '}') {
+            tags_len--;
+        }
+        
+        // Only append if there's actual content (not just "{}")
+        if (tags_len > 0) {
+            json_buffer_append(&buf, tags_content, tags_len);
+            tag_first = 0;
+        }
+    }
     
     // Add organization_id and project_id to tags (agent reads from tags)
     if (OPA_G(organization_id) && strlen(OPA_G(organization_id)) > 0) {
@@ -710,6 +973,21 @@ char* produce_span_json_from_values(
     json_buffer_append_str(&buf, ",\"sql\":");
     int sql_count = aggregate_sql_queries_from_calls(&buf);
     debug_log("[produce_span_json_from_values] Aggregated %d SQL queries from call stack", sql_count);
+    
+    // Aggregate HTTP requests from call stack
+    json_buffer_append_str(&buf, ",\"http\":");
+    int http_count = aggregate_http_requests_from_calls(&buf);
+    debug_log("[produce_span_json_from_values] Aggregated %d HTTP requests from call stack", http_count);
+    
+    // Aggregate cache operations from call stack
+    json_buffer_append_str(&buf, ",\"cache\":");
+    int cache_count = aggregate_cache_operations_from_calls(&buf);
+    debug_log("[produce_span_json_from_values] Aggregated %d cache operations from call stack", cache_count);
+    
+    // Aggregate Redis operations from call stack
+    json_buffer_append_str(&buf, ",\"redis\":");
+    int redis_count = aggregate_redis_operations_from_calls(&buf);
+    debug_log("[produce_span_json_from_values] Aggregated %d Redis operations from call stack", redis_count);
     
     // Serialize dumps if present
     json_buffer_append_str(&buf, ",\"dumps\":");
@@ -1128,17 +1406,29 @@ char* produce_span_json(span_context_t *span) {
         }
     }
     
+    // Serialize tags to JSON string (malloc'd, persistent)
+    char *tags_json = NULL;
+    if (span->tags) {
+        tags_json = serialize_tags_json(span->tags);
+    }
+    
     // Call the safe function
     char *result = produce_span_json_from_values(
         trace_id_copy, span_id_copy, parent_id_copy, name_copy,
         url_scheme_copy, url_host_copy, url_path_copy,
         start_ts, end_ts, cpu_ms, status, dumps_json,
-        NULL, NULL, NULL  // cli_args_json, http_request_json, http_response_json
+        NULL, NULL, NULL,  // cli_args_json, http_request_json, http_response_json
+        tags_json  // custom tags
     );
     
     // Free dumps JSON if allocated
     if (dumps_json) {
         free(dumps_json);
+    }
+    
+    // Free tags JSON if allocated
+    if (tags_json) {
+        free(tags_json);
     }
     
     // Free copied strings (they're now in the JSON output)
