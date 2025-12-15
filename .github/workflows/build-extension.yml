@@ -9,21 +9,25 @@ on:
   workflow_dispatch:
     inputs:
       php_version:
-        description: 'PHP version (8.4 or 8.5)'
+        description: 'PHP version (8.3, 8.4 or 8.5)'
         required: true
         default: '8.4'
         type: choice
         options:
+          - '8.3'
           - '8.4'
           - '8.5'
 
 jobs:
-  build:
+  build-linux:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        php_version: ['8.4', '8.5']
+        php_version: ['8.3', '8.4', '8.5']
+        arch: ['linux/amd64', 'linux/arm64/v8']
         include:
+          - php_version: '8.3'
+            php_package: 'php8.3-dev'
           - php_version: '8.4'
             php_package: 'php8.4-dev'
           - php_version: '8.5'
@@ -52,35 +56,153 @@ jobs:
             exit 0
           fi
           
-          # For pull requests, check if .c or .h files changed
+          # For pull requests, check if relevant files changed
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE_SHA="${{ github.event.pull_request.base.sha }}"
             HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-            CHANGED_FILES=$(git diff --name-only ${BASE_SHA}..${HEAD_SHA} -- "*.c" "*.h" | wc -l)
+            CHANGED_FILES=$(git diff --name-only ${BASE_SHA}..${HEAD_SHA} -- "*.c" "*.h" "*.m4" "*.ac" | wc -l)
           else
             # For push events, check changes in the commit
             if [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-              CHANGED_FILES=$(git diff --name-only ${{ github.event.before }}..${{ github.event.after }} -- "*.c" "*.h" | wc -l)
+              CHANGED_FILES=$(git diff --name-only ${{ github.event.before }}..${{ github.event.after }} -- "*.c" "*.h" "*.m4" "*.ac" | wc -l)
             else
               # If no before SHA, check current commit
-              CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD -- "*.c" "*.h" | wc -l)
+              CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD -- "*.c" "*.h" "*.m4" "*.ac" | wc -l)
             fi
           fi
           
           if [ "$CHANGED_FILES" -gt 0 ]; then
-            echo "Code files (.c or .h) have changed. Proceeding with build."
+            echo "Relevant files (.c, .h, .m4, or .ac) have changed. Proceeding with build."
             echo "should_build=true" >> $GITHUB_OUTPUT
           else
-            echo "No .c or .h files changed. Skipping build."
+            echo "No relevant files changed. Skipping build."
             echo "should_build=false" >> $GITHUB_OUTPUT
           fi
       
-      - name: Set up PHP
+      - name: Set up QEMU
+        if: steps.code_changes.outputs.should_build == 'true'
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        if: steps.code_changes.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build Docker image for ${{ matrix.arch }}
+        if: steps.code_changes.outputs.should_build == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.arch }}
+          build-args: |
+            PHP_VERSION=${{ matrix.php_version }}
+          tags: opa-php-${{ matrix.php_version }}-${{ matrix.arch }}:local
+          outputs: type=docker,dest=/tmp/opa-php-${{ matrix.php_version }}-${{ matrix.arch }}.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Extract .so file from container
         if: steps.code_changes.outputs.should_build == 'true'
         run: |
-          sudo add-apt-repository ppa:ondrej/php -y
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.php_package }} liblz4-dev build-essential autoconf libtool pkg-config
+          # Load the image
+          docker load -i /tmp/opa-php-${{ matrix.php_version }}-${{ matrix.arch }}.tar
+          
+          # Create architecture-specific directory name
+          ARCH_NAME=$(echo "${{ matrix.arch }}" | sed 's|/v8||g' | sed 's|/|-|g' | tr -d ' ')
+          
+          # Create output directory
+          mkdir -p dist/php${{ matrix.php_version }}/$ARCH_NAME
+          
+          # Create a temporary container and extract the file
+          CONTAINER_ID=$(docker create opa-php-${{ matrix.php_version }}-${{ matrix.arch }}:local)
+          
+          # Copy from build directory
+          docker cp $CONTAINER_ID:/usr/src/opa/modules/opa.so dist/php${{ matrix.php_version }}/$ARCH_NAME/opa.so
+          
+          # Clean up
+          docker rm $CONTAINER_ID
+      
+      - name: Set artifact name
+        if: steps.code_changes.outputs.should_build == 'true'
+        id: artifact_name
+        run: |
+          ARCH_SANITIZED=$(echo "${{ matrix.arch }}" | sed 's|/|-|g' | sed 's|v8||g' | tr -d ' ')
+          echo "name=opa-php${{ matrix.php_version }}-$ARCH_SANITIZED" >> $GITHUB_OUTPUT
+      
+      - name: Upload artifact
+        if: steps.code_changes.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact_name.outputs.name }}
+          path: dist/php${{ matrix.php_version }}/*
+          retention-days: 30
+  
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        php_version: ['8.3', '8.4', '8.5']
+        arch: ['darwin/amd64', 'darwin/arm64']
+        include:
+          - php_version: '8.3'
+            php_brew: 'php@8.3'
+          - php_version: '8.4'
+            php_brew: 'php@8.4'
+          - php_version: '8.5'
+            php_brew: 'php@8.5'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Check for code changes
+        id: code_changes
+        run: |
+          # For workflow_dispatch (manual trigger), always build
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger detected. Proceeding with build."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # For tag pushes, always build
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "Tag push detected. Proceeding with build."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # For pull requests, check if relevant files changed
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            CHANGED_FILES=$(git diff --name-only ${BASE_SHA}..${HEAD_SHA} -- "*.c" "*.h" "*.m4" "*.ac" | wc -l)
+          else
+            # For push events, check changes in the commit
+            if [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+              CHANGED_FILES=$(git diff --name-only ${{ github.event.before }}..${{ github.event.after }} -- "*.c" "*.h" "*.m4" "*.ac" | wc -l)
+            else
+              # If no before SHA, check current commit
+              CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD -- "*.c" "*.h" "*.m4" "*.ac" | wc -l)
+            fi
+          fi
+          
+          if [ "$CHANGED_FILES" -gt 0 ]; then
+            echo "Relevant files (.c, .h, .m4, or .ac) have changed. Proceeding with build."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "No relevant files changed. Skipping build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Install PHP and dependencies
+        if: steps.code_changes.outputs.should_build == 'true'
+        run: |
+          brew install ${{ matrix.php_brew }} autoconf libtool pkg-config lz4
+          brew link --force --overwrite ${{ matrix.php_brew }}
+          echo "$(brew --prefix ${{ matrix.php_brew }})/bin" >> $GITHUB_PATH
       
       - name: Build extension
         if: steps.code_changes.outputs.should_build == 'true'
@@ -92,19 +214,28 @@ jobs:
       - name: Create release directory
         if: steps.code_changes.outputs.should_build == 'true'
         run: |
-          mkdir -p dist/php${{ matrix.php_version }}
-          cp modules/opa.so dist/php${{ matrix.php_version }}/opa.so
+          ARCH_NAME=$(echo "${{ matrix.arch }}" | sed 's/\//-/g')
+          mkdir -p dist/php${{ matrix.php_version }}/$ARCH_NAME
+          cp modules/opa.dylib dist/php${{ matrix.php_version }}/$ARCH_NAME/opa.dylib || \
+          cp modules/opa.so dist/php${{ matrix.php_version }}/$ARCH_NAME/opa.dylib
+      
+      - name: Set artifact name
+        if: steps.code_changes.outputs.should_build == 'true'
+        id: artifact_name
+        run: |
+          ARCH_SANITIZED=$(echo "${{ matrix.arch }}" | sed 's|/|-|g')
+          echo "name=opa-php${{ matrix.php_version }}-$ARCH_SANITIZED" >> $GITHUB_OUTPUT
       
       - name: Upload artifact
         if: steps.code_changes.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: opa-php${{ matrix.php_version }}
-          path: dist/php${{ matrix.php_version }}/opa.so
+          name: ${{ steps.artifact_name.outputs.name }}
+          path: dist/php${{ matrix.php_version }}/*
           retention-days: 30
   
   release:
-    needs: build
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -124,6 +255,7 @@ jobs:
         with:
           files: |
             dist/**/*.so
+            dist/**/*.dylib
           draft: false
           prerelease: false
         env:
