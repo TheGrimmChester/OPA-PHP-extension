@@ -3501,12 +3501,27 @@ static void opa_observer_fcall_begin(zend_execute_data *execute_data) {
         class_name = ZSTR_VAL(func->common.scope->name);
     }
     
+    // Always track APCu functions even if collect_internal_functions is disabled
+    int is_apcu = 0;
+    if (func->type == ZEND_INTERNAL_FUNCTION && function_name) {
+        if (strcmp(function_name, "apcu_fetch") == 0 ||
+            strcmp(function_name, "apcu_store") == 0 ||
+            strcmp(function_name, "apcu_delete") == 0 ||
+            strcmp(function_name, "apcu_clear_cache") == 0 ||
+            strcmp(function_name, "apcu_exists") == 0 ||
+            strcmp(function_name, "apc_fetch") == 0 ||
+            strcmp(function_name, "apc_store") == 0 ||
+            strcmp(function_name, "apc_delete") == 0) {
+            is_apcu = 1;
+        }
+    }
+    
     // Determine function type
     if (func->type == ZEND_USER_FUNCTION) {
         function_type = class_name ? 2 : 0;
     } else if (func->type == ZEND_INTERNAL_FUNCTION) {
-        // Skip internal functions if not collecting them
-        if (!OPA_G(collect_internal_functions)) {
+        // Skip internal functions if not collecting them (except APCu functions)
+        if (!OPA_G(collect_internal_functions) && !is_apcu) {
             in_opa_observer = 0;
             return;
         }
@@ -4155,12 +4170,29 @@ static zend_observer_fcall_handlers opa_observer_fcall_init(zend_execute_data *e
     
     zend_function *func = execute_data->func;
     
-    // Skip internal functions if not collecting them
-    if (func->type == ZEND_INTERNAL_FUNCTION && !OPA_G(collect_internal_functions)) {
+    // Always track APCu functions even if collect_internal_functions is disabled
+    // APCu functions are important for cache profiling
+    int is_apcu = 0;
+    if (func->type == ZEND_INTERNAL_FUNCTION && func->common.function_name) {
+        const char *function_name = ZSTR_VAL(func->common.function_name);
+        if (strcmp(function_name, "apcu_fetch") == 0 ||
+            strcmp(function_name, "apcu_store") == 0 ||
+            strcmp(function_name, "apcu_delete") == 0 ||
+            strcmp(function_name, "apcu_clear_cache") == 0 ||
+            strcmp(function_name, "apcu_exists") == 0 ||
+            strcmp(function_name, "apc_fetch") == 0 ||
+            strcmp(function_name, "apc_store") == 0 ||
+            strcmp(function_name, "apc_delete") == 0) {
+            is_apcu = 1;
+        }
+    }
+    
+    // Skip internal functions if not collecting them (except APCu functions)
+    if (func->type == ZEND_INTERNAL_FUNCTION && !OPA_G(collect_internal_functions) && !is_apcu) {
         return handlers;
     }
     
-    // Register handlers for all functions (user and internal if enabled)
+    // Register handlers for all functions (user and internal if enabled, plus APCu always)
     handlers.begin = opa_observer_fcall_begin;
     handlers.end = opa_observer_fcall_end;
     
