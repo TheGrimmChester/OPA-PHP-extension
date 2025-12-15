@@ -6,6 +6,8 @@ on:
     # Exclude tags to avoid duplicate builds
     tags-ignore:
       - 'v*'
+  pull_request:
+    branches: [ main, master ]
 
 jobs:
   build-linux:
