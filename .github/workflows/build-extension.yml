@@ -251,193 +251,96 @@ jobs:
           path: dist
           merge-multiple: false
       
-      - name: List downloaded artifacts
+      - name: Prepare release directory
         run: |
-          echo "=== Downloaded artifact directories ==="
-          ls -la dist/ || echo "No dist directory"
-          echo ""
-          echo "=== Artifact directory contents ==="
-          for dir in dist/*/; do
-            if [ -d "$dir" ]; then
-              echo "Directory: $dir"
-              find "$dir" -type f | head -5
-              echo ""
-            fi
-          done
-      
-      - name: Reorganize artifacts
-        run: |
-          # Reorganize downloaded artifacts into expected structure with descriptive names
           mkdir -p dist/release
+          echo "Created dist/release directory"
+      
+      - name: Collect and rename all extension files
+        run: |
+          set -e
           
-          # Debug: show structure
-          echo "=== Artifact structure ==="
-          find dist -type f \( -name "*.so" -o -name "*.dylib" \) | sort || echo "No .so or .dylib files found"
+          echo "=== Step 1: Finding all artifact directories ==="
+          find dist -type d -name "opa-php*" | sort
           echo ""
-          echo "=== Directory structure ==="
-          find dist -type d | sort || echo "No directories found"
+          
+          echo "=== Step 2: Finding all .so and .dylib files ==="
+          find dist -type f \( -name "*.so" -o -name "*.dylib" \) ! -path "dist/release/*" | sort
           echo ""
           
-          # Process each artifact directory
-          # Artifacts are downloaded as: dist/{artifact-name}/...
-          # Artifact names are: opa-php{version}-{arch}
-          # Files inside are: {artifact-name}/php{version}/{arch}/opa.{so,dylib}
-          
-          for artifact_dir in dist/opa-php*; do
-            if [ ! -d "$artifact_dir" ]; then
+          echo "=== Step 3: Processing each file ==="
+          # Find all .so and .dylib files and process them
+          find dist -type f \( -name "*.so" -o -name "*.dylib" \) ! -path "dist/release/*" | while read -r filepath; do
+            # Get the full path relative to dist
+            REL_PATH=${filepath#dist/}
+            
+            # Extract artifact directory name (first directory in path)
+            # Example: opa-php8.4-linux-amd64/php8.4/linux-amd64/opa.so
+            # -> artifact_dir = opa-php8.4-linux-amd64
+            ARTIFACT_DIR=$(echo "$REL_PATH" | cut -d'/' -f1)
+            
+            # Skip if not an opa-php artifact
+            if ! echo "$ARTIFACT_DIR" | grep -q "^opa-php"; then
+              echo "Skipping non-artifact file: $filepath"
               continue
             fi
             
             # Extract version and architecture from artifact directory name
             # Example: opa-php8.4-linux-amd64 -> version=8.4, arch=linux-amd64
-            ARTIFACT_NAME=$(basename "$artifact_dir")
-            
-            # Extract PHP version (8.3, 8.4, or 8.5)
-            VERSION=$(echo "$ARTIFACT_NAME" | grep -oE 'php(8\.[345])' | sed 's/php//')
-            
-            # Extract architecture (everything after opa-php{version}-)
-            ARCH_NAME=$(echo "$ARTIFACT_NAME" | sed "s/opa-php${VERSION}-//")
-            
-            if [ -z "$VERSION" ] || [ -z "$ARCH_NAME" ]; then
-              echo "Warning: Could not parse artifact name: $ARTIFACT_NAME"
-              continue
-            fi
-            
-            echo "Processing artifact: $ARTIFACT_NAME (PHP $VERSION, arch: $ARCH_NAME)"
-            
-            # Find all .so and .dylib files in this artifact directory
-            FILES_FOUND=$(find "$artifact_dir" -type f \( -name "*.so" -o -name "*.dylib" \) | wc -l)
-            if [ "$FILES_FOUND" -eq 0 ]; then
-              echo "  WARNING: No .so or .dylib files found in $artifact_dir"
-            fi
-            
-            find "$artifact_dir" -type f \( -name "*.so" -o -name "*.dylib" \) | while read -r file; do
-              # Get file extension
-              EXT=$(echo "$file" | sed 's/.*\.//')
+            if echo "$ARTIFACT_DIR" | grep -qE 'opa-php8\.[345]-'; then
+              VERSION=$(echo "$ARTIFACT_DIR" | grep -oE 'php8\.[345]' | sed 's/php//')
+              ARCH_NAME=$(echo "$ARTIFACT_DIR" | sed "s/opa-php${VERSION}-//")
               
-              # Create descriptive filename using artifact name (most reliable)
-              NEW_NAME="opa-php${VERSION}-${ARCH_NAME}.${EXT}"
-              
-              # Verify the target name is different from source
-              SOURCE_NAME=$(basename "$file")
-              if [ "$SOURCE_NAME" = "$NEW_NAME" ]; then
-                # File already has correct name, just copy it
-                cp "$file" "dist/release/${NEW_NAME}"
-                echo "  Copied: ${NEW_NAME} (already correctly named)"
-              elif [ ! -f "dist/release/${NEW_NAME}" ]; then
-                cp "$file" "dist/release/${NEW_NAME}"
-                echo "  Copied: ${NEW_NAME} (renamed from ${SOURCE_NAME})"
-              else
-                echo "  ERROR: Target file already exists: ${NEW_NAME}"
-                echo "  Source: $file"
-                # Don't overwrite, but log the issue
-              fi
-            done
-          done
-          
-          # Also check for direct structure (dist/php{version}/{arch}/opa.{so,dylib})
-          # This handles cases where artifacts might be structured differently
-          for version in 8.3 8.4 8.5; do
-            if [ -d "dist/php${version}" ]; then
-              echo "Processing direct structure: dist/php${version}/"
-              for arch_dir in dist/php${version}/*; do
-                if [ -d "$arch_dir" ]; then
-                  ARCH_NAME=$(basename "$arch_dir")
-                  
-                  if [ -f "$arch_dir/opa.so" ]; then
-                    NEW_NAME="opa-php${version}-${ARCH_NAME}.so"
-                    if [ ! -f "dist/release/${NEW_NAME}" ]; then
-                      cp "$arch_dir/opa.so" "dist/release/${NEW_NAME}"
-                      echo "  Copied: ${NEW_NAME}"
-                    fi
-                  fi
-                  
-                  if [ -f "$arch_dir/opa.dylib" ]; then
-                    NEW_NAME="opa-php${version}-${ARCH_NAME}.dylib"
-                    if [ ! -f "dist/release/${NEW_NAME}" ]; then
-                      cp "$arch_dir/opa.dylib" "dist/release/${NEW_NAME}"
-                      echo "  Copied: ${NEW_NAME}"
-                    fi
-                  fi
+              if [ -n "$VERSION" ] && [ -n "$ARCH_NAME" ]; then
+                # Get file extension
+                EXT="${filepath##*.}"
+                
+                # Create new filename
+                NEW_NAME="opa-php${VERSION}-${ARCH_NAME}.${EXT}"
+                TARGET_PATH="dist/release/${NEW_NAME}"
+                
+                # Copy file if it doesn't exist or is different
+                if [ ! -f "$TARGET_PATH" ]; then
+                  cp "$filepath" "$TARGET_PATH"
+                  echo "✓ Copied: $NEW_NAME (from $REL_PATH)"
+                else
+                  echo "⚠ Skipped (exists): $NEW_NAME"
                 fi
-              done
-            fi
-          done
-          
-          # Final catch-all: find any remaining .so or .dylib files we might have missed
-          echo ""
-          echo "=== Checking for any remaining files ==="
-          find dist -type f \( -name "*.so" -o -name "*.dylib" \) ! -path "dist/release/*" | while read -r file; do
-            # Try to extract info from path
-            VERSION=""
-            ARCH_NAME=""
-            
-            # Try to extract from path patterns
-            if echo "$file" | grep -q "php8\.[345]"; then
-              VERSION=$(echo "$file" | grep -oE 'php(8\.[345])' | sed 's/php//')
-              # Try to get arch from parent directory
-              PARENT_DIR=$(dirname "$file" | xargs basename)
-              if [ "$PARENT_DIR" != "dist" ] && [ "$PARENT_DIR" != "release" ] && [ "$PARENT_DIR" != "modules" ]; then
-                ARCH_NAME="$PARENT_DIR"
-              fi
-            fi
-            
-            # Try to extract from artifact directory
-            if [ -z "$VERSION" ] || [ -z "$ARCH_NAME" ]; then
-              ARTIFACT_PATH=$(echo "$file" | sed 's|dist/\([^/]*\).*|\1|')
-              if echo "$ARTIFACT_PATH" | grep -q "opa-php"; then
-                VERSION=$(echo "$ARTIFACT_PATH" | grep -oE 'php(8\.[345])' | sed 's/php//')
-                ARCH_NAME=$(echo "$ARTIFACT_PATH" | sed "s/opa-php${VERSION}-//")
-              fi
-            fi
-            
-            if [ -n "$VERSION" ] && [ -n "$ARCH_NAME" ]; then
-              EXT=$(echo "$file" | sed 's/.*\.//')
-              NEW_NAME="opa-php${VERSION}-${ARCH_NAME}.${EXT}"
-              if [ ! -f "dist/release/${NEW_NAME}" ]; then
-                cp "$file" "dist/release/${NEW_NAME}"
-                echo "  Found and copied: ${NEW_NAME} from $file"
+              else
+                echo "✗ Failed to parse: $ARTIFACT_DIR -> version=$VERSION, arch=$ARCH_NAME"
               fi
             else
-              echo "  Warning: Could not determine version/arch for $file"
+              echo "✗ Invalid artifact name format: $ARTIFACT_DIR"
             fi
           done
           
-          # Verify files exist
           echo ""
-          echo "=== Final release files ==="
-          ls -lah dist/release/ || echo "No files found in dist/release/"
+          echo "=== Step 4: Verification ==="
+          echo "Files in dist/release/:"
+          ls -lh dist/release/ || echo "No files found!"
           echo ""
           
-          # Check if we have at least one file
           FILE_COUNT=$(find dist/release -type f \( -name "*.so" -o -name "*.dylib" \) 2>/dev/null | wc -l)
+          echo "Total files: $FILE_COUNT"
+          
           if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "ERROR: No .so or .dylib files found for release!"
             echo ""
-            echo "Debug: Full directory tree:"
-            find dist -type f | sort || true
+            echo "ERROR: No files found in dist/release/"
+            echo ""
+            echo "Debug: Full dist structure:"
+            find dist -type f | sort
             exit 1
           fi
-          echo "✓ Found $FILE_COUNT extension file(s) for release:"
+          
+          echo ""
+          echo "File list:"
           find dist/release -type f \( -name "*.so" -o -name "*.dylib" \) -exec basename {} \; | sort
           
-          # Verify we have files with descriptive names (not just opa.so/opa.dylib)
-          GENERIC_COUNT=$(find dist/release -type f \( -name "opa.so" -o -name "opa.dylib" \) 2>/dev/null | wc -l)
-          DESCRIPTIVE_COUNT=$(find dist/release -type f \( -name "opa-php*.so" -o -name "opa-php*.dylib" \) 2>/dev/null | wc -l)
-          
-          if [ "$GENERIC_COUNT" -gt 0 ] && [ "$DESCRIPTIVE_COUNT" -eq 0 ]; then
+          # Check for expected count
+          if [ "$FILE_COUNT" -lt 12 ]; then
             echo ""
-            echo "WARNING: Only generic files found (opa.so/opa.dylib), no descriptive names!"
-            echo "This suggests the reorganization didn't work correctly."
-          fi
-          
-          # Expected: 12 files total (6 Linux + 6 macOS)
-          # Linux: 2 architectures (amd64, arm64) × 3 PHP versions (8.3, 8.4, 8.5) = 6 files
-          # macOS: 2 architectures (amd64, arm64) × 3 PHP versions (8.3, 8.4, 8.5) = 6 files
-          if [ "$DESCRIPTIVE_COUNT" -lt 12 ]; then
-            echo ""
-            echo "WARNING: Expected 12 files (6 Linux + 6 macOS), found $DESCRIPTIVE_COUNT"
-            echo "This may indicate some build jobs failed or artifacts weren't uploaded correctly."
+            echo "WARNING: Expected 12 files (6 Linux + 6 macOS), found $FILE_COUNT"
+            echo "This may indicate some build jobs failed."
           fi
       
       - name: Extract tag name
@@ -448,14 +351,24 @@ jobs:
           echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
           echo "Creating release for tag: $TAG_NAME"
       
+      - name: List files for release
+        run: |
+          echo "=== Files to be included in release ==="
+          find dist/release -type f \( -name "*.so" -o -name "*.dylib" \) | sort
+          echo ""
+          FILE_COUNT=$(find dist/release -type f \( -name "*.so" -o -name "*.dylib" \) | wc -l)
+          echo "Total files: $FILE_COUNT"
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "ERROR: No files found for release!"
+            exit 1
+          fi
+      
       - name: Create release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: Release ${{ steps.tag.outputs.tag }}
-          files: |
-            dist/release/*.so
-            dist/release/*.dylib
+          files: dist/release/*
           draft: false
           prerelease: false
         env:
