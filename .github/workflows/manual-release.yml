@@ -257,31 +257,33 @@ jobs:
           find dist -type d || echo "No directories found"
           
           # Find and copy all architecture-specific files
-          # Structure: dist/php{version}/{arch}/opa.{so,dylib}
+          # Handle multiple possible structures:
+          # 1. dist/php{version}/{arch}/opa.{so,dylib} (direct from build jobs)
+          # 2. dist/opa-php{version}-{os}-{arch}/{os}-{arch}/opa.{so,dylib} (from downloaded artifacts)
           for version in 8.3 8.4 8.5; do
-            # Look for files in the new multi-arch structure
+            # Look for files in the direct build structure
             if [ -d "dist/php${version}" ]; then
               # Copy all architecture-specific files
               find "dist/php${version}" -type f \( -name "*.so" -o -name "*.dylib" \) -exec cp {} "dist/release/" \;
             fi
             
-            # Also handle old artifact structure for backward compatibility
+            # Handle artifact structure: dist/opa-php{version}-{os}-{arch}/{os}-{arch}/opa.{so,dylib}
+            # Find all artifact directories matching the pattern
+            for artifact_dir in dist/opa-php${version}-*; do
+              if [ -d "$artifact_dir" ]; then
+                # Find and copy all .so and .dylib files recursively
+                find "$artifact_dir" -type f \( -name "*.so" -o -name "*.dylib" \) -exec cp {} "dist/release/" \;
+              fi
+            done
+            
+            # Also handle legacy artifact structure for backward compatibility
             if [ -d "dist/opa-php${version}" ]; then
               # Try different possible paths
               if [ -d "dist/opa-php${version}/dist/php${version}" ]; then
                 find "dist/opa-php${version}/dist/php${version}" -type f \( -name "*.so" -o -name "*.dylib" \) -exec cp {} "dist/release/" \;
-              elif [ -f "dist/opa-php${version}/dist/php${version}/opa.so" ]; then
-                cp "dist/opa-php${version}/dist/php${version}/opa.so" "dist/release/opa-php${version}-linux-amd64.so"
-              elif [ -f "dist/opa-php${version}/opa.so" ]; then
-                cp "dist/opa-php${version}/opa.so" "dist/release/opa-php${version}-linux-amd64.so"
-              elif [ -f "dist/php${version}/opa.so" ]; then
-                cp "dist/php${version}/opa.so" "dist/release/opa-php${version}-linux-amd64.so"
               else
                 # Try to find the file recursively
-                SO_FILE=$(find "dist/opa-php${version}" -type f \( -name "*.so" -o -name "*.dylib" \) 2>/dev/null | head -1)
-                if [ -n "$SO_FILE" ]; then
-                  cp "$SO_FILE" "dist/release/"
-                fi
+                find "dist/opa-php${version}" -type f \( -name "*.so" -o -name "*.dylib" \) -exec cp {} "dist/release/" \;
               fi
             fi
           done
