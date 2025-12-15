@@ -126,7 +126,7 @@ jobs:
         if: steps.code_changes.outputs.should_build == 'true'
         id: artifact_name
         run: |
-          ARCH_SANITIZED=$(echo "${{ matrix.arch }}" | sed 's|/|-|g' | sed 's|v8||g' | tr -d ' ')
+          ARCH_SANITIZED=$(echo "${{ matrix.arch }}" | sed 's|/|-|g' | sed 's|-v8||g' | sed 's|v8||g' | sed 's|-*$||' | tr -d ' ')
           echo "name=opa-php${{ matrix.php_version }}-$ARCH_SANITIZED" >> $GITHUB_OUTPUT
       
       - name: Upload artifact
