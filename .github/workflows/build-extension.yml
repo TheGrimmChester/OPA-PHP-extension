@@ -42,42 +42,46 @@ jobs:
       - name: Check for code changes
         id: code_changes
         run: |
-          # For workflow_dispatch (manual trigger), always build
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual trigger detected. Proceeding with build."
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          # TEMPORARILY DISABLED: Always build to test workflow
+          echo "Temporarily building always to test workflow"
+          echo "should_build=true" >> $GITHUB_OUTPUT
           
-          # For tag pushes, always build
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "Tag push detected. Proceeding with build."
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          # For pull requests, check if .c or .h files changed
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE_SHA="${{ github.event.pull_request.base.sha }}"
-            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-            CHANGED_FILES=$(git diff --name-only ${BASE_SHA}..${HEAD_SHA} -- "*.c" "*.h" | wc -l)
-          else
-            # For push events, check changes in the commit
-            if [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-              CHANGED_FILES=$(git diff --name-only ${{ github.event.before }}..${{ github.event.after }} -- "*.c" "*.h" | wc -l)
-            else
-              # If no before SHA, check current commit
-              CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD -- "*.c" "*.h" | wc -l)
-            fi
-          fi
-          
-          if [ "$CHANGED_FILES" -gt 0 ]; then
-            echo "Code files (.c or .h) have changed. Proceeding with build."
-            echo "should_build=true" >> $GITHUB_OUTPUT
-          else
-            echo "No .c or .h files changed. Skipping build."
-            echo "should_build=false" >> $GITHUB_OUTPUT
-          fi
+          # # For workflow_dispatch (manual trigger), always build
+          # if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          #   echo "Manual trigger detected. Proceeding with build."
+          #   echo "should_build=true" >> $GITHUB_OUTPUT
+          #   exit 0
+          # fi
+          # 
+          # # For tag pushes, always build
+          # if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          #   echo "Tag push detected. Proceeding with build."
+          #   echo "should_build=true" >> $GITHUB_OUTPUT
+          #   exit 0
+          # fi
+          # 
+          # # For pull requests, check if .c or .h files changed
+          # if [ "${{ github.event_name }}" = "pull_request" ]; then
+          #   BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          #   HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          #   CHANGED_FILES=$(git diff --name-only ${BASE_SHA}..${HEAD_SHA} -- "*.c" "*.h" | wc -l)
+          # else
+          #   # For push events, check changes in the commit
+          #   if [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+          #     CHANGED_FILES=$(git diff --name-only ${{ github.event.before }}..${{ github.event.after }} -- "*.c" "*.h" | wc -l)
+          #   else
+          #     # If no before SHA, check current commit
+          #     CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD -- "*.c" "*.h" | wc -l)
+          #   fi
+          # fi
+          # 
+          # if [ "$CHANGED_FILES" -gt 0 ]; then
+          #   echo "Code files (.c or .h) have changed. Proceeding with build."
+          #   echo "should_build=true" >> $GITHUB_OUTPUT
+          # else
+          #   echo "No .c or .h files changed. Skipping build."
+          #   echo "should_build=false" >> $GITHUB_OUTPUT
+          # fi
       
       - name: Set up QEMU
         if: steps.code_changes.outputs.should_build == 'true'
@@ -153,42 +157,46 @@ jobs:
       - name: Check for code changes
         id: code_changes
         run: |
-          # For workflow_dispatch (manual trigger), always build
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual trigger detected. Proceeding with build."
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          # TEMPORARILY DISABLED: Always build to test workflow
+          echo "Temporarily building always to test workflow"
+          echo "should_build=true" >> $GITHUB_OUTPUT
           
-          # For tag pushes, always build
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "Tag push detected. Proceeding with build."
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          # For pull requests, check if .c or .h files changed
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE_SHA="${{ github.event.pull_request.base.sha }}"
-            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-            CHANGED_FILES=$(git diff --name-only ${BASE_SHA}..${HEAD_SHA} -- "*.c" "*.h" | wc -l)
-          else
-            # For push events, check changes in the commit
-            if [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-              CHANGED_FILES=$(git diff --name-only ${{ github.event.before }}..${{ github.event.after }} -- "*.c" "*.h" | wc -l)
-            else
-              # If no before SHA, check current commit
-              CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD -- "*.c" "*.h" | wc -l)
-            fi
-          fi
-          
-          if [ "$CHANGED_FILES" -gt 0 ]; then
-            echo "Code files (.c or .h) have changed. Proceeding with build."
-            echo "should_build=true" >> $GITHUB_OUTPUT
-          else
-            echo "No .c or .h files changed. Skipping build."
-            echo "should_build=false" >> $GITHUB_OUTPUT
-          fi
+          # # For workflow_dispatch (manual trigger), always build
+          # if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          #   echo "Manual trigger detected. Proceeding with build."
+          #   echo "should_build=true" >> $GITHUB_OUTPUT
+          #   exit 0
+          # fi
+          # 
+          # # For tag pushes, always build
+          # if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          #   echo "Tag push detected. Proceeding with build."
+          #   echo "should_build=true" >> $GITHUB_OUTPUT
+          #   exit 0
+          # fi
+          # 
+          # # For pull requests, check if .c or .h files changed
+          # if [ "${{ github.event_name }}" = "pull_request" ]; then
+          #   BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          #   HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          #   CHANGED_FILES=$(git diff --name-only ${BASE_SHA}..${HEAD_SHA} -- "*.c" "*.h" | wc -l)
+          # else
+          #   # For push events, check changes in the commit
+          #   if [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+          #     CHANGED_FILES=$(git diff --name-only ${{ github.event.before }}..${{ github.event.after }} -- "*.c" "*.h" | wc -l)
+          #   else
+          #     # If no before SHA, check current commit
+          #     CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD -- "*.c" "*.h" | wc -l)
+          #   fi
+          # fi
+          # 
+          # if [ "$CHANGED_FILES" -gt 0 ]; then
+          #   echo "Code files (.c or .h) have changed. Proceeding with build."
+          #   echo "should_build=true" >> $GITHUB_OUTPUT
+          # else
+          #   echo "No .c or .h files changed. Skipping build."
+          #   echo "should_build=false" >> $GITHUB_OUTPUT
+          # fi
       
       - name: Install PHP and dependencies
         if: steps.code_changes.outputs.should_build == 'true'
