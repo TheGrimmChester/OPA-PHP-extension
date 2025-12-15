@@ -431,14 +431,28 @@ jobs:
             echo "This suggests the reorganization didn't work correctly."
           fi
           
-          if [ "$DESCRIPTIVE_COUNT" -lt 6 ]; then
+          # Expected: 12 files total (6 Linux + 6 macOS)
+          # Linux: 2 architectures (amd64, arm64) × 3 PHP versions (8.3, 8.4, 8.5) = 6 files
+          # macOS: 2 architectures (amd64, arm64) × 3 PHP versions (8.3, 8.4, 8.5) = 6 files
+          if [ "$DESCRIPTIVE_COUNT" -lt 12 ]; then
             echo ""
-            echo "WARNING: Expected at least 6 files (2 Linux + 2 macOS for 3 PHP versions), found $DESCRIPTIVE_COUNT"
+            echo "WARNING: Expected 12 files (6 Linux + 6 macOS), found $DESCRIPTIVE_COUNT"
+            echo "This may indicate some build jobs failed or artifacts weren't uploaded correctly."
           fi
+      
+      - name: Extract tag name
+        id: tag
+        run: |
+          # Extract tag name from ref (e.g., refs/tags/v1.2.3 -> v1.2.3)
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "Creating release for tag: $TAG_NAME"
       
       - name: Create release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Release ${{ steps.tag.outputs.tag }}
           files: |
             dist/release/*.so
             dist/release/*.dylib
