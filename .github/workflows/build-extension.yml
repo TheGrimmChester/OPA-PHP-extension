@@ -126,11 +126,18 @@ jobs:
           # Clean up
           docker rm $CONTAINER_ID
       
+      - name: Set artifact name
+        if: steps.code_changes.outputs.should_build == 'true'
+        id: artifact_name
+        run: |
+          ARCH_SANITIZED=$(echo "${{ matrix.arch }}" | sed 's|/|-|g' | sed 's|v8||g' | tr -d ' ')
+          echo "name=opa-php${{ matrix.php_version }}-$ARCH_SANITIZED" >> $GITHUB_OUTPUT
+      
       - name: Upload artifact
         if: steps.code_changes.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: opa-php${{ matrix.php_version }}-${{ matrix.arch }}
+          name: ${{ steps.artifact_name.outputs.name }}
           path: dist/php${{ matrix.php_version }}/*
           retention-days: 30
   
@@ -220,11 +227,18 @@ jobs:
           cp modules/opa.dylib dist/php${{ matrix.php_version }}/$ARCH_NAME/opa.dylib || \
           cp modules/opa.so dist/php${{ matrix.php_version }}/$ARCH_NAME/opa.dylib
       
+      - name: Set artifact name
+        if: steps.code_changes.outputs.should_build == 'true'
+        id: artifact_name
+        run: |
+          ARCH_SANITIZED=$(echo "${{ matrix.arch }}" | sed 's|/|-|g')
+          echo "name=opa-php${{ matrix.php_version }}-$ARCH_SANITIZED" >> $GITHUB_OUTPUT
+      
       - name: Upload artifact
         if: steps.code_changes.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: opa-php${{ matrix.php_version }}-${{ matrix.arch }}
+          name: ${{ steps.artifact_name.outputs.name }}
           path: dist/php${{ matrix.php_version }}/*
           retention-days: 30
   
