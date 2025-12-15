@@ -8,11 +8,12 @@ on:
       - 'v*'
 
 jobs:
-  build:
+  build-linux:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         php_version: ['8.3', '8.4', '8.5']
+        arch: ['linux/amd64', 'linux/arm64/v8']
         include:
           - php_version: '8.3'
             php_package: 'php8.3-dev'
@@ -27,11 +28,77 @@ jobs:
         with:
           fetch-depth: 0
       
-      - name: Set up PHP
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build Docker image for ${{ matrix.arch }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.arch }}
+          build-args: |
+            PHP_VERSION=${{ matrix.php_version }}
+          tags: opa-php-${{ matrix.php_version }}-${{ matrix.arch }}:local
+          outputs: type=docker,dest=/tmp/opa-php-${{ matrix.php_version }}-${{ matrix.arch }}.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Extract .so file from container
         run: |
-          sudo add-apt-repository ppa:ondrej/php -y
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.php_package }} liblz4-dev build-essential autoconf libtool pkg-config
+          # Load the image
+          docker load -i /tmp/opa-php-${{ matrix.php_version }}-${{ matrix.arch }}.tar
+          
+          # Create architecture-specific directory name
+          ARCH_NAME=$(echo "${{ matrix.arch }}" | sed 's|/v8||g' | sed 's|/|-|g' | tr -d ' ')
+          
+          # Create output directory
+          mkdir -p dist/php${{ matrix.php_version }}/$ARCH_NAME
+          
+          # Create a temporary container and extract the file
+          CONTAINER_ID=$(docker create opa-php-${{ matrix.php_version }}-${{ matrix.arch }}:local)
+          
+          # Copy from build directory (the .so file is built there before being copied to extension dir)
+          docker cp $CONTAINER_ID:/usr/src/opa/modules/opa.so dist/php${{ matrix.php_version }}/$ARCH_NAME/opa.so
+          
+          # Clean up
+          docker rm $CONTAINER_ID
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opa-php${{ matrix.php_version }}-${{ matrix.arch }}
+          path: dist/php${{ matrix.php_version }}/*
+          retention-days: 30
+  
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        php_version: ['8.3', '8.4', '8.5']
+        arch: ['darwin/amd64', 'darwin/arm64']
+        include:
+          - php_version: '8.3'
+            php_brew: 'php@8.3'
+          - php_version: '8.4'
+            php_brew: 'php@8.4'
+          - php_version: '8.5'
+            php_brew: 'php@8.5'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Install PHP and dependencies
+        run: |
+          brew install ${{ matrix.php_brew }} autoconf libtool pkg-config lz4
+          brew link --force --overwrite ${{ matrix.php_brew }}
+          echo "$(brew --prefix ${{ matrix.php_brew }})/bin" >> $GITHUB_PATH
       
       - name: Build extension
         run: |
@@ -41,13 +108,15 @@ jobs:
       
       - name: Create release directory
         run: |
-          mkdir -p dist/php${{ matrix.php_version }}
-          cp modules/opa.so dist/php${{ matrix.php_version }}/opa.so
+          ARCH_NAME=$(echo "${{ matrix.arch }}" | sed 's/\//-/g')
+          mkdir -p dist/php${{ matrix.php_version }}/$ARCH_NAME
+          cp modules/opa.dylib dist/php${{ matrix.php_version }}/$ARCH_NAME/opa.dylib || \
+          cp modules/opa.so dist/php${{ matrix.php_version }}/$ARCH_NAME/opa.dylib
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: opa-php${{ matrix.php_version }}
-          path: dist/php${{ matrix.php_version }}/opa.so
+          name: opa-php${{ matrix.php_version }}-${{ matrix.arch }}
+          path: dist/php${{ matrix.php_version }}/*
           retention-days: 30
 

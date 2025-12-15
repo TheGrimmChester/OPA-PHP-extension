@@ -14,12 +14,13 @@ on:
         type: boolean
 
 jobs:
-  build:
+  build-linux:
     if: inputs.build_extensions == true
     runs-on: ubuntu-latest
     strategy:
       matrix:
         php_version: ['8.3', '8.4', '8.5']
+        arch: ['linux/amd64', 'linux/arm64/v8']
         include:
           - php_version: '8.3'
             php_package: 'php8.3-dev'
@@ -34,11 +35,78 @@ jobs:
         with:
           fetch-depth: 0
       
-      - name: Set up PHP
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build Docker image for ${{ matrix.arch }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.arch }}
+          build-args: |
+            PHP_VERSION=${{ matrix.php_version }}
+          tags: opa-php-${{ matrix.php_version }}-${{ matrix.arch }}:local
+          outputs: type=docker,dest=/tmp/opa-php-${{ matrix.php_version }}-${{ matrix.arch }}.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Extract .so file from container
         run: |
-          sudo add-apt-repository ppa:ondrej/php -y
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.php_package }} liblz4-dev build-essential autoconf libtool pkg-config
+          # Load the image
+          docker load -i /tmp/opa-php-${{ matrix.php_version }}-${{ matrix.arch }}.tar
+          
+          # Create architecture-specific directory name
+          ARCH_NAME=$(echo "${{ matrix.arch }}" | sed 's|/v8||g' | sed 's|/|-|g' | tr -d ' ')
+          
+          # Create output directory
+          mkdir -p dist/php${{ matrix.php_version }}/$ARCH_NAME
+          
+          # Create a temporary container and extract the file
+          CONTAINER_ID=$(docker create opa-php-${{ matrix.php_version }}-${{ matrix.arch }}:local)
+          
+          # Copy from build directory
+          docker cp $CONTAINER_ID:/usr/src/opa/modules/opa.so dist/php${{ matrix.php_version }}/$ARCH_NAME/opa.so
+          
+          # Clean up
+          docker rm $CONTAINER_ID
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opa-php${{ matrix.php_version }}-${{ matrix.arch }}
+          path: dist/php${{ matrix.php_version }}/*
+          retention-days: 30
+  
+  build-macos:
+    if: inputs.build_extensions == true
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        php_version: ['8.3', '8.4', '8.5']
+        arch: ['darwin/amd64', 'darwin/arm64']
+        include:
+          - php_version: '8.3'
+            php_brew: 'php@8.3'
+          - php_version: '8.4'
+            php_brew: 'php@8.4'
+          - php_version: '8.5'
+            php_brew: 'php@8.5'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Install PHP and dependencies
+        run: |
+          brew install ${{ matrix.php_brew }} autoconf libtool pkg-config lz4
+          brew link --force --overwrite ${{ matrix.php_brew }}
+          echo "$(brew --prefix ${{ matrix.php_brew }})/bin" >> $GITHUB_PATH
       
       - name: Build extension
         run: |
@@ -48,14 +116,16 @@ jobs:
       
       - name: Create release directory
         run: |
-          mkdir -p dist/php${{ matrix.php_version }}
-          cp modules/opa.so dist/php${{ matrix.php_version }}/opa.so
+          ARCH_NAME=$(echo "${{ matrix.arch }}" | sed 's|/|-|g')
+          mkdir -p dist/php${{ matrix.php_version }}/$ARCH_NAME
+          cp modules/opa.dylib dist/php${{ matrix.php_version }}/$ARCH_NAME/opa.dylib || \
+          cp modules/opa.so dist/php${{ matrix.php_version }}/$ARCH_NAME/opa.dylib
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: opa-php${{ matrix.php_version }}
-          path: dist/php${{ matrix.php_version }}/opa.so
+          name: opa-php${{ matrix.php_version }}-${{ matrix.arch }}
+          path: dist/php${{ matrix.php_version }}/*
           retention-days: 30
 
   download-latest-artifacts:
@@ -134,8 +204,8 @@ jobs:
           echo "All artifacts downloaded successfully";
 
   release:
-    needs: [build, download-latest-artifacts]
-    if: always() && (needs.build.result == 'success' || needs.download-latest-artifacts.result == 'success')
+    needs: [build-linux, build-macos, download-latest-artifacts]
+    if: always() && ((needs.build-linux.result == 'success' || needs.build-macos.result == 'success') || needs.download-latest-artifacts.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -148,7 +218,7 @@ jobs:
           fetch-depth: 0
       
       - name: Download artifacts (if built in this workflow)
-        if: needs.build.result == 'success'
+        if: needs.build-linux.result == 'success' || needs.build-macos.result == 'success'
         uses: actions/download-artifact@v4
         with:
           path: dist
@@ -171,44 +241,51 @@ jobs:
           mkdir -p dist/release
           # Debug: show structure
           echo "Artifact structure:"
-          find dist -type f -name "*.so" || echo "No .so files found"
+          find dist -type f \( -name "*.so" -o -name "*.dylib" \) || echo "No .so or .dylib files found"
           find dist -type d || echo "No directories found"
-          # Find and copy .so files from artifact subdirectories (handle nested paths)
-          # Rename to include PHP version to avoid conflicts
+          
+          # Find and copy all architecture-specific files
+          # Structure: dist/php{version}/{arch}/opa.{so,dylib}
           for version in 8.3 8.4 8.5; do
-            FOUND=false
-            # Try different possible paths
-            if [ -f "dist/opa-php${version}/dist/php${version}/opa.so" ]; then
-              cp "dist/opa-php${version}/dist/php${version}/opa.so" "dist/release/opa-php${version}.so"
-              FOUND=true
-            elif [ -f "dist/opa-php${version}/opa.so" ]; then
-              cp "dist/opa-php${version}/opa.so" "dist/release/opa-php${version}.so"
-              FOUND=true
-            elif [ -f "dist/php${version}/opa.so" ]; then
-              cp "dist/php${version}/opa.so" "dist/release/opa-php${version}.so"
-              FOUND=true
-            else
-              # Try to find the file recursively
-              SO_FILE=$(find "dist/opa-php${version}" -type f -name "*.so" 2>/dev/null | head -1)
-              if [ -n "$SO_FILE" ]; then
-                cp "$SO_FILE" "dist/release/opa-php${version}.so"
-                FOUND=true
+            # Look for files in the new multi-arch structure
+            if [ -d "dist/php${version}" ]; then
+              # Copy all architecture-specific files
+              find "dist/php${version}" -type f \( -name "*.so" -o -name "*.dylib" \) -exec cp {} "dist/release/" \;
+            fi
+            
+            # Also handle old artifact structure for backward compatibility
+            if [ -d "dist/opa-php${version}" ]; then
+              # Try different possible paths
+              if [ -d "dist/opa-php${version}/dist/php${version}" ]; then
+                find "dist/opa-php${version}/dist/php${version}" -type f \( -name "*.so" -o -name "*.dylib" \) -exec cp {} "dist/release/" \;
+              elif [ -f "dist/opa-php${version}/dist/php${version}/opa.so" ]; then
+                cp "dist/opa-php${version}/dist/php${version}/opa.so" "dist/release/opa-php${version}-linux-amd64.so"
+              elif [ -f "dist/opa-php${version}/opa.so" ]; then
+                cp "dist/opa-php${version}/opa.so" "dist/release/opa-php${version}-linux-amd64.so"
+              elif [ -f "dist/php${version}/opa.so" ]; then
+                cp "dist/php${version}/opa.so" "dist/release/opa-php${version}-linux-amd64.so"
+              else
+                # Try to find the file recursively
+                SO_FILE=$(find "dist/opa-php${version}" -type f \( -name "*.so" -o -name "*.dylib" \) 2>/dev/null | head -1)
+                if [ -n "$SO_FILE" ]; then
+                  cp "$SO_FILE" "dist/release/"
+                fi
               fi
             fi
-            if [ "$FOUND" = false ]; then
-              echo "Warning: Could not find opa.so for PHP ${version}"
-            fi
           done
+          
           # Verify files exist
           echo "Final release files:"
-          ls -la dist/release/*.so || echo "No .so files found in dist/release/"
+          ls -la dist/release/ || echo "No files found in dist/release/"
           # Check if we have at least one file
-          if [ ! -f "dist/release/opa-php8.3.so" ] && [ ! -f "dist/release/opa-php8.4.so" ] && [ ! -f "dist/release/opa-php8.5.so" ]; then
-            echo "Error: No .so files found for release!"
+          FILE_COUNT=$(find dist/release -type f \( -name "*.so" -o -name "*.dylib" \) 2>/dev/null | wc -l)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "Error: No .so or .dylib files found for release!"
             exit 1
           fi
+          echo "Found $FILE_COUNT extension file(s) for release"
           # Clean up artifact directories
-          rm -rf dist/opa-php8.3 dist/opa-php8.4 dist/opa-php8.5 dist/php8.3 dist/php8.4 dist/php8.5
+          rm -rf dist/opa-php* dist/php8.*
       
       - name: Generate version tag
         id: version
@@ -287,11 +364,16 @@ jobs:
           
           DESCRIPTION="${DESCRIPTION}"$'\n\n'
           DESCRIPTION="${DESCRIPTION}### Built Extensions"$'\n'
-          DESCRIPTION="${DESCRIPTION}- **PHP 8.3**: \`opa-php8.3.so\`"$'\n'
-          DESCRIPTION="${DESCRIPTION}- **PHP 8.4**: \`opa-php8.4.so\`"$'\n'
-          DESCRIPTION="${DESCRIPTION}- **PHP 8.5**: \`opa-php8.5.so\`"$'\n\n'
+          DESCRIPTION="${DESCRIPTION}This release includes extensions for multiple architectures:"$'\n\n'
+          DESCRIPTION="${DESCRIPTION}**Linux:**"$'\n'
+          DESCRIPTION="${DESCRIPTION}- \`linux-amd64\` (x86_64)"$'\n'
+          DESCRIPTION="${DESCRIPTION}- \`linux-arm64\` (ARM64)"$'\n\n'
+          DESCRIPTION="${DESCRIPTION}**macOS:**"$'\n'
+          DESCRIPTION="${DESCRIPTION}- \`darwin-amd64\` (Intel Macs)"$'\n'
+          DESCRIPTION="${DESCRIPTION}- \`darwin-arm64\` (Apple Silicon)"$'\n\n'
+          DESCRIPTION="${DESCRIPTION}Extensions are available for PHP 8.3, 8.4, and 8.5."$'\n\n'
           DESCRIPTION="${DESCRIPTION}### Installation"$'\n'
-          DESCRIPTION="${DESCRIPTION}Download the appropriate extension file for your PHP version from the assets below."
+          DESCRIPTION="${DESCRIPTION}Download the appropriate extension file for your PHP version and architecture from the assets below."
           
           echo "description<<EOF" >> $GITHUB_OUTPUT
           echo "$DESCRIPTION" >> $GITHUB_OUTPUT
@@ -305,6 +387,7 @@ jobs:
           body: ${{ steps.release_desc.outputs.description }}
           files: |
             dist/release/*.so
+            dist/release/*.dylib
           draft: false
           prerelease: false
           generate_release_notes: false
