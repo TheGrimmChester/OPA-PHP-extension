@@ -431,6 +431,37 @@ static size_t json_escape_and_write(char *dest, size_t dest_size, const char *st
     return pos;
 }
 
+// Helper: Extract real client IP from $_SERVER, handling proxy headers
+// Priority: HTTP_X_FORWARDED_FOR > HTTP_X_REAL_IP > REMOTE_ADDR
+// Returns pointer to zval containing the IP string, or NULL if not found
+// Note: Caller must handle X-Forwarded-For extraction (first IP before comma)
+static zval* get_real_client_ip(zval *server_zv) {
+    if (!server_zv || Z_TYPE_P(server_zv) != IS_ARRAY) {
+        return NULL;
+    }
+    
+    // Try HTTP_X_FORWARDED_FOR first (contains original client IP when behind proxy)
+    // Format: "client_ip, proxy1, proxy2" - caller will extract first IP
+    zval *zv = zend_hash_str_find(Z_ARRVAL_P(server_zv), "HTTP_X_FORWARDED_FOR", sizeof("HTTP_X_FORWARDED_FOR")-1);
+    if (zv && Z_TYPE_P(zv) == IS_STRING && Z_STRLEN_P(zv) > 0 && Z_STRLEN_P(zv) < 200) {
+        return zv;
+    }
+    
+    // Try HTTP_X_REAL_IP (set by nginx proxy)
+    zv = zend_hash_str_find(Z_ARRVAL_P(server_zv), "HTTP_X_REAL_IP", sizeof("HTTP_X_REAL_IP")-1);
+    if (zv && Z_TYPE_P(zv) == IS_STRING && Z_STRLEN_P(zv) > 0 && Z_STRLEN_P(zv) < 50) {
+        return zv;
+    }
+    
+    // Fallback to REMOTE_ADDR (direct connection or proxy IP if no headers)
+    zv = zend_hash_str_find(Z_ARRVAL_P(server_zv), "REMOTE_ADDR", sizeof("REMOTE_ADDR")-1);
+    if (zv && Z_TYPE_P(zv) == IS_STRING && Z_STRLEN_P(zv) > 0 && Z_STRLEN_P(zv) < 50) {
+        return zv;
+    }
+    
+    return NULL;
+}
+
 // Helper: Add server field to JSON buffer with proper escaping and reallocation
 // Returns new position in buffer, updates *result and *buf_size if reallocation occurs
 static int add_server_field_json(char **result, size_t *buf_size, int pos, 
@@ -533,7 +564,8 @@ char* serialize_http_request_json_universal(void) {
         if (num_elements > 0) {
             zval *method_zv = zend_hash_str_find(Z_ARRVAL_P(server), "REQUEST_METHOD", sizeof("REQUEST_METHOD")-1);
             zval *query_zv = zend_hash_str_find(Z_ARRVAL_P(server), "QUERY_STRING", sizeof("QUERY_STRING")-1);
-            zval *remote_zv = zend_hash_str_find(Z_ARRVAL_P(server), "REMOTE_ADDR", sizeof("REMOTE_ADDR")-1);
+            // Get real client IP (handles proxy headers) - will extract IP from zval later
+            zval *remote_zv = get_real_client_ip(server);
             
             // For Symfony and frameworks with front controllers, prefer PATH_INFO over REQUEST_URI
             // Store both: uri (cleaned route) and request_uri (original full path)
@@ -656,6 +688,47 @@ char* serialize_http_request_json_universal(void) {
                     return strdup("{\"method\":\"GET\",\"uri\":\"/\"}");
                 }
                 
+                // Extract real IP from remote_zv (handles X-Forwarded-For)
+                const char *ip_str = "unknown";
+                size_t ip_len = 0;
+                size_t start_offset = 0;
+                if (remote_zv && Z_TYPE_P(remote_zv) == IS_STRING && Z_STRLEN_P(remote_zv) > 0) {
+                    ip_str = Z_STRVAL_P(remote_zv);
+                    ip_len = Z_STRLEN_P(remote_zv);
+                    
+                    // If this is X-Forwarded-For, extract first IP (before comma)
+                    zval *xff_zv = zend_hash_str_find(Z_ARRVAL_P(server), "HTTP_X_FORWARDED_FOR", sizeof("HTTP_X_FORWARDED_FOR")-1);
+                    if (xff_zv && remote_zv == xff_zv) {
+                        // Find first comma
+                        size_t first_comma = ip_len;
+                        for (size_t i = 0; i < ip_len; i++) {
+                            if (ip_str[i] == ',') {
+                                first_comma = i;
+                                break;
+                            }
+                        }
+                        ip_len = first_comma;
+                        
+                        // Trim leading whitespace
+                        while (ip_len > 0 && (ip_str[start_offset] == ' ' || ip_str[start_offset] == '\t')) {
+                            start_offset++;
+                            ip_len--;
+                        }
+                        // Trim trailing whitespace
+                        while (ip_len > 0 && (ip_str[start_offset + ip_len - 1] == ' ' || ip_str[start_offset + ip_len - 1] == '\t')) {
+                            ip_len--;
+                        }
+                    }
+                    
+                    // Create a null-terminated string for snprintf
+                    static char ip_buf[50];
+                    if (ip_len > 0 && ip_len < sizeof(ip_buf) - 1) {
+                        memcpy(ip_buf, ip_str + start_offset, ip_len);
+                        ip_buf[ip_len] = '\0';
+                        ip_str = ip_buf;
+                    }
+                }
+                
                 int pos = snprintf(buf, buf_size,
                     "{\"method\":\"%s\",\"uri\":\"%s\","
                      "\"query_string\":\"%s\",\"remote_addr\":\"%s\","
@@ -663,7 +736,7 @@ char* serialize_http_request_json_universal(void) {
                     method,
                     uri,
                     query,
-                    remote_zv && Z_TYPE_P(remote_zv) == IS_STRING ? Z_STRVAL_P(remote_zv) : "unknown");
+                    ip_str);
                 
                 // Add original request_uri if available (for ClickHouse storage)
                 if (request_uri_original && strlen(request_uri_original) > 0) {
@@ -949,15 +1022,41 @@ char* serialize_http_request_json(zval *server) {
         }
     }
     
-    // Try to get IP from $_SERVER if available
-    if (server_zv && Z_TYPE_P(server_zv) == IS_ARRAY) {
-        zval *zv = zend_hash_str_find(Z_ARRVAL_P(server_zv), "REMOTE_ADDR", sizeof("REMOTE_ADDR")-1);
-        if (!zv || Z_TYPE_P(zv) != IS_STRING) {
-            zv = zend_hash_str_find(Z_ARRVAL_P(server_zv), "HTTP_X_FORWARDED_FOR", sizeof("HTTP_X_FORWARDED_FOR")-1);
+    // Try to get real client IP from $_SERVER (handles proxy headers)
+    zval *ip_zv = get_real_client_ip(server_zv);
+    if (ip_zv && Z_TYPE_P(ip_zv) == IS_STRING && Z_STRLEN_P(ip_zv) > 0) {
+        const char *ip_str = Z_STRVAL_P(ip_zv);
+        size_t ip_len = Z_STRLEN_P(ip_zv);
+        size_t start_offset = 0;
+        
+        // If this is X-Forwarded-For, extract first IP (before comma)
+        // Check by looking for comma in the string (X-Forwarded-For format: "ip1, ip2, ...")
+        zval *xff_zv = zend_hash_str_find(Z_ARRVAL_P(server_zv), "HTTP_X_FORWARDED_FOR", sizeof("HTTP_X_FORWARDED_FOR")-1);
+        if (xff_zv && ip_zv == xff_zv) {
+            // Find first comma
+            size_t first_comma = ip_len;
+            for (size_t i = 0; i < ip_len; i++) {
+                if (ip_str[i] == ',') {
+                    first_comma = i;
+                    break;
+                }
+            }
+            ip_len = first_comma;
         }
-        if (zv && Z_TYPE_P(zv) == IS_STRING && Z_STRLEN_P(zv) > 0 && Z_STRLEN_P(zv) < 50) {
+        
+        // Trim leading whitespace
+        while (ip_len > 0 && (ip_str[start_offset] == ' ' || ip_str[start_offset] == '\t')) {
+            start_offset++;
+            ip_len--;
+        }
+        // Trim trailing whitespace
+        while (ip_len > 0 && (ip_str[start_offset + ip_len - 1] == ' ' || ip_str[start_offset + ip_len - 1] == '\t')) {
+            ip_len--;
+        }
+        
+        if (ip_len > 0 && ip_len < 50) {
             if (pos + 100 < buf_size) {
-                pos += snprintf(result + pos, buf_size - pos, ",\"ip\":\"%.*s\"", (int)Z_STRLEN_P(zv), Z_STRVAL_P(zv));
+                pos += snprintf(result + pos, buf_size - pos, ",\"ip\":\"%.*s\"", (int)ip_len, ip_str + start_offset);
             }
         }
     }
