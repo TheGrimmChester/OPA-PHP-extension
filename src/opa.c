@@ -1714,6 +1714,45 @@ static int is_curl_call(zend_execute_data *execute_data, zval **curl_handle_out)
     return 0;
 }
 
+// Helper to check if a zval is specifically a CurlHandle (not CurlMultiHandle or CurlShareHandle)
+// This is used to validate handles before calling curl_getinfo() which only accepts CurlHandle
+static int is_curl_handle(zval *handle) {
+    if (!handle) {
+        return 0;
+    }
+    
+    if (Z_TYPE_P(handle) == IS_OBJECT) {
+        zend_class_entry *ce = Z_OBJCE_P(handle);
+        if (!ce) {
+            return 0;
+        }
+        
+        // 1) Pointer match if we resolved it in RINIT
+        if (curl_ce && ce == curl_ce) {
+            return 1;
+        }
+        
+        // 2) Name-based match (robust on 8.0+)
+        if (ce->name) {
+            size_t len = ZSTR_LEN(ce->name);
+            const char *cn = ZSTR_VAL(ce->name);
+            
+            // Only match CurlHandle, not CurlMultiHandle or CurlShareHandle
+            if (len == sizeof("CurlHandle")-1 && 
+                memcmp(cn, "CurlHandle", sizeof("CurlHandle")-1) == 0) {
+                return 1;
+            }
+        }
+    }
+    
+    // For PHP < 8.0, resources are treated as CurlHandle
+    if (Z_TYPE_P(handle) == IS_RESOURCE) {
+        return 1;
+    }
+    
+    return 0;
+}
+
 // Check if function is a cURL function
 int is_curl_function(zend_execute_data *execute_data) {
     if (!execute_data || !execute_data->func) {
@@ -2609,6 +2648,7 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         curl_bytes_received = curl_bytes_received_after - curl_bytes_received_before;
         
         // Try to get status code, headers, and other details from curl handle
+        // Declare variables outside if block so they're accessible later
         char *request_headers_str = NULL;
         char *response_headers_str = NULL;
         char *uri_path = NULL;
@@ -2622,6 +2662,10 @@ void opa_execute_ex(zend_execute_data *execute_data) {
         // Use curl_handle_after obtained from function name detection
         if (curl_handle_after && (Z_TYPE_P(curl_handle_after) == IS_RESOURCE || Z_TYPE_P(curl_handle_after) == IS_OBJECT)) {
             zval *curl_handle = curl_handle_after;
+            
+            // CRITICAL: Only call curl_getinfo() on CurlHandle, not CurlMultiHandle or CurlShareHandle
+            // curl_getinfo() only accepts CurlHandle, calling it on CurlMultiHandle causes fatal TypeError
+            if (is_curl_handle(curl_handle)) {
                 // Get full curl_getinfo array with all details
                 zval curl_getinfo_func, curl_getinfo_args[1], curl_getinfo_ret;
                 ZVAL_UNDEF(&curl_getinfo_func);
@@ -2741,32 +2785,33 @@ void opa_execute_ex(zend_execute_data *execute_data) {
                 zval_dtor(&curl_getinfo_func);
                 zval_dtor(&curl_getinfo_args[0]);
                 
-            // Get error if any
-            zval curl_error_func, curl_error_args[1], curl_error_ret;
-            ZVAL_UNDEF(&curl_error_func);
-            ZVAL_UNDEF(&curl_error_args[0]);
-            ZVAL_UNDEF(&curl_error_ret);
-            
-            ZVAL_STRING(&curl_error_func, "curl_error");
-            ZVAL_COPY(&curl_error_args[0], curl_handle);
-            
-            if (zend_fcall_info_init(&curl_error_func, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
-                fci.size = sizeof(fci);
-                ZVAL_UNDEF(&fci.function_name);
-                fci.object = NULL;
-                fci.param_count = 1;
-                fci.params = curl_error_args;
-                fci.retval = &curl_error_ret;
+                // Get error if any (curl_error() also only accepts CurlHandle)
+                zval curl_error_func, curl_error_args[1], curl_error_ret;
+                ZVAL_UNDEF(&curl_error_func);
+                ZVAL_UNDEF(&curl_error_args[0]);
+                ZVAL_UNDEF(&curl_error_ret);
                 
-                if (zend_call_function(&fci, &fcc) == SUCCESS) {
-                    if (Z_TYPE(curl_error_ret) == IS_STRING && Z_STRLEN(curl_error_ret) > 0) {
-                        error = estrdup(Z_STRVAL(curl_error_ret));
+                ZVAL_STRING(&curl_error_func, "curl_error");
+                ZVAL_COPY(&curl_error_args[0], curl_handle);
+                
+                if (zend_fcall_info_init(&curl_error_func, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
+                    fci.size = sizeof(fci);
+                    ZVAL_UNDEF(&fci.function_name);
+                    fci.object = NULL;
+                    fci.param_count = 1;
+                    fci.params = curl_error_args;
+                    fci.retval = &curl_error_ret;
+                    
+                    if (zend_call_function(&fci, &fcc) == SUCCESS) {
+                        if (Z_TYPE(curl_error_ret) == IS_STRING && Z_STRLEN(curl_error_ret) > 0) {
+                            error = estrdup(Z_STRVAL(curl_error_ret));
+                        }
+                        zval_dtor(&curl_error_ret);
                     }
-                    zval_dtor(&curl_error_ret);
                 }
+                zval_dtor(&curl_error_func);
+                zval_dtor(&curl_error_args[0]);
             }
-            zval_dtor(&curl_error_func);
-            zval_dtor(&curl_error_args[0]);
         }
         
         // Log HTTP response code for cURL requests
@@ -2956,14 +3001,17 @@ static void zif_opa_curl_exec(zend_execute_data *execute_data, zval *return_valu
     double total_time = 0.0;
     size_t response_size = bytes_received;
     
-    // Call curl_getinfo to get all details
-    zval curl_getinfo_func, curl_getinfo_args[1], curl_getinfo_ret;
-    ZVAL_UNDEF(&curl_getinfo_func);
-    ZVAL_UNDEF(&curl_getinfo_args[0]);
-    ZVAL_UNDEF(&curl_getinfo_ret);
-    
-    ZVAL_STRING(&curl_getinfo_func, "curl_getinfo");
-    ZVAL_COPY(&curl_getinfo_args[0], curl_handle);
+    // CRITICAL: Only call curl_getinfo() on CurlHandle, not CurlMultiHandle or CurlShareHandle
+    // curl_getinfo() only accepts CurlHandle, calling it on CurlMultiHandle causes fatal TypeError
+    if (is_curl_handle(curl_handle)) {
+        // Call curl_getinfo to get all details
+        zval curl_getinfo_func, curl_getinfo_args[1], curl_getinfo_ret;
+        ZVAL_UNDEF(&curl_getinfo_func);
+        ZVAL_UNDEF(&curl_getinfo_args[0]);
+        ZVAL_UNDEF(&curl_getinfo_ret);
+        
+        ZVAL_STRING(&curl_getinfo_func, "curl_getinfo");
+        ZVAL_COPY(&curl_getinfo_args[0], curl_handle);
     
     zend_fcall_info fci;
     zend_fcall_info_cache fcc;
@@ -3078,36 +3126,37 @@ static void zif_opa_curl_exec(zend_execute_data *execute_data, zval *return_valu
             }
             zval_dtor(&curl_getinfo_ret);
         }
-    }
-    zval_dtor(&curl_getinfo_func);
-    zval_dtor(&curl_getinfo_args[0]);
-    
-    // Get error if any
-    zval curl_error_func, curl_error_args[1], curl_error_ret;
-    ZVAL_UNDEF(&curl_error_func);
-    ZVAL_UNDEF(&curl_error_args[0]);
-    ZVAL_UNDEF(&curl_error_ret);
-    
-    ZVAL_STRING(&curl_error_func, "curl_error");
-    ZVAL_COPY(&curl_error_args[0], curl_handle);
-    
-    if (zend_fcall_info_init(&curl_error_func, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
-        fci.size = sizeof(fci);
-        ZVAL_UNDEF(&fci.function_name);
-        fci.object = NULL;
-        fci.param_count = 1;
-        fci.params = curl_error_args;
-        fci.retval = &curl_error_ret;
+        zval_dtor(&curl_getinfo_func);
+        zval_dtor(&curl_getinfo_args[0]);
         
-        if (zend_call_function(&fci, &fcc) == SUCCESS) {
-            if (Z_TYPE(curl_error_ret) == IS_STRING && Z_STRLEN(curl_error_ret) > 0) {
-                error = estrdup(Z_STRVAL(curl_error_ret));
+        // Get error if any (curl_error() also only accepts CurlHandle)
+        zval curl_error_func, curl_error_args[1], curl_error_ret;
+        ZVAL_UNDEF(&curl_error_func);
+        ZVAL_UNDEF(&curl_error_args[0]);
+        ZVAL_UNDEF(&curl_error_ret);
+        
+        ZVAL_STRING(&curl_error_func, "curl_error");
+        ZVAL_COPY(&curl_error_args[0], curl_handle);
+        
+        if (zend_fcall_info_init(&curl_error_func, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
+            fci.size = sizeof(fci);
+            ZVAL_UNDEF(&fci.function_name);
+            fci.object = NULL;
+            fci.param_count = 1;
+            fci.params = curl_error_args;
+            fci.retval = &curl_error_ret;
+            
+            if (zend_call_function(&fci, &fcc) == SUCCESS) {
+                if (Z_TYPE(curl_error_ret) == IS_STRING && Z_STRLEN(curl_error_ret) > 0) {
+                    error = estrdup(Z_STRVAL(curl_error_ret));
+                }
+                zval_dtor(&curl_error_ret);
             }
-            zval_dtor(&curl_error_ret);
+        }
+        zval_dtor(&curl_error_func);
+        zval_dtor(&curl_error_args[0]);
         }
     }
-    zval_dtor(&curl_error_func);
-    zval_dtor(&curl_error_args[0]);
     
     // Log HTTP response code
     if (status_code > 0) {
@@ -3890,95 +3939,105 @@ static void opa_observer_fcall_end(zend_execute_data *execute_data, zval *return
         char *error = NULL;
         
         if (data->curl_handle && Z_TYPE_P(data->curl_handle) == IS_OBJECT) {
-            // RE-ENABLED: Call curl_getinfo and curl_error with proper recursion prevention
-            // Use re-entrancy guard to prevent observer callbacks (profiling_active is global, don't modify it)
-            int old_guard = in_opa_observer;
-            in_opa_observer = 1;  // Set guard - observer checks this first and returns early
-            
-            // Get curl_getinfo data using zend_call_function
-            // With profiling_active=0 and in_opa_observer=1, observer should not trigger
-            zval curl_getinfo_func_zv, curl_getinfo_args[1], curl_getinfo_ret;
-            ZVAL_UNDEF(&curl_getinfo_func_zv);
-            ZVAL_UNDEF(&curl_getinfo_args[0]);
-            ZVAL_UNDEF(&curl_getinfo_ret);
-            
-            ZVAL_STRING(&curl_getinfo_func_zv, "curl_getinfo");
-            ZVAL_COPY(&curl_getinfo_args[0], data->curl_handle);
-            
-            zend_fcall_info fci;
-            zend_fcall_info_cache fcc;
-            
-            if (zend_fcall_info_init(&curl_getinfo_func_zv, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
-                fci.param_count = 1;
-                fci.params = curl_getinfo_args;
-                fci.retval = &curl_getinfo_ret;
+            // CRITICAL: Only call curl_getinfo() on CurlHandle, not CurlMultiHandle or CurlShareHandle
+            // curl_getinfo() only accepts CurlHandle, calling it on CurlMultiHandle causes fatal TypeError
+            if (is_curl_handle(data->curl_handle)) {
+                // RE-ENABLED: Call curl_getinfo and curl_error with proper recursion prevention
+                // Use re-entrancy guard to prevent observer callbacks (profiling_active is global, don't modify it)
+                int old_guard = in_opa_observer;
+                in_opa_observer = 1;  // Set guard - observer checks this first and returns early
                 
-                if (zend_call_function(&fci, &fcc) == SUCCESS) {
-                    // CRITICAL: Validate return value before accessing
-                    // Check if return value is valid and is an array
-                    if (Z_TYPE(curl_getinfo_ret) == IS_ARRAY && Z_ARRVAL(curl_getinfo_ret) != NULL) {
-                        HashTable *ht = Z_ARRVAL(curl_getinfo_ret);
-                        // Additional safety check: verify hash table is valid
-                        if (ht && ht->nTableSize > 0) {
-                            zval *url_val = zend_hash_str_find(ht, "url", sizeof("url") - 1);
-                            if (url_val && Z_TYPE_P(url_val) == IS_STRING) {
-                                curl_url = estrdup(Z_STRVAL_P(url_val));
-                            }
-                            
-                            zval *method_val = zend_hash_str_find(ht, "request_method", sizeof("request_method") - 1);
-                            if (method_val && Z_TYPE_P(method_val) == IS_STRING) {
-                                curl_method = estrdup(Z_STRVAL_P(method_val));
-                            } else {
-                                curl_method = estrdup("GET");
-                            }
-                            
-                            zval *status_val = zend_hash_str_find(ht, "http_code", sizeof("http_code") - 1);
-                            if (status_val && Z_TYPE_P(status_val) == IS_LONG) {
-                                status_code = Z_LVAL_P(status_val);
+                // Get curl_getinfo data using zend_call_function
+                // With profiling_active=0 and in_opa_observer=1, observer should not trigger
+                zval curl_getinfo_func_zv, curl_getinfo_args[1], curl_getinfo_ret;
+                ZVAL_UNDEF(&curl_getinfo_func_zv);
+                ZVAL_UNDEF(&curl_getinfo_args[0]);
+                ZVAL_UNDEF(&curl_getinfo_ret);
+                
+                ZVAL_STRING(&curl_getinfo_func_zv, "curl_getinfo");
+                ZVAL_COPY(&curl_getinfo_args[0], data->curl_handle);
+                
+                zend_fcall_info fci;
+                zend_fcall_info_cache fcc;
+                
+                if (zend_fcall_info_init(&curl_getinfo_func_zv, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
+                    fci.size = sizeof(fci);
+                    ZVAL_UNDEF(&fci.function_name);
+                    fci.object = NULL;
+                    fci.param_count = 1;
+                    fci.params = curl_getinfo_args;
+                    fci.retval = &curl_getinfo_ret;
+                    
+                    if (zend_call_function(&fci, &fcc) == SUCCESS) {
+                        // CRITICAL: Validate return value before accessing
+                        // Check if return value is valid and is an array
+                        if (Z_TYPE(curl_getinfo_ret) == IS_ARRAY && Z_ARRVAL(curl_getinfo_ret) != NULL) {
+                            HashTable *ht = Z_ARRVAL(curl_getinfo_ret);
+                            // Additional safety check: verify hash table is valid
+                            if (ht && ht->nTableSize > 0) {
+                                zval *url_val = zend_hash_str_find(ht, "url", sizeof("url") - 1);
+                                if (url_val && Z_TYPE_P(url_val) == IS_STRING) {
+                                    curl_url = estrdup(Z_STRVAL_P(url_val));
+                                }
+                                
+                                zval *method_val = zend_hash_str_find(ht, "request_method", sizeof("request_method") - 1);
+                                if (method_val && Z_TYPE_P(method_val) == IS_STRING) {
+                                    curl_method = estrdup(Z_STRVAL_P(method_val));
+                                } else {
+                                    curl_method = estrdup("GET");
+                                }
+                                
+                                zval *status_val = zend_hash_str_find(ht, "http_code", sizeof("http_code") - 1);
+                                if (status_val && Z_TYPE_P(status_val) == IS_LONG) {
+                                    status_code = Z_LVAL_P(status_val);
+                                }
                             }
                         }
-                    }
-                    // Always destroy the return value, even if invalid
-                    if (Z_TYPE(curl_getinfo_ret) != IS_UNDEF) {
-                        zval_dtor(&curl_getinfo_ret);
-                    }
-                }
-                zval_dtor(&curl_getinfo_func_zv);
-                zval_dtor(&curl_getinfo_args[0]);
-            }
-            
-            // Get curl_error
-            zval curl_error_func_zv, curl_error_args[1], curl_error_ret;
-            ZVAL_UNDEF(&curl_error_func_zv);
-            ZVAL_UNDEF(&curl_error_args[0]);
-            ZVAL_UNDEF(&curl_error_ret);
-            
-            ZVAL_STRING(&curl_error_func_zv, "curl_error");
-            ZVAL_COPY(&curl_error_args[0], data->curl_handle);
-            
-            if (zend_fcall_info_init(&curl_error_func_zv, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
-                fci.param_count = 1;
-                fci.params = curl_error_args;
-                fci.retval = &curl_error_ret;
-                
-                if (zend_call_function(&fci, &fcc) == SUCCESS) {
-                    // CRITICAL: Validate return value before accessing
-                    if (Z_TYPE(curl_error_ret) == IS_STRING && Z_STRVAL(curl_error_ret) != NULL) {
-                        if (Z_STRLEN(curl_error_ret) > 0) {
-                            error = estrdup(Z_STRVAL(curl_error_ret));
+                        // Always destroy the return value, even if invalid
+                        if (Z_TYPE(curl_getinfo_ret) != IS_UNDEF) {
+                            zval_dtor(&curl_getinfo_ret);
                         }
                     }
-                    // Always destroy the return value, even if invalid
-                    if (Z_TYPE(curl_error_ret) != IS_UNDEF) {
-                        zval_dtor(&curl_error_ret);
-                    }
+                    zval_dtor(&curl_getinfo_func_zv);
+                    zval_dtor(&curl_getinfo_args[0]);
                 }
-                zval_dtor(&curl_error_func_zv);
-                zval_dtor(&curl_error_args[0]);
+                
+                // Get curl_error (curl_error() also only accepts CurlHandle)
+                zval curl_error_func_zv, curl_error_args[1], curl_error_ret;
+                ZVAL_UNDEF(&curl_error_func_zv);
+                ZVAL_UNDEF(&curl_error_args[0]);
+                ZVAL_UNDEF(&curl_error_ret);
+                
+                ZVAL_STRING(&curl_error_func_zv, "curl_error");
+                ZVAL_COPY(&curl_error_args[0], data->curl_handle);
+                
+                if (zend_fcall_info_init(&curl_error_func_zv, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
+                    fci.size = sizeof(fci);
+                    ZVAL_UNDEF(&fci.function_name);
+                    fci.object = NULL;
+                    fci.param_count = 1;
+                    fci.params = curl_error_args;
+                    fci.retval = &curl_error_ret;
+                    
+                    if (zend_call_function(&fci, &fcc) == SUCCESS) {
+                        // CRITICAL: Validate return value before accessing
+                        if (Z_TYPE(curl_error_ret) == IS_STRING && Z_STRVAL(curl_error_ret) != NULL) {
+                            if (Z_STRLEN(curl_error_ret) > 0) {
+                                error = estrdup(Z_STRVAL(curl_error_ret));
+                            }
+                        }
+                        // Always destroy the return value, even if invalid
+                        if (Z_TYPE(curl_error_ret) != IS_UNDEF) {
+                            zval_dtor(&curl_error_ret);
+                        }
+                    }
+                    zval_dtor(&curl_error_func_zv);
+                    zval_dtor(&curl_error_args[0]);
+                }
+                
+                // Restore guard
+                in_opa_observer = old_guard;
             }
-            
-            // Restore guard
-            in_opa_observer = old_guard;
         }
         
         // Record HTTP request
