@@ -30,13 +30,13 @@ PHP_INI_MH(OnUpdateSamplingRate) {
 
 // INI configuration
 PHP_INI_BEGIN()
-    STD_PHP_INI_ENTRY("opa.enabled", "1", PHP_INI_ALL, OnUpdateBool, enabled, zend_opa_globals, opa_globals)
+    STD_PHP_INI_ENTRY("opa.enabled", "0", PHP_INI_ALL, OnUpdateBool, enabled, zend_opa_globals, opa_globals)
     STD_PHP_INI_ENTRY_EX("opa.sampling_rate", "1.0", PHP_INI_ALL, OnUpdateSamplingRate, sampling_rate, zend_opa_globals, opa_globals, NULL)
     STD_PHP_INI_ENTRY("opa.socket_path", "/var/run/opa.sock", PHP_INI_ALL, OnUpdateString, socket_path, zend_opa_globals, opa_globals)
     STD_PHP_INI_ENTRY("opa.full_capture_threshold_ms", "100", PHP_INI_ALL, OnUpdateLong, full_capture_threshold_ms, zend_opa_globals, opa_globals)
     STD_PHP_INI_ENTRY("opa.stack_depth", "20", PHP_INI_ALL, OnUpdateLong, stack_depth, zend_opa_globals, opa_globals)
     STD_PHP_INI_ENTRY("opa.buffer_size", "65536", PHP_INI_ALL, OnUpdateLong, buffer_size, zend_opa_globals, opa_globals)
-    STD_PHP_INI_ENTRY("opa.collect_internal_functions", "1", PHP_INI_ALL, OnUpdateBool, collect_internal_functions, zend_opa_globals, opa_globals)
+    STD_PHP_INI_ENTRY("opa.collect_internal_functions", "0", PHP_INI_ALL, OnUpdateBool, collect_internal_functions, zend_opa_globals, opa_globals)
     STD_PHP_INI_ENTRY("opa.debug_log", "0", PHP_INI_ALL, OnUpdateBool, debug_log_enabled, zend_opa_globals, opa_globals)
     STD_PHP_INI_ENTRY("opa.organization_id", "default-org", PHP_INI_ALL, OnUpdateString, organization_id, zend_opa_globals, opa_globals)
     STD_PHP_INI_ENTRY("opa.project_id", "default-project", PHP_INI_ALL, OnUpdateString, project_id, zend_opa_globals, opa_globals)
@@ -2062,11 +2062,35 @@ void opa_collector_free(opa_collector_t *collector) {
     while (call) {
         call_node_t *next = call->next;
         if (call->magic == OPA_CALL_NODE_MAGIC) {
+            // Free all estrdup'd strings
             if (call->call_id) efree(call->call_id);
             if (call->function_name) efree(call->function_name);
             if (call->class_name) efree(call->class_name);
             if (call->file) efree(call->file);
             if (call->parent_id) efree(call->parent_id);
+            
+            // Free all zval arrays
+            if (call->sql_queries) {
+                zval_ptr_dtor(call->sql_queries);
+                efree(call->sql_queries);
+            }
+            if (call->http_requests) {
+                zval_ptr_dtor(call->http_requests);
+                efree(call->http_requests);
+            }
+            if (call->cache_operations) {
+                zval_ptr_dtor(call->cache_operations);
+                efree(call->cache_operations);
+            }
+            if (call->redis_operations) {
+                zval_ptr_dtor(call->redis_operations);
+                efree(call->redis_operations);
+            }
+            if (call->children) {
+                zval_ptr_dtor(call->children);
+                efree(call->children);
+            }
+            
             call->magic = 0;
             efree(call);
         }
@@ -3508,6 +3532,29 @@ typedef struct _opa_observer_data {
 // Hash table to store observer data keyed by execute_data pointer
 static HashTable *observer_data_table = NULL;
 static pthread_mutex_t observer_data_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Helper function to free observer data entry (used in hash table cleanup)
+static int free_observer_data_entry(zval *zv) {
+    if (!zv || Z_TYPE_P(zv) != IS_PTR) {
+        return ZEND_HASH_APPLY_REMOVE;
+    }
+    
+    opa_observer_data_t *data = (opa_observer_data_t *)Z_PTR_P(zv);
+    if (data) {
+        // Free all estrdup'd strings
+        if (data->call_id) efree(data->call_id);
+        if (data->sql) efree(data->sql);
+        if (data->apcu_key) efree(data->apcu_key);
+        if (data->redis_key) efree(data->redis_key);
+        if (data->redis_host) efree(data->redis_host);
+        if (data->redis_port) efree(data->redis_port);
+        
+        // Free the data structure itself
+        efree(data);
+    }
+    
+    return ZEND_HASH_APPLY_REMOVE;
+}
 
 // General Zend Observer callbacks for all function calls
 // This is the proper way to intercept function calls in PHP 8.0+ (like xdebug)
@@ -5239,7 +5286,11 @@ PHP_RSHUTDOWN_FUNCTION(opa) {
     // Clean up observer data hash table
     pthread_mutex_lock(&observer_data_mutex);
     if (observer_data_table) {
-        // Free all remaining observer data entries
+        // Free all remaining observer data entries before destroying the table
+        // The hash table uses NULL destructor, so entries are not automatically freed
+        zend_hash_apply(observer_data_table, free_observer_data_entry);
+        
+        // Now destroy the hash table structure
         zend_hash_destroy(observer_data_table);
         free(observer_data_table); // Use free (not efree) since we used malloc
         observer_data_table = NULL;
@@ -5454,8 +5505,9 @@ PHP_RSHUTDOWN_FUNCTION(opa) {
         debug_log("[RSHUTDOWN] Sent %d child spans (expand_spans mode)", child_spans_sent);
     }
     
-    // Free collector () - this will free all calls
+    // Stop collector first, then free it - this will free all calls
     if (global_collector) {
+        opa_collector_stop(global_collector);
         opa_collector_free(global_collector);
         global_collector = NULL;
     }
